@@ -360,7 +360,7 @@ xfsaild_resubmit_item(
 
 	/* protected by ail_lock */
 	list_for_each_entry(lip, &bp->b_li_list, li_bio_list) {
-		if (bp->b_flags & _XBF_INODES)
+		if (bp->b_flags & (_XBF_INODES | _XBF_DQUOTS))
 			clear_bit(XFS_LI_FAILED, &lip->li_flags);
 		else
 			xfs_clear_li_failed(lip);
@@ -644,7 +644,12 @@ xfsaild(
 	set_freezable();
 
 	while (1) {
-		if (tout)
+		/*
+		 * Long waits of 50ms or more occur when we've run out of items
+		 * to push, so we only want uninterruptible state if we're
+		 * actually blocked on something.
+		 */
+		if (tout && tout <= 20)
 			set_current_state(TASK_KILLABLE|TASK_FREEZABLE);
 		else
 			set_current_state(TASK_INTERRUPTIBLE|TASK_FREEZABLE);

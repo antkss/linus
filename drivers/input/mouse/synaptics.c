@@ -189,6 +189,7 @@ static const char * const smbus_pnp_ids[] = {
 	"LEN2054", /* E480 */
 	"LEN2055", /* E580 */
 	"LEN2068", /* T14 Gen 1 */
+	"SYN3015", /* HP EliteBook 840 G2 */
 	"SYN3052", /* HP EliteBook 840 G4 */
 	"SYN3221", /* HP 15-ay000 */
 	"SYN323d", /* HP Spectre X360 13-w013dx */
@@ -649,9 +650,8 @@ static int synaptics_pt_start(struct serio *serio)
 	struct psmouse *parent = psmouse_from_serio(serio->parent);
 	struct synaptics_data *priv = parent->private;
 
-	serio_pause_rx(parent->ps2dev.serio);
+	guard(serio_pause_rx)(parent->ps2dev.serio);
 	priv->pt_port = serio;
-	serio_continue_rx(parent->ps2dev.serio);
 
 	return 0;
 }
@@ -661,9 +661,8 @@ static void synaptics_pt_stop(struct serio *serio)
 	struct psmouse *parent = psmouse_from_serio(serio->parent);
 	struct synaptics_data *priv = parent->private;
 
-	serio_pause_rx(parent->ps2dev.serio);
+	guard(serio_pause_rx)(parent->ps2dev.serio);
 	priv->pt_port = NULL;
-	serio_continue_rx(parent->ps2dev.serio);
 }
 
 static int synaptics_is_pt_packet(u8 *buf)

@@ -85,7 +85,7 @@ static void iter_unmark_lpis(struct kvm *kvm)
 	struct vgic_irq *irq;
 	unsigned long intid;
 
-	xa_for_each(&dist->lpi_xa, intid, irq) {
+	xa_for_each_marked(&dist->lpi_xa, intid, irq, LPI_XA_MARK_DEBUG_ITER) {
 		xa_clear_mark(&dist->lpi_xa, intid, LPI_XA_MARK_DEBUG_ITER);
 		vgic_put_irq(kvm, irq);
 	}
@@ -287,7 +287,10 @@ static int vgic_debug_show(struct seq_file *s, void *v)
 	 * Expect this to succeed, as iter_mark_lpis() takes a reference on
 	 * every LPI to be visited.
 	 */
-	irq = vgic_get_irq(kvm, vcpu, iter->intid);
+	if (iter->intid < VGIC_NR_PRIVATE_IRQS)
+		irq = vgic_get_vcpu_irq(vcpu, iter->intid);
+	else
+		irq = vgic_get_irq(kvm, iter->intid);
 	if (WARN_ON_ONCE(!irq))
 		return -EINVAL;
 
