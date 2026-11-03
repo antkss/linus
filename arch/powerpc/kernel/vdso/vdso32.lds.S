@@ -6,6 +6,7 @@
 #include <asm/vdso.h>
 #include <asm/page.h>
 #include <asm-generic/vmlinux.lds.h>
+#include <vdso/datapage.h>
 
 #ifdef __LITTLE_ENDIAN__
 OUTPUT_FORMAT("elf32-powerpcle", "elf32-powerpcle", "elf32-powerpcle")
@@ -16,7 +17,8 @@ OUTPUT_ARCH(powerpc:common)
 
 SECTIONS
 {
-	PROVIDE(_vdso_datapage = . - 3 * PAGE_SIZE);
+	VDSO_VVAR_SYMS
+
 	. = SIZEOF_HEADERS;
 
 	.hash          	: { *(.hash) }			:text
@@ -117,12 +119,15 @@ VERSION
 {
 	VDSO_VERSION_STRING {
 	global:
-		__kernel_get_syscall_map;
+#ifdef CONFIG_COMPAT_32BIT_TIME
 		__kernel_gettimeofday;
 		__kernel_clock_gettime;
-		__kernel_clock_gettime64;
 		__kernel_clock_getres;
 		__kernel_time;
+#endif /* CONFIG_COMPAT_32BIT_TIME */
+		__kernel_get_syscall_map;
+		__kernel_clock_gettime64;
+		__kernel_clock_getres_time64;
 		__kernel_get_tbfreq;
 		__kernel_sync_dicache;
 		__kernel_sigtramp32;

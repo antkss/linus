@@ -5,16 +5,20 @@
  * Copyright (C) 2015, Taeung Song <treeze.taeung@gmail.com>
  *
  */
-#include "builtin.h"
-
-#include "util/cache.h"
-#include <subcmd/parse-options.h>
-#include "util/debug.h"
-#include "util/config.h"
-#include <linux/string.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+#include <linux/string.h>
+
+#include <subcmd/parse-options.h>
+
+#include "builtin.h"
+#include "util/config.h"
+#include "util/debug.h"
+#include "util/path.h"
 
 static bool use_system_config, use_user_config;
 
@@ -23,7 +27,7 @@ static const char * const config_usage[] = {
 	NULL
 };
 
-enum actions {
+static enum actions {
 	ACTION_LIST = 1
 } actions;
 
@@ -37,37 +41,7 @@ static struct option config_options[] = {
 
 static int set_config(struct perf_config_set *set, const char *file_name)
 {
-	struct perf_config_section *section = NULL;
-	struct perf_config_item *item = NULL;
-	const char *first_line = "# this file is auto-generated.";
-	FILE *fp;
-
-	if (set == NULL)
-		return -1;
-
-	fp = fopen(file_name, "w");
-	if (!fp)
-		return -1;
-
-	fprintf(fp, "%s\n", first_line);
-
-	/* overwrite configvariables */
-	perf_config_items__for_each_entry(&set->sections, section) {
-		if (!use_system_config && section->from_system_config)
-			continue;
-		fprintf(fp, "[%s]\n", section->name);
-
-		perf_config_items__for_each_entry(&section->items, item) {
-			if (!use_system_config && item->from_system_config)
-				continue;
-			if (item->value)
-				fprintf(fp, "\t%s = %s\n",
-					item->name, item->value);
-		}
-	}
-	fclose(fp);
-
-	return 0;
+	return perf_config_set__write(set, file_name, use_system_config);
 }
 
 static int show_spec_config(struct perf_config_set *set, const char *var)

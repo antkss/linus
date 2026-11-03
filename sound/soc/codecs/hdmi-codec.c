@@ -4,6 +4,7 @@
  * Copyright (C) 2015 Texas Instruments Incorporated - https://www.ti.com/
  * Author: Jyri Sarha <jsarha@ti.com>
  */
+#include <linux/cleanup.h>
 #include <linux/module.h>
 #include <linux/string.h>
 #include <sound/core.h>
@@ -281,6 +282,7 @@ static const struct hdmi_codec_cea_spk_alloc hdmi_codec_channel_alloc[] = {
 struct hdmi_codec_priv {
 	struct hdmi_codec_pdata hcd;
 	uint8_t eld[MAX_ELD_BYTES];
+	struct snd_parsed_hdmi_eld eld_parsed;
 	struct snd_pcm_chmap *chmap_info;
 	unsigned int chmap_idx;
 	struct mutex lock;
@@ -288,6 +290,7 @@ struct hdmi_codec_priv {
 	struct snd_soc_jack *jack;
 	unsigned int jack_status;
 	u8 iec_status[AES_IEC958_STATUS_SIZE];
+	struct snd_info_entry *proc_entry;
 };
 
 static const struct snd_soc_dapm_widget hdmi_widgets[] = {
@@ -423,10 +426,14 @@ static int hdmi_codec_iec958_default_put(struct snd_kcontrol *kcontrol,
 	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct hdmi_codec_priv *hcp = snd_soc_component_get_drvdata(component);
 
+	if (!memcmp(hcp->iec_status, ucontrol->value.iec958.status,
+		    sizeof(hcp->iec_status)))
+		return 0;
+
 	memcpy(hcp->iec_status, ucontrol->value.iec958.status,
 	       sizeof(hcp->iec_status));
 
-	return 0;
+	return 1;
 }
 
 static int hdmi_codec_iec958_mask_get(struct snd_kcontrol *kcontrol,
@@ -450,28 +457,34 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
 	if (!((has_playback && tx) || (has_capture && !tx)))
 		return 0;
 
-	mutex_lock(&hcp->lock);
+	guard(mutex)(&hcp->lock);
 	if (hcp->busy) {
 		dev_err(dai->dev, "Only one simultaneous stream supported!\n");
-		mutex_unlock(&hcp->lock);
 		return -EINVAL;
 	}
 
 	if (hcp->hcd.ops->audio_startup) {
 		ret = hcp->hcd.ops->audio_startup(dai->dev->parent, hcp->hcd.data);
 		if (ret)
-			goto err;
+			return ret;
 	}
 
 	if (tx && hcp->hcd.ops->get_eld) {
 		ret = hcp->hcd.ops->get_eld(dai->dev->parent, hcp->hcd.data,
 					    hcp->eld, sizeof(hcp->eld));
 		if (ret)
-			goto err;
+			return ret;
+
+		/* An empty ELD means no sink is connected; nothing to parse. */
+		if (hcp->eld[0])
+			snd_parse_eld(dai->dev, &hcp->eld_parsed,
+				      hcp->eld, sizeof(hcp->eld));
+		else
+			memset(&hcp->eld_parsed, 0, sizeof(hcp->eld_parsed));
 
 		ret = snd_pcm_hw_constraint_eld(substream->runtime, hcp->eld);
 		if (ret)
-			goto err;
+			return ret;
 
 		/* Select chmap supported */
 		hdmi_codec_eld_chmap(hcp);
@@ -479,8 +492,6 @@ static int hdmi_codec_startup(struct snd_pcm_substream *substream,
 
 	hcp->busy = true;
 
-err:
-	mutex_unlock(&hcp->lock);
 	return ret;
 }
 
@@ -498,9 +509,8 @@ static void hdmi_codec_shutdown(struct snd_pcm_substream *substream,
 	hcp->chmap_idx = HDMI_CODEC_CHMAP_IDX_UNKNOWN;
 	hcp->hcd.ops->audio_shutdown(dai->dev->parent, hcp->hcd.data);
 
-	mutex_lock(&hcp->lock);
+	guard(mutex)(&hcp->lock);
 	hcp->busy = false;
-	mutex_unlock(&hcp->lock);
 }
 
 static int hdmi_codec_fill_codec_params(struct snd_soc_dai *dai,
@@ -714,7 +724,7 @@ static int hdmi_codec_mute(struct snd_soc_dai *dai, int mute, int direction)
 	 */
 	if (hcp->hcd.ops->mute_stream &&
 	    (direction == SNDRV_PCM_STREAM_PLAYBACK ||
-	     !hcp->hcd.ops->no_capture_mute))
+	     !hcp->hcd.no_capture_mute))
 		return hcp->hcd.ops->mute_stream(dai->dev->parent,
 						 hcp->hcd.data,
 						 mute, direction);
@@ -825,8 +835,70 @@ static int hdmi_codec_pcm_new(struct snd_soc_pcm_runtime *rtd,
 	return 0;
 }
 
+#ifdef CONFIG_SND_PROC_FS
+static void print_eld_info(struct snd_info_entry *entry,
+			   struct snd_info_buffer *buffer)
+{
+	struct hdmi_codec_priv *hcp = entry->private_data;
+
+	snd_print_eld_info(&hcp->eld_parsed, buffer);
+}
+
+static int hdmi_dai_proc_new(struct hdmi_codec_priv *hcp,
+			     struct snd_soc_dai *dai)
+{
+	struct snd_soc_component *component = dai->component;
+	struct snd_soc_card *card = component->card;
+	struct snd_soc_dai *d;
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_info_entry *entry;
+	char name[32];
+	int err, i, id = 0;
+
+	/*
+	 * To avoid duplicate proc entry, find its rtd and use rtd->id
+	 * instead of dai->id
+	 */
+	for_each_card_rtds(card, rtd) {
+		for_each_rtd_dais(rtd, i, d)
+			if (d == dai) {
+				id = rtd->id;
+				goto found;
+			}
+	}
+found:
+	snprintf(name, sizeof(name), "eld#%d", id);
+	err = snd_card_proc_new(card->snd_card, name, &entry);
+	if (err < 0)
+		return err;
+
+	snd_info_set_text_ops(entry, hcp, print_eld_info);
+	hcp->proc_entry = entry;
+
+	return 0;
+}
+
+static void hdmi_dai_proc_free(struct hdmi_codec_priv *hcp)
+{
+	snd_info_free_entry(hcp->proc_entry);
+	hcp->proc_entry = NULL;
+}
+#else
+static int hdmi_dai_proc_new(struct hdmi_codec_priv *hcp,
+			     struct snd_soc_dai *dai)
+{
+	return 0;
+}
+
+static void hdmi_dai_proc_free(struct hdmi_codec_priv *hcp)
+{
+}
+#endif
+
 static int hdmi_dai_probe(struct snd_soc_dai *dai)
 {
+	struct hdmi_codec_priv *hcp =
+		snd_soc_component_get_drvdata(dai->component);
 	struct snd_soc_dapm_context *dapm;
 	struct hdmi_codec_daifmt *daifmt;
 	struct snd_soc_dapm_route route[] = {
@@ -841,7 +913,7 @@ static int hdmi_dai_probe(struct snd_soc_dai *dai)
 	};
 	int ret, i;
 
-	dapm = snd_soc_component_get_dapm(dai->component);
+	dapm = snd_soc_component_to_dapm(dai->component);
 
 	/* One of the directions might be omitted for unidirectional DAIs */
 	for (i = 0; i < ARRAY_SIZE(route); i++) {
@@ -859,6 +931,15 @@ static int hdmi_dai_probe(struct snd_soc_dai *dai)
 
 	snd_soc_dai_dma_data_set_playback(dai, daifmt);
 
+	return hdmi_dai_proc_new(hcp, dai);
+}
+
+static int hdmi_dai_remove(struct snd_soc_dai *dai)
+{
+	struct hdmi_codec_priv *hcp =
+		snd_soc_component_get_drvdata(dai->component);
+
+	hdmi_dai_proc_free(hcp);
 	return 0;
 }
 
@@ -867,7 +948,7 @@ static void hdmi_codec_jack_report(struct hdmi_codec_priv *hcp,
 {
 	if (jack_status != hcp->jack_status) {
 		if (hcp->jack)
-			snd_soc_jack_report(hcp->jack, jack_status, SND_JACK_LINEOUT);
+			snd_soc_jack_report(hcp->jack, jack_status, SND_JACK_AVOUT);
 		hcp->jack_status = jack_status;
 	}
 }
@@ -875,13 +956,20 @@ static void hdmi_codec_jack_report(struct hdmi_codec_priv *hcp,
 static void plugged_cb(struct device *dev, bool plugged)
 {
 	struct hdmi_codec_priv *hcp = dev_get_drvdata(dev);
+	int ret;
 
 	if (plugged) {
 		if (hcp->hcd.ops->get_eld) {
 			hcp->hcd.ops->get_eld(dev->parent, hcp->hcd.data,
 					    hcp->eld, sizeof(hcp->eld));
+			ret = snd_parse_eld(dev, &hcp->eld_parsed,
+					    hcp->eld, sizeof(hcp->eld));
+			if (ret < 0)
+				dev_dbg(dev, "Failed to parse ELD: %d\n", ret);
+			else
+				snd_show_eld(dev, &hcp->eld_parsed);
 		}
-		hdmi_codec_jack_report(hcp, SND_JACK_LINEOUT);
+		hdmi_codec_jack_report(hcp, SND_JACK_AVOUT);
 	} else {
 		hdmi_codec_jack_report(hcp, 0);
 		memset(hcp->eld, 0, sizeof(hcp->eld));
@@ -901,7 +989,7 @@ static int hdmi_codec_set_jack(struct snd_soc_component *component,
 		 * Report the initial jack status which may have been provided
 		 * by the parent hdmi driver while the hpd hook was registered.
 		 */
-		snd_soc_jack_report(jack, hcp->jack_status, SND_JACK_LINEOUT);
+		snd_soc_jack_report(jack, hcp->jack_status, SND_JACK_AVOUT);
 
 		return 0;
 	}
@@ -926,6 +1014,7 @@ static int hdmi_dai_spdif_probe(struct snd_soc_dai *dai)
 
 static const struct snd_soc_dai_ops hdmi_codec_i2s_dai_ops = {
 	.probe				= hdmi_dai_probe,
+	.remove				= hdmi_dai_remove,
 	.startup			= hdmi_codec_startup,
 	.shutdown			= hdmi_codec_shutdown,
 	.hw_params			= hdmi_codec_hw_params,
@@ -942,6 +1031,7 @@ static const struct snd_soc_dai_ops hdmi_codec_spdif_dai_ops = {
 	.startup	= hdmi_codec_startup,
 	.shutdown	= hdmi_codec_shutdown,
 	.hw_params	= hdmi_codec_hw_params,
+	.prepare	= hdmi_codec_prepare,
 	.mute_stream	= hdmi_codec_mute,
 	.pcm_new	= hdmi_codec_pcm_new,
 };
@@ -995,7 +1085,7 @@ static int hdmi_of_xlate_dai_id(struct snd_soc_component *component,
 	int ret = -ENOTSUPP; /* see snd_soc_get_dai_id() */
 
 	if (hcp->hcd.ops->get_dai_id)
-		ret = hcp->hcd.ops->get_dai_id(component, endpoint);
+		ret = hcp->hcd.ops->get_dai_id(component, endpoint, hcp->hcd.data);
 
 	return ret;
 }
@@ -1077,6 +1167,10 @@ static int hdmi_codec_probe(struct platform_device *pdev)
 	if (hcd->i2s) {
 		daidrv[i] = hdmi_i2s_dai;
 		daidrv[i].playback.channels_max = hcd->max_i2s_channels;
+		if (hcd->i2s_formats) {
+			daidrv[i].playback.formats = hcd->i2s_formats;
+			daidrv[i].capture.formats = hcd->i2s_formats;
+		}
 		if (hcd->no_i2s_playback)
 			memset(&daidrv[i].playback, 0,
 			       sizeof(daidrv[i].playback));

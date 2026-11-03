@@ -213,7 +213,7 @@ static int acp5x_dma_open(struct snd_soc_component *component,
 	component = snd_soc_rtdcom_lookup(prtd, DRV_NAME);
 	adata = dev_get_drvdata(component->dev);
 
-	i2s_data = kzalloc(sizeof(*i2s_data), GFP_KERNEL);
+	i2s_data = kzalloc_obj(*i2s_data);
 	if (!i2s_data)
 		return -ENOMEM;
 
@@ -231,7 +231,13 @@ static int acp5x_dma_open(struct snd_soc_component *component,
 	}
 	i2s_data->acp5x_base = adata->acp5x_base;
 	runtime->private_data = i2s_data;
-	return ret;
+
+	/*
+	 * ASoC only marks the component as opened when .open() returns 0.
+	 * Since snd_pcm_hw_constraint_integer() may return 1, explicitly
+	 * return 0 to ensure .close() is not skipped on rollback.
+	 */
+	return 0;
 }
 
 static int acp5x_dma_hw_params(struct snd_soc_component *component,
@@ -357,7 +363,7 @@ static const struct snd_soc_component_driver acp5x_i2s_component = {
 	.close		= acp5x_dma_close,
 	.hw_params	= acp5x_dma_hw_params,
 	.pointer	= acp5x_dma_pointer,
-	.pcm_construct	= acp5x_dma_new,
+	.pcm_new	= acp5x_dma_new,
 };
 
 static int acp5x_audio_probe(struct platform_device *pdev)
@@ -420,7 +426,7 @@ static void acp5x_audio_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 }
 
-static int __maybe_unused acp5x_pcm_resume(struct device *dev)
+static int acp5x_pcm_resume(struct device *dev)
 {
 	struct i2s_dev_data *adata;
 	struct i2s_stream_instance *rtd;
@@ -473,7 +479,7 @@ static int __maybe_unused acp5x_pcm_resume(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused acp5x_pcm_suspend(struct device *dev)
+static int acp5x_pcm_suspend(struct device *dev)
 {
 	struct i2s_dev_data *adata;
 
@@ -482,7 +488,7 @@ static int __maybe_unused acp5x_pcm_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused acp5x_pcm_runtime_resume(struct device *dev)
+static int acp5x_pcm_runtime_resume(struct device *dev)
 {
 	struct i2s_dev_data *adata;
 
@@ -492,9 +498,8 @@ static int __maybe_unused acp5x_pcm_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops acp5x_pm_ops = {
-	SET_RUNTIME_PM_OPS(acp5x_pcm_suspend,
-			   acp5x_pcm_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(acp5x_pcm_suspend, acp5x_pcm_resume)
+	RUNTIME_PM_OPS(acp5x_pcm_suspend, acp5x_pcm_runtime_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(acp5x_pcm_suspend, acp5x_pcm_resume)
 };
 
 static struct platform_driver acp5x_dma_driver = {

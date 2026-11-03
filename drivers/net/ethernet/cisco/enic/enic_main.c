@@ -58,23 +58,25 @@
 #include "enic_dev.h"
 #include "enic_pp.h"
 #include "enic_clsf.h"
+#include "enic_rq.h"
+#include "enic_wq.h"
+#include "enic_admin.h"
+#include "enic_mbox.h"
 
 #define ENIC_NOTIFY_TIMER_PERIOD	(2 * HZ)
-#define WQ_ENET_MAX_DESC_LEN		(1 << WQ_ENET_LEN_BITS)
-#define MAX_TSO				(1 << 16)
-#define ENIC_DESC_MAX_SPLITS		(MAX_TSO / WQ_ENET_MAX_DESC_LEN + 1)
 
 #define PCI_DEVICE_ID_CISCO_VIC_ENET         0x0043  /* ethernet vnic */
 #define PCI_DEVICE_ID_CISCO_VIC_ENET_DYN     0x0044  /* enet dynamic vnic */
 #define PCI_DEVICE_ID_CISCO_VIC_ENET_VF      0x0071  /* enet SRIOV VF */
-
-#define RX_COPYBREAK_DEFAULT		256
+#define PCI_DEVICE_ID_CISCO_VIC_ENET_VF_V2   0x02b7  /* enet SRIOV V2 VF */
+#define PCI_DEVICE_ID_CISCO_VIC_ENET_VF_USNIC 0x00cf /* enet USNIC VF */
 
 /* Supported devices */
 static const struct pci_device_id enic_id_table[] = {
 	{ PCI_VDEVICE(CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET) },
 	{ PCI_VDEVICE(CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET_DYN) },
 	{ PCI_VDEVICE(CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET_VF) },
+	{ PCI_VDEVICE(CISCO, PCI_DEVICE_ID_CISCO_VIC_ENET_VF_V2) },
 	{ 0, }	/* end of table */
 };
 
@@ -109,7 +111,7 @@ static struct enic_intr_mod_table mod_table[ENIC_MAX_COALESCE_TIMERS + 1] = {
 static struct enic_intr_mod_range mod_range[ENIC_MAX_LINK_SPEEDS] = {
 	{0,  0}, /* 0  - 4  Gbps */
 	{0,  3}, /* 4  - 10 Gbps */
-	{3,  6}, /* 10 - 40 Gbps */
+	{3,  6}, /* 10+ Gbps */
 };
 
 static void enic_init_affinity_hint(struct enic *enic)
@@ -310,7 +312,13 @@ int enic_sriov_enabled(struct enic *enic)
 
 static int enic_is_sriov_vf(struct enic *enic)
 {
-	return enic->pdev->device == PCI_DEVICE_ID_CISCO_VIC_ENET_VF;
+	return enic->pdev->device == PCI_DEVICE_ID_CISCO_VIC_ENET_VF ||
+	       enic->pdev->device == PCI_DEVICE_ID_CISCO_VIC_ENET_VF_V2;
+}
+
+int enic_is_sriov_vf_v2(struct enic *enic)
+{
+	return enic->pdev->device == PCI_DEVICE_ID_CISCO_VIC_ENET_VF_V2;
 }
 
 int enic_is_valid_vf(struct enic *enic, int vf)
@@ -320,54 +328,6 @@ int enic_is_valid_vf(struct enic *enic, int vf)
 #else
 	return 0;
 #endif
-}
-
-static void enic_free_wq_buf(struct vnic_wq *wq, struct vnic_wq_buf *buf)
-{
-	struct enic *enic = vnic_dev_priv(wq->vdev);
-
-	if (buf->sop)
-		dma_unmap_single(&enic->pdev->dev, buf->dma_addr, buf->len,
-				 DMA_TO_DEVICE);
-	else
-		dma_unmap_page(&enic->pdev->dev, buf->dma_addr, buf->len,
-			       DMA_TO_DEVICE);
-
-	if (buf->os_buf)
-		dev_kfree_skb_any(buf->os_buf);
-}
-
-static void enic_wq_free_buf(struct vnic_wq *wq,
-	struct cq_desc *cq_desc, struct vnic_wq_buf *buf, void *opaque)
-{
-	struct enic *enic = vnic_dev_priv(wq->vdev);
-
-	enic->wq[wq->index].stats.cq_work++;
-	enic->wq[wq->index].stats.cq_bytes += buf->len;
-	enic_free_wq_buf(wq, buf);
-}
-
-static int enic_wq_service(struct vnic_dev *vdev, struct cq_desc *cq_desc,
-	u8 type, u16 q_number, u16 completed_index, void *opaque)
-{
-	struct enic *enic = vnic_dev_priv(vdev);
-
-	spin_lock(&enic->wq[q_number].lock);
-
-	vnic_wq_service(&enic->wq[q_number].vwq, cq_desc,
-		completed_index, enic_wq_free_buf,
-		opaque);
-
-	if (netif_tx_queue_stopped(netdev_get_tx_queue(enic->netdev, q_number)) &&
-	    vnic_wq_desc_avail(&enic->wq[q_number].vwq) >=
-	    (MAX_SKB_FRAGS + ENIC_DESC_MAX_SPLITS)) {
-		netif_wake_subqueue(enic->netdev, q_number);
-		enic->wq[q_number].stats.wake++;
-	}
-
-	spin_unlock(&enic->wq[q_number].lock);
-
-	return 0;
 }
 
 static bool enic_log_q_error(struct enic *enic)
@@ -428,17 +388,80 @@ static void enic_mtu_check(struct enic *enic)
 	}
 }
 
+static void enic_set_rx_coal_setting(struct enic *enic)
+{
+	unsigned int speed;
+	int index = -1;
+	struct enic_rx_coal *rx_coal = &enic->rx_coalesce_setting;
+
+	/* 1. Read the link speed from fw
+	 * 2. Pick the default range for the speed
+	 * 3. Update it in enic->rx_coalesce_setting
+	 */
+	speed = vnic_dev_port_speed(enic->vdev);
+	if (speed > ENIC_LINK_SPEED_10G)
+		index = ENIC_LINK_40G_INDEX;
+	else if (speed > ENIC_LINK_SPEED_4G)
+		index = ENIC_LINK_10G_INDEX;
+	else
+		index = ENIC_LINK_4G_INDEX;
+
+	rx_coal->small_pkt_range_start = mod_range[index].small_pkt_range_start;
+	rx_coal->large_pkt_range_start = mod_range[index].large_pkt_range_start;
+	rx_coal->range_end = ENIC_RX_COALESCE_RANGE_END;
+
+	/* Start with the value provided by UCSM */
+	for (index = 0; index < enic->rq_count; index++)
+		enic->cq[index].cur_rx_coal_timeval =
+				enic->config.intr_timer_usec;
+
+	rx_coal->use_adaptive_rx_coalesce = 1;
+}
+
+static void enic_link_notify_work_handler(struct work_struct *work)
+{
+	struct enic *enic = container_of(work, struct enic,
+					 link_notify_work);
+	u32 state;
+	u16 i;
+
+	if (!enic_sriov_enabled(enic) || !enic->vf_state)
+		return;
+
+	state = netif_carrier_ok(enic->netdev) ?
+		ENIC_MBOX_LINK_STATE_ENABLE :
+		ENIC_MBOX_LINK_STATE_DISABLE;
+
+	for (i = 0; i < enic->num_vfs; i++)
+		enic_mbox_send_link_state(enic, i, state);
+}
+
 static void enic_link_check(struct enic *enic)
 {
-	int link_status = vnic_dev_link_status(enic->vdev);
-	int carrier_ok = netif_carrier_ok(enic->netdev);
+	int link_status;
+	int carrier_ok;
+
+	/* A V2 SR-IOV VF's carrier is driven by PF link-state MBOX
+	 * notifications, not by its own vnic link status; skip the
+	 * autonomous check so it cannot flap the VF carrier.
+	 */
+	if (enic_is_sriov_vf_v2(enic))
+		return;
+
+	link_status = vnic_dev_link_status(enic->vdev);
+	carrier_ok = netif_carrier_ok(enic->netdev);
 
 	if (link_status && !carrier_ok) {
 		netdev_info(enic->netdev, "Link UP\n");
 		netif_carrier_on(enic->netdev);
+		enic_set_rx_coal_setting(enic);
+		if (enic_sriov_enabled(enic) && enic->vf_state)
+			schedule_work(&enic->link_notify_work);
 	} else if (!link_status && carrier_ok) {
 		netdev_info(enic->netdev, "Link DOWN\n");
 		netif_carrier_off(enic->netdev);
+		if (enic_sriov_enabled(enic) && enic->vf_state)
+			schedule_work(&enic->link_notify_work);
 	}
 }
 
@@ -1282,243 +1305,6 @@ nla_put_failure:
 	return -EMSGSIZE;
 }
 
-static void enic_free_rq_buf(struct vnic_rq *rq, struct vnic_rq_buf *buf)
-{
-	struct enic *enic = vnic_dev_priv(rq->vdev);
-
-	if (!buf->os_buf)
-		return;
-
-	dma_unmap_single(&enic->pdev->dev, buf->dma_addr, buf->len,
-			 DMA_FROM_DEVICE);
-	dev_kfree_skb_any(buf->os_buf);
-	buf->os_buf = NULL;
-}
-
-static int enic_rq_alloc_buf(struct vnic_rq *rq)
-{
-	struct enic *enic = vnic_dev_priv(rq->vdev);
-	struct net_device *netdev = enic->netdev;
-	struct sk_buff *skb;
-	unsigned int len = netdev->mtu + VLAN_ETH_HLEN;
-	unsigned int os_buf_index = 0;
-	dma_addr_t dma_addr;
-	struct vnic_rq_buf *buf = rq->to_use;
-
-	if (buf->os_buf) {
-		enic_queue_rq_desc(rq, buf->os_buf, os_buf_index, buf->dma_addr,
-				   buf->len);
-
-		return 0;
-	}
-	skb = netdev_alloc_skb_ip_align(netdev, len);
-	if (!skb) {
-		enic->rq[rq->index].stats.no_skb++;
-		return -ENOMEM;
-	}
-
-	dma_addr = dma_map_single(&enic->pdev->dev, skb->data, len,
-				  DMA_FROM_DEVICE);
-	if (unlikely(enic_dma_map_check(enic, dma_addr))) {
-		dev_kfree_skb(skb);
-		return -ENOMEM;
-	}
-
-	enic_queue_rq_desc(rq, skb, os_buf_index,
-		dma_addr, len);
-
-	return 0;
-}
-
-static void enic_intr_update_pkt_size(struct vnic_rx_bytes_counter *pkt_size,
-				      u32 pkt_len)
-{
-	if (ENIC_LARGE_PKT_THRESHOLD <= pkt_len)
-		pkt_size->large_pkt_bytes_cnt += pkt_len;
-	else
-		pkt_size->small_pkt_bytes_cnt += pkt_len;
-}
-
-static bool enic_rxcopybreak(struct net_device *netdev, struct sk_buff **skb,
-			     struct vnic_rq_buf *buf, u16 len)
-{
-	struct enic *enic = netdev_priv(netdev);
-	struct sk_buff *new_skb;
-
-	if (len > enic->rx_copybreak)
-		return false;
-	new_skb = netdev_alloc_skb_ip_align(netdev, len);
-	if (!new_skb)
-		return false;
-	dma_sync_single_for_cpu(&enic->pdev->dev, buf->dma_addr, len,
-				DMA_FROM_DEVICE);
-	memcpy(new_skb->data, (*skb)->data, len);
-	*skb = new_skb;
-
-	return true;
-}
-
-static void enic_rq_indicate_buf(struct vnic_rq *rq,
-	struct cq_desc *cq_desc, struct vnic_rq_buf *buf,
-	int skipped, void *opaque)
-{
-	struct enic *enic = vnic_dev_priv(rq->vdev);
-	struct net_device *netdev = enic->netdev;
-	struct sk_buff *skb;
-	struct vnic_cq *cq = &enic->cq[enic_cq_rq(enic, rq->index)];
-	struct enic_rq_stats *rqstats = &enic->rq[rq->index].stats;
-
-	u8 type, color, eop, sop, ingress_port, vlan_stripped;
-	u8 fcoe, fcoe_sof, fcoe_fc_crc_ok, fcoe_enc_error, fcoe_eof;
-	u8 tcp_udp_csum_ok, udp, tcp, ipv4_csum_ok;
-	u8 ipv6, ipv4, ipv4_fragment, fcs_ok, rss_type, csum_not_calc;
-	u8 packet_error;
-	u16 q_number, completed_index, bytes_written, vlan_tci, checksum;
-	u32 rss_hash;
-	bool outer_csum_ok = true, encap = false;
-
-	rqstats->packets++;
-	if (skipped) {
-		rqstats->desc_skip++;
-		return;
-	}
-
-	skb = buf->os_buf;
-
-	cq_enet_rq_desc_dec((struct cq_enet_rq_desc *)cq_desc,
-		&type, &color, &q_number, &completed_index,
-		&ingress_port, &fcoe, &eop, &sop, &rss_type,
-		&csum_not_calc, &rss_hash, &bytes_written,
-		&packet_error, &vlan_stripped, &vlan_tci, &checksum,
-		&fcoe_sof, &fcoe_fc_crc_ok, &fcoe_enc_error,
-		&fcoe_eof, &tcp_udp_csum_ok, &udp, &tcp,
-		&ipv4_csum_ok, &ipv6, &ipv4, &ipv4_fragment,
-		&fcs_ok);
-
-	if (packet_error) {
-
-		if (!fcs_ok) {
-			if (bytes_written > 0)
-				rqstats->bad_fcs++;
-			else if (bytes_written == 0)
-				rqstats->pkt_truncated++;
-		}
-
-		dma_unmap_single(&enic->pdev->dev, buf->dma_addr, buf->len,
-				 DMA_FROM_DEVICE);
-		dev_kfree_skb_any(skb);
-		buf->os_buf = NULL;
-
-		return;
-	}
-
-	if (eop && bytes_written > 0) {
-
-		/* Good receive
-		 */
-		rqstats->bytes += bytes_written;
-		if (!enic_rxcopybreak(netdev, &skb, buf, bytes_written)) {
-			buf->os_buf = NULL;
-			dma_unmap_single(&enic->pdev->dev, buf->dma_addr,
-					 buf->len, DMA_FROM_DEVICE);
-		}
-		prefetch(skb->data - NET_IP_ALIGN);
-
-		skb_put(skb, bytes_written);
-		skb->protocol = eth_type_trans(skb, netdev);
-		skb_record_rx_queue(skb, q_number);
-		if ((netdev->features & NETIF_F_RXHASH) && rss_hash &&
-		    (type == 3)) {
-			switch (rss_type) {
-			case CQ_ENET_RQ_DESC_RSS_TYPE_TCP_IPv4:
-			case CQ_ENET_RQ_DESC_RSS_TYPE_TCP_IPv6:
-			case CQ_ENET_RQ_DESC_RSS_TYPE_TCP_IPv6_EX:
-				skb_set_hash(skb, rss_hash, PKT_HASH_TYPE_L4);
-				rqstats->l4_rss_hash++;
-				break;
-			case CQ_ENET_RQ_DESC_RSS_TYPE_IPv4:
-			case CQ_ENET_RQ_DESC_RSS_TYPE_IPv6:
-			case CQ_ENET_RQ_DESC_RSS_TYPE_IPv6_EX:
-				skb_set_hash(skb, rss_hash, PKT_HASH_TYPE_L3);
-				rqstats->l3_rss_hash++;
-				break;
-			}
-		}
-		if (enic->vxlan.vxlan_udp_port_number) {
-			switch (enic->vxlan.patch_level) {
-			case 0:
-				if (fcoe) {
-					encap = true;
-					outer_csum_ok = fcoe_fc_crc_ok;
-				}
-				break;
-			case 2:
-				if ((type == 7) &&
-				    (rss_hash & BIT(0))) {
-					encap = true;
-					outer_csum_ok = (rss_hash & BIT(1)) &&
-							(rss_hash & BIT(2));
-				}
-				break;
-			}
-		}
-
-		/* Hardware does not provide whole packet checksum. It only
-		 * provides pseudo checksum. Since hw validates the packet
-		 * checksum but not provide us the checksum value. use
-		 * CHECSUM_UNNECESSARY.
-		 *
-		 * In case of encap pkt tcp_udp_csum_ok/tcp_udp_csum_ok is
-		 * inner csum_ok. outer_csum_ok is set by hw when outer udp
-		 * csum is correct or is zero.
-		 */
-		if ((netdev->features & NETIF_F_RXCSUM) && !csum_not_calc &&
-		    tcp_udp_csum_ok && outer_csum_ok &&
-		    (ipv4_csum_ok || ipv6)) {
-			skb->ip_summed = CHECKSUM_UNNECESSARY;
-			skb->csum_level = encap;
-			if (encap)
-				rqstats->csum_unnecessary_encap++;
-			else
-				rqstats->csum_unnecessary++;
-		}
-
-		if (vlan_stripped) {
-			__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), vlan_tci);
-			rqstats->vlan_stripped++;
-		}
-		skb_mark_napi_id(skb, &enic->napi[rq->index]);
-		if (!(netdev->features & NETIF_F_GRO))
-			netif_receive_skb(skb);
-		else
-			napi_gro_receive(&enic->napi[q_number], skb);
-		if (enic->rx_coalesce_setting.use_adaptive_rx_coalesce)
-			enic_intr_update_pkt_size(&cq->pkt_size_counter,
-						  bytes_written);
-	} else {
-
-		/* Buffer overflow
-		 */
-		rqstats->pkt_truncated++;
-		dma_unmap_single(&enic->pdev->dev, buf->dma_addr, buf->len,
-				 DMA_FROM_DEVICE);
-		dev_kfree_skb_any(skb);
-		buf->os_buf = NULL;
-	}
-}
-
-static int enic_rq_service(struct vnic_dev *vdev, struct cq_desc *cq_desc,
-	u8 type, u16 q_number, u16 completed_index, void *opaque)
-{
-	struct enic *enic = vnic_dev_priv(vdev);
-
-	vnic_rq_service(&enic->rq[q_number].vrq, cq_desc,
-		completed_index, VNIC_RQ_RETURN_DESC,
-		enic_rq_indicate_buf, opaque);
-
-	return 0;
-}
-
 static void enic_set_int_moderation(struct enic *enic, struct vnic_rq *rq)
 {
 	unsigned int intr = enic_msix_rq_intr(enic, rq->index);
@@ -1589,12 +1375,10 @@ static int enic_poll(struct napi_struct *napi, int budget)
 	unsigned int  work_done, rq_work_done = 0, wq_work_done;
 	int err;
 
-	wq_work_done = vnic_cq_service(&enic->cq[cq_wq], wq_work_to_do,
-				       enic_wq_service, NULL);
+	wq_work_done = enic_wq_cq_service(enic, cq_wq, wq_work_to_do);
 
 	if (budget > 0)
-		rq_work_done = vnic_cq_service(&enic->cq[cq_rq],
-			rq_work_to_do, enic_rq_service, NULL);
+		rq_work_done = enic_rq_cq_service(enic, cq_rq, rq_work_to_do);
 
 	/* Accumulate intr event credits for this polling
 	 * cycle.  An intr event is the completion of a
@@ -1693,8 +1477,8 @@ static int enic_poll_msix_wq(struct napi_struct *napi, int budget)
 	wq_irq = wq->index;
 	cq = enic_cq_wq(enic, wq_irq);
 	intr = enic_msix_wq_intr(enic, wq_irq);
-	wq_work_done = vnic_cq_service(&enic->cq[cq], wq_work_to_do,
-				       enic_wq_service, NULL);
+
+	wq_work_done = enic_wq_cq_service(enic, cq, wq_work_to_do);
 
 	vnic_intr_return_credits(&enic->intr[intr], wq_work_done,
 				 0 /* don't unmask intr */,
@@ -1723,8 +1507,7 @@ static int enic_poll_msix_rq(struct napi_struct *napi, int budget)
 	 */
 
 	if (budget > 0)
-		work_done = vnic_cq_service(&enic->cq[cq],
-			work_to_do, enic_rq_service, NULL);
+		work_done = enic_rq_cq_service(enic, cq, work_to_do);
 
 	/* Return intr event credits for this polling
 	 * cycle.  An intr event is the completion of a
@@ -1770,7 +1553,7 @@ static int enic_poll_msix_rq(struct napi_struct *napi, int budget)
 
 static void enic_notify_timer(struct timer_list *t)
 {
-	struct enic *enic = from_timer(enic, t, notify_timer);
+	struct enic *enic = timer_container_of(enic, t, notify_timer);
 
 	enic_notify_check(enic);
 
@@ -1901,36 +1684,6 @@ static void enic_synchronize_irqs(struct enic *enic)
 	}
 }
 
-static void enic_set_rx_coal_setting(struct enic *enic)
-{
-	unsigned int speed;
-	int index = -1;
-	struct enic_rx_coal *rx_coal = &enic->rx_coalesce_setting;
-
-	/* 1. Read the link speed from fw
-	 * 2. Pick the default range for the speed
-	 * 3. Update it in enic->rx_coalesce_setting
-	 */
-	speed = vnic_dev_port_speed(enic->vdev);
-	if (ENIC_LINK_SPEED_10G < speed)
-		index = ENIC_LINK_40G_INDEX;
-	else if (ENIC_LINK_SPEED_4G < speed)
-		index = ENIC_LINK_10G_INDEX;
-	else
-		index = ENIC_LINK_4G_INDEX;
-
-	rx_coal->small_pkt_range_start = mod_range[index].small_pkt_range_start;
-	rx_coal->large_pkt_range_start = mod_range[index].large_pkt_range_start;
-	rx_coal->range_end = ENIC_RX_COALESCE_RANGE_END;
-
-	/* Start with the value provided by UCSM */
-	for (index = 0; index < enic->rq_count; index++)
-		enic->cq[index].cur_rx_coal_timeval =
-				enic->config.intr_timer_usec;
-
-	rx_coal->use_adaptive_rx_coalesce = 1;
-}
-
 static int enic_dev_notify_set(struct enic *enic)
 {
 	int err;
@@ -1971,6 +1724,17 @@ static int enic_open(struct net_device *netdev)
 	struct enic *enic = netdev_priv(netdev);
 	unsigned int i;
 	int err, ret;
+	unsigned int max_pkt_len = netdev->mtu + VLAN_ETH_HLEN;
+	struct page_pool_params pp_params = {
+		.order = get_order(max_pkt_len),
+		.pool_size = enic->config.rq_desc_count,
+		.nid = dev_to_node(&enic->pdev->dev),
+		.dev = &enic->pdev->dev,
+		.dma_dir = DMA_FROM_DEVICE,
+		.max_len = (max_pkt_len > PAGE_SIZE) ? max_pkt_len : PAGE_SIZE,
+		.netdev = netdev,
+		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+	};
 
 	err = enic_request_intr(enic);
 	if (err) {
@@ -1988,6 +1752,16 @@ static int enic_open(struct net_device *netdev)
 	}
 
 	for (i = 0; i < enic->rq_count; i++) {
+		/* create a page pool for each RQ */
+		pp_params.napi = &enic->napi[i];
+		pp_params.queue_idx = i;
+		enic->rq[i].pool = page_pool_create(&pp_params);
+		if (IS_ERR(enic->rq[i].pool)) {
+			err = PTR_ERR(enic->rq[i].pool);
+			enic->rq[i].pool = NULL;
+			goto err_out_free_rq;
+		}
+
 		/* enable rq before updating rq desc */
 		vnic_rq_enable(&enic->rq[i].vrq);
 		vnic_rq_fill(&enic->rq[i].vrq, enic_rq_alloc_buf);
@@ -2015,21 +1789,41 @@ static int enic_open(struct net_device *netdev)
 	if (vnic_dev_get_intr_mode(enic->vdev) == VNIC_DEV_INTR_MODE_MSIX)
 		for (i = 0; i < enic->wq_count; i++)
 			napi_enable(&enic->napi[enic_cq_wq(enic, i)]);
-	enic_dev_enable(enic);
+	err = enic_dev_enable(enic);
+	if (err) {
+		netdev_err(netdev, "Failed to enable device: %d\n", err);
+		goto err_out_dev_enable;
+	}
 
 	for (i = 0; i < enic->intr_count; i++)
 		vnic_intr_unmask(&enic->intr[i]);
 
 	enic_notify_timer_start(enic);
 	enic_rfs_timer_start(enic);
+	if (enic_is_sriov_vf_v2(enic))
+		enic_mbox_vf_link_state_set_running(enic, true);
 
 	return 0;
 
+err_out_dev_enable:
+	for (i = 0; i < enic->rq_count; i++)
+		napi_disable(&enic->napi[i]);
+	if (vnic_dev_get_intr_mode(enic->vdev) == VNIC_DEV_INTR_MODE_MSIX)
+		for (i = 0; i < enic->wq_count; i++)
+			napi_disable(&enic->napi[enic_cq_wq(enic, i)]);
+	netif_tx_disable(netdev);
+	if (!enic_is_dynamic(enic) && !enic_is_sriov_vf(enic))
+		enic_dev_del_station_addr(enic);
+	for (i = 0; i < enic->wq_count; i++)
+		vnic_wq_disable(&enic->wq[i].vwq);
 err_out_free_rq:
 	for (i = 0; i < enic->rq_count; i++) {
 		ret = vnic_rq_disable(&enic->rq[i].vrq);
-		if (!ret)
+		if (!ret) {
 			vnic_rq_clean(&enic->rq[i].vrq, enic_free_rq_buf);
+			page_pool_destroy(enic->rq[i].pool);
+			enic->rq[i].pool = NULL;
+		}
 	}
 	enic_dev_notify_unset(enic);
 err_out_free_intr:
@@ -2053,7 +1847,7 @@ static int enic_stop(struct net_device *netdev)
 
 	enic_synchronize_irqs(enic);
 
-	del_timer_sync(&enic->notify_timer);
+	timer_delete_sync(&enic->notify_timer);
 	enic_rfs_flw_tbl_free(enic);
 
 	enic_dev_disable(enic);
@@ -2061,7 +1855,10 @@ static int enic_stop(struct net_device *netdev)
 	for (i = 0; i < enic->rq_count; i++)
 		napi_disable(&enic->napi[i]);
 
-	netif_carrier_off(netdev);
+	if (enic_is_sriov_vf_v2(enic))
+		enic_mbox_vf_link_state_set_running(enic, false);
+	else
+		netif_carrier_off(netdev);
 	if (vnic_dev_get_intr_mode(enic->vdev) == VNIC_DEV_INTR_MODE_MSIX)
 		for (i = 0; i < enic->wq_count; i++)
 			napi_disable(&enic->napi[enic_cq_wq(enic, i)]);
@@ -2087,8 +1884,11 @@ static int enic_stop(struct net_device *netdev)
 
 	for (i = 0; i < enic->wq_count; i++)
 		vnic_wq_clean(&enic->wq[i].vwq, enic_free_wq_buf);
-	for (i = 0; i < enic->rq_count; i++)
+	for (i = 0; i < enic->rq_count; i++) {
 		vnic_rq_clean(&enic->rq[i].vrq, enic_free_rq_buf);
+		page_pool_destroy(enic->rq[i].pool);
+		enic->rq[i].pool = NULL;
+	}
 	for (i = 0; i < enic->cq_count; i++)
 		vnic_cq_clean(&enic->cq[i]);
 	for (i = 0; i < enic->intr_count; i++)
@@ -2127,10 +1927,10 @@ static int enic_change_mtu(struct net_device *netdev, int new_mtu)
 	if (enic_is_dynamic(enic) || enic_is_sriov_vf(enic))
 		return -EOPNOTSUPP;
 
-	if (netdev->mtu > enic->port_mtu)
+	if (new_mtu > enic->port_mtu)
 		netdev_warn(netdev,
 			    "interface MTU (%d) set higher than port MTU (%d)\n",
-			    netdev->mtu, enic->port_mtu);
+			    new_mtu, enic->port_mtu);
 
 	return _enic_change_mtu(netdev, new_mtu);
 }
@@ -2386,6 +2186,75 @@ static void enic_set_api_busy(struct enic *enic, bool busy)
 	spin_unlock(&enic->enic_api_lock);
 }
 
+/* The admin/MBOX channel exists on a V2 PF while SR-IOV is enabled and on
+ * every V2 VF.  A reset wipes the admin WQ/RQ/CQ, so such devices must tear
+ * the channel down before the reset and re-establish it afterwards.
+ */
+static bool enic_has_admin_chan(struct enic *enic)
+{
+	return enic_is_sriov_vf_v2(enic) ||
+	       (enic_sriov_enabled(enic) && enic->vf_type == ENIC_VF_TYPE_V2);
+}
+
+/* Re-establish the admin/MBOX channel after a reset has re-created the data
+ * path.  Mirrors the relevant part of the probe / SR-IOV-enable sequence:
+ * reinitialise MBOX and reopen the channel, then for a VF re-run the PF
+ * handshake (the reset wiped the VF's admin QP, so the VF must register
+ * again), or for a PF re-push the current link state to registered VFs.
+ */
+static void enic_admin_chan_reopen(struct enic *enic)
+{
+	int err;
+
+	/* Install the MBOX receive handler and clear pending reply state before
+	 * opening the channel, so the handler is in place before the admin
+	 * interrupt is unmasked and no early completion is dropped.  Keep the
+	 * sequence number monotonic across channel generations.
+	 */
+	enic_mbox_init(enic);
+
+	/* A reset destroys the VF's local admin QP, so the VF can no longer
+	 * rely on its previous registration.  The PF may retain stale software
+	 * registration state until the VF successfully registers again.
+	 * Clear the local flag before reopening so a failed reopen or
+	 * re-handshake cannot leave the VF believing it has a usable PF
+	 * registration over a dead channel.
+	 */
+	if (enic_is_sriov_vf_v2(enic))
+		WRITE_ONCE(enic->vf_registered, false);
+
+	err = enic_admin_channel_open(enic);
+	if (err) {
+		netdev_err(enic->netdev,
+			   "admin channel reopen after reset failed: %d\n", err);
+		return;
+	}
+
+	if (enic_is_sriov_vf_v2(enic)) {
+		err = enic_mbox_vf_capability_check(enic);
+		if (err) {
+			netdev_err(enic->netdev,
+				   "MBOX capability check after reset failed: %d\n",
+				   err);
+			enic_admin_channel_close(enic);
+			return;
+		}
+		err = enic_mbox_vf_register(enic);
+		if (err) {
+			netdev_err(enic->netdev,
+				   "MBOX VF re-registration after reset failed: %d\n",
+				   err);
+			enic_admin_channel_close(enic);
+		}
+	} else {
+		/* The link came back up during enic_open() above while MBOX
+		 * sends were still disabled (channel not yet reopened), so that
+		 * link-notify was dropped.  Re-push current link state now.
+		 */
+		schedule_work(&enic->link_notify_work);
+	}
+}
+
 static void enic_reset(struct work_struct *work)
 {
 	struct enic *enic = container_of(work, struct enic, reset);
@@ -2398,13 +2267,35 @@ static void enic_reset(struct work_struct *work)
 	/* Stop any activity from infiniband */
 	enic_set_api_busy(enic, true);
 
+	/* Fully tear down the V2 admin/MBOX channel before the soft reset.
+	 * The reset wipes all hardware queues including the admin WQ/RQ;
+	 * closing first tells firmware to stop the admin QP (so it no longer
+	 * DMAs from the about-to-be-reset rings) and frees the admin resources
+	 * so they are cleanly re-allocated afterwards.
+	 */
+	if (enic_has_admin_chan(enic))
+		enic_admin_channel_close(enic);
+
 	enic_stop(enic->netdev);
+	if (enic_is_sriov_vf_v2(enic))
+		enic_mbox_vf_link_state_reset(enic);
+
 	enic_dev_soft_reset(enic);
 	enic_reset_addr_lists(enic);
 	enic_init_vnic_resources(enic);
 	enic_set_rss_nic_cfg(enic);
 	enic_dev_set_ig_vlan_rewrite_mode(enic);
+	enic_ext_cq(enic);
+
 	enic_open(enic->netdev);
+
+	/* Re-establish the admin/MBOX channel after the data path is back up.
+	 * It was fully torn down by enic_admin_channel_close() above;
+	 * enic_admin_chan_reopen() reopens it and, for a PF re-pushes link
+	 * state, or for a VF re-runs the probe-time PF handshake.
+	 */
+	if (enic_has_admin_chan(enic))
+		enic_admin_chan_reopen(enic);
 
 	/* Allow infiniband to fiddle with the device again */
 	enic_set_api_busy(enic, false);
@@ -2423,14 +2314,34 @@ static void enic_tx_hang_reset(struct work_struct *work)
 	/* Stop any activity from infiniband */
 	enic_set_api_busy(enic, true);
 
+	/* Fully tear down the V2 admin/MBOX channel before the hang reset, for
+	 * the same reason as the soft reset path: stop the admin QP and free
+	 * the admin resources before the hardware queues are wiped.
+	 */
+	if (enic_has_admin_chan(enic))
+		enic_admin_channel_close(enic);
+
 	enic_dev_hang_notify(enic);
 	enic_stop(enic->netdev);
+	if (enic_is_sriov_vf_v2(enic))
+		enic_mbox_vf_link_state_reset(enic);
+
 	enic_dev_hang_reset(enic);
 	enic_reset_addr_lists(enic);
 	enic_init_vnic_resources(enic);
 	enic_set_rss_nic_cfg(enic);
 	enic_dev_set_ig_vlan_rewrite_mode(enic);
+	enic_ext_cq(enic);
+
 	enic_open(enic->netdev);
+
+	/* Re-establish the admin/MBOX channel after the data path is back up.
+	 * It was fully torn down by enic_admin_channel_close() above;
+	 * enic_admin_chan_reopen() reopens it and, for a PF re-pushes link
+	 * state, or for a VF re-runs the probe-time PF handshake.
+	 */
+	if (enic_has_admin_chan(enic))
+		enic_admin_chan_reopen(enic);
 
 	/* Allow infiniband to fiddle with the device again */
 	enic_set_api_busy(enic, false);
@@ -2442,6 +2353,8 @@ static void enic_tx_hang_reset(struct work_struct *work)
 
 static int enic_set_intr_mode(struct enic *enic)
 {
+	unsigned int admin_reserve = enic->has_admin_channel ? 1 : 0;
+	unsigned int min_intr = ENIC_MSIX_MIN_INTR + admin_reserve;
 	unsigned int i;
 	int num_intr;
 
@@ -2452,12 +2365,12 @@ static int enic_set_intr_mode(struct enic *enic)
 	 */
 
 	if (enic->config.intr_mode < 1 &&
-	    enic->intr_avail >= ENIC_MSIX_MIN_INTR) {
+	    enic->intr_avail >= min_intr) {
 		for (i = 0; i < enic->intr_avail; i++)
 			enic->msix_entry[i].entry = i;
 
 		num_intr = pci_enable_msix_range(enic->pdev, enic->msix_entry,
-						 ENIC_MSIX_MIN_INTR,
+						 min_intr,
 						 enic->intr_avail);
 		if (num_intr > 0) {
 			vnic_dev_set_intr_mode(enic->vdev,
@@ -2552,15 +2465,27 @@ static int enic_adjust_resources(struct enic *enic)
 		enic->cq_count = 2;
 		enic->intr_count = enic->intr_avail;
 		break;
-	case VNIC_DEV_INTR_MODE_MSIX:
+	case VNIC_DEV_INTR_MODE_MSIX: {
 		/* Adjust the number of wqs/rqs/cqs/interrupts that will be
-		 * used based on which resource is the most constrained
+		 * used based on which resource is the most constrained.
+		 * Reserve one extra MSI-X slot for the admin channel INTR
+		 * when has_admin_channel is set so that
+		 * enic_admin_setup_intr() can allocate at intr_count
+		 * within the intr_avail bounds even when the data queue
+		 * count is maxed out.  intr_count counts only the data-path
+		 * IRQs (registered by enic_request_intr()); the admin INTR
+		 * lives at msix index intr_count and is set up later by
+		 * enic_admin_setup_intr().
 		 */
+		unsigned int admin_reserve = enic->has_admin_channel ? 1 : 0;
+
 		wq_avail = min(enic->wq_avail, ENIC_WQ_MAX);
-		rq_default = netif_get_num_default_rss_queues();
+		rq_default = max(netif_get_num_default_rss_queues(),
+				 ENIC_RQ_MIN_DEFAULT);
 		rq_avail = min3(enic->rq_avail, ENIC_RQ_MAX, rq_default);
 		max_queues = min(enic->cq_avail,
-				 enic->intr_avail - ENIC_MSIX_RESERVED_INTR);
+				 enic->intr_avail - ENIC_MSIX_RESERVED_INTR -
+				 admin_reserve);
 		if (wq_avail + rq_avail <= max_queues) {
 			enic->rq_count = rq_avail;
 			enic->wq_count = wq_avail;
@@ -2578,6 +2503,7 @@ static int enic_adjust_resources(struct enic *enic)
 		enic->intr_count = enic->cq_count + ENIC_MSIX_RESERVED_INTR;
 
 		break;
+	}
 	default:
 		dev_err(enic_get_dev(enic), "Unknown interrupt mode\n");
 		return -EINVAL;
@@ -2598,6 +2524,7 @@ static void enic_get_queue_stats_rx(struct net_device *dev, int idx,
 	rxs->hw_drop_overruns = rqstats->pkt_truncated;
 	rxs->csum_unnecessary = rqstats->csum_unnecessary +
 				rqstats->csum_unnecessary_encap;
+	rxs->alloc_fail = rqstats->pp_alloc_fail;
 }
 
 static void enic_get_queue_stats_tx(struct net_device *dev, int idx,
@@ -2625,6 +2552,7 @@ static void enic_get_base_stats(struct net_device *dev,
 	rxs->hw_drops = 0;
 	rxs->hw_drop_overruns = 0;
 	rxs->csum_unnecessary = 0;
+	rxs->alloc_fail = 0;
 	txs->bytes = 0;
 	txs->packets = 0;
 	txs->csum_none = 0;
@@ -2714,35 +2642,32 @@ static void enic_free_enic_resources(struct enic *enic)
 
 static int enic_alloc_enic_resources(struct enic *enic)
 {
-	enic->wq = kcalloc(enic->wq_avail, sizeof(struct enic_wq), GFP_KERNEL);
+	enic->wq = kzalloc_objs(struct enic_wq, enic->wq_avail);
 	if (!enic->wq)
 		goto free_queues;
 
-	enic->rq = kcalloc(enic->rq_avail, sizeof(struct enic_rq), GFP_KERNEL);
+	enic->rq = kzalloc_objs(struct enic_rq, enic->rq_avail);
 	if (!enic->rq)
 		goto free_queues;
 
-	enic->cq = kcalloc(enic->cq_avail, sizeof(struct vnic_cq), GFP_KERNEL);
+	enic->cq = kzalloc_objs(struct vnic_cq, enic->cq_avail);
 	if (!enic->cq)
 		goto free_queues;
 
-	enic->napi = kcalloc(enic->wq_avail + enic->rq_avail,
-			     sizeof(struct napi_struct), GFP_KERNEL);
+	enic->napi = kzalloc_objs(struct napi_struct,
+				  enic->wq_avail + enic->rq_avail);
 	if (!enic->napi)
 		goto free_queues;
 
-	enic->msix_entry = kcalloc(enic->intr_avail, sizeof(struct msix_entry),
-				   GFP_KERNEL);
+	enic->msix_entry = kzalloc_objs(struct msix_entry, enic->intr_avail);
 	if (!enic->msix_entry)
 		goto free_queues;
 
-	enic->msix = kcalloc(enic->intr_avail, sizeof(struct enic_msix_entry),
-			     GFP_KERNEL);
+	enic->msix = kzalloc_objs(struct enic_msix_entry, enic->intr_avail);
 	if (!enic->msix)
 		goto free_queues;
 
-	enic->intr = kcalloc(enic->intr_avail, sizeof(struct vnic_intr),
-			     GFP_KERNEL);
+	enic->intr = kzalloc_objs(struct vnic_intr, enic->intr_avail);
 	if (!enic->intr)
 		goto free_queues;
 
@@ -2801,6 +2726,8 @@ static int enic_dev_init(struct enic *enic)
 	 */
 
 	enic_get_res_counts(enic);
+
+	enic_ext_cq(enic);
 
 	err = enic_alloc_enic_resources(enic);
 	if (err) {
@@ -2877,12 +2804,203 @@ static void enic_iounmap(struct enic *enic)
 			iounmap(enic->bar[i].vaddr);
 }
 
+#ifdef CONFIG_PCI_IOV
+static void enic_sriov_detect_vf_type(struct enic *enic)
+{
+	struct pci_dev *pdev = enic->pdev;
+	u64 supported_versions, a1 = 0;
+	u16 vf_dev_id;
+	int pos;
+	int err;
+
+	if (enic_is_sriov_vf(enic) || enic_is_dynamic(enic))
+		return;
+
+	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
+	if (!pos) {
+		enic->vf_type = ENIC_VF_TYPE_NONE;
+		return;
+	}
+
+	pci_read_config_word(pdev, pos + PCI_SRIOV_VF_DID, &vf_dev_id);
+
+	switch (vf_dev_id) {
+	case PCI_DEVICE_ID_CISCO_VIC_ENET_VF:
+		enic->vf_type = ENIC_VF_TYPE_V1;
+		break;
+	case PCI_DEVICE_ID_CISCO_VIC_ENET_VF_USNIC:
+		enic->vf_type = ENIC_VF_TYPE_USNIC;
+		break;
+	case PCI_DEVICE_ID_CISCO_VIC_ENET_VF_V2:
+		enic->vf_type = ENIC_VF_TYPE_V2;
+		break;
+	default:
+		enic->vf_type = ENIC_VF_TYPE_NONE;
+		break;
+	}
+
+	if (enic->vf_type != ENIC_VF_TYPE_V2)
+		return;
+
+	/* A successful command means firmware recognizes
+	 * VIC_FEATURE_SRIOV; supported_versions is available
+	 * for sub-feature versioning in the future.
+	 */
+	err = vnic_dev_get_supported_feature_ver(enic->vdev,
+						 VIC_FEATURE_SRIOV,
+						 &supported_versions,
+						 &a1);
+	if (err) {
+		dev_warn(&pdev->dev,
+			 "SR-IOV V2 not supported by current firmware. Upgrade to VIC FW 5.3(4.72) or higher.\n");
+		enic->vf_type = ENIC_VF_TYPE_NONE;
+	}
+}
+
+static int __maybe_unused
+enic_sriov_v2_enable(struct enic *enic, int num_vfs)
+{
+	int err;
+
+	if (!enic->has_admin_channel) {
+		netdev_err(enic->netdev,
+			   "V2 SR-IOV requires admin channel resources\n");
+		return -EOPNOTSUPP;
+	}
+
+	enic->vf_state = kzalloc_objs(*enic->vf_state, num_vfs);
+	if (!enic->vf_state)
+		return -ENOMEM;
+
+	/* Install the MBOX receive handler before the admin interrupt is
+	 * unmasked in enic_admin_channel_open(), so no early completion is
+	 * dropped.
+	 */
+	enic_mbox_init(enic);
+
+	err = enic_admin_channel_open(enic);
+	if (err) {
+		netdev_err(enic->netdev,
+			   "Failed to open admin channel: %d\n", err);
+		goto free_vf_state;
+	}
+
+	enic->num_vfs = num_vfs;
+
+	err = pci_enable_sriov(enic->pdev, num_vfs);
+	if (err) {
+		netdev_err(enic->netdev,
+			   "pci_enable_sriov failed: %d\n", err);
+		goto close_admin;
+	}
+
+	enic->priv_flags |= ENIC_SRIOV_ENABLED;
+	return num_vfs;
+
+close_admin:
+	enic->num_vfs = 0;
+	enic_admin_channel_close(enic);
+free_vf_state:
+	kfree(enic->vf_state);
+	enic->vf_state = NULL;
+	return err;
+}
+
+static void enic_sriov_v2_disable(struct enic *enic)
+{
+	/* Stop new VF link-state broadcasts before tearing down vf_state.
+	 * Clearing ENIC_SRIOV_ENABLED makes enic_link_check() (called from
+	 * the notify timer/ISR) skip the VF notify path, and cancelling
+	 * link_notify_work ensures any already-queued broadcast has finished
+	 * before vf_state is freed, closing a use-after-free window.
+	 */
+	enic->priv_flags &= ~ENIC_SRIOV_ENABLED;
+	cancel_work_sync(&enic->link_notify_work);
+
+	pci_disable_sriov(enic->pdev);
+	enic_admin_channel_close(enic);
+	kfree(enic->vf_state);
+	enic->vf_state = NULL;
+	enic->num_vfs = 0;
+}
+
+/*
+ * enic_sriov_configure() and its V2 helpers are defined but not yet wired
+ * into enic_driver via .sriov_configure (see the __maybe_unused annotations);
+ * V2 enable/disable is activated in a follow-up series.  Because the callback
+ * is not registered, it cannot run concurrently with the rtnl-protected reset
+ * paths (enic_reset(), enic_tx_hang_reset()) yet.  Serialization against those
+ * paths is added together with the .sriov_configure wiring in that series.
+ */
+static int __maybe_unused
+enic_sriov_configure(struct pci_dev *pdev, int num_vfs)
+{
+	struct net_device *netdev = pci_get_drvdata(pdev);
+	struct enic *enic = netdev_priv(netdev);
+	struct enic_port_profile *pp;
+	int err;
+
+	if (num_vfs > 0) {
+		if (enic->config.mq_subvnic_count) {
+			netdev_err(netdev,
+				   "SR-IOV not supported with multi-queue sub-vnics\n");
+			return -EOPNOTSUPP;
+		}
+
+		if (enic->vf_type == ENIC_VF_TYPE_NONE) {
+			netdev_err(netdev,
+				   "SR-IOV not supported on this firmware version\n");
+			return -EOPNOTSUPP;
+		}
+
+		if (enic->vf_type == ENIC_VF_TYPE_V2)
+			return enic_sriov_v2_enable(enic, num_vfs);
+
+		pp = kzalloc_objs(*pp, num_vfs);
+		if (!pp)
+			return -ENOMEM;
+
+		err = pci_enable_sriov(pdev, num_vfs);
+		if (err) {
+			kfree(pp);
+			return err;
+		}
+
+		kfree(enic->pp);
+		enic->pp = pp;
+		enic->num_vfs = num_vfs;
+		enic->priv_flags |= ENIC_SRIOV_ENABLED;
+		return num_vfs;
+	}
+
+	if (!enic_sriov_enabled(enic))
+		return 0;
+
+	if (enic->vf_type == ENIC_VF_TYPE_V2) {
+		enic_sriov_v2_disable(enic);
+		return 0;
+	}
+
+	pp = kzalloc_obj(*enic->pp);
+	if (!pp)
+		return -ENOMEM;
+
+	pci_disable_sriov(pdev);
+	enic->num_vfs = 0;
+	enic->priv_flags &= ~ENIC_SRIOV_ENABLED;
+
+	kfree(enic->pp);
+	enic->pp = pp;
+
+	return 0;
+}
+#endif
+
 static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct device *dev = &pdev->dev;
 	struct net_device *netdev;
 	struct enic *enic;
-	int using_dac = 0;
 	unsigned int i;
 	int err;
 #ifdef CONFIG_PCI_IOV
@@ -2906,6 +3024,7 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	enic = netdev_priv(netdev);
 	enic->netdev = netdev;
 	enic->pdev = pdev;
+	spin_lock_init(&enic->vf_link_state_lock);
 
 	/* Setup PCI resources
 	 */
@@ -2924,20 +3043,11 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_master(pdev);
 
-	/* Query PCI controller on system for DMA addressing
-	 * limitation for the device.  Try 47-bit first, and
-	 * fail to 32-bit.
-	 */
-
+	/* The device supports DMA addresses up to 47 bits. */
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(47));
 	if (err) {
-		err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(dev, "No usable DMA configuration, aborting\n");
-			goto err_out_release_regions;
-		}
-	} else {
-		using_dac = 1;
+		dev_err(dev, "No usable DMA configuration, aborting\n");
+		goto err_out_release_regions;
 	}
 
 	/* Map vNIC resources from BAR0-5
@@ -2973,12 +3083,23 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_out_vnic_unregister;
 
 #ifdef CONFIG_PCI_IOV
-	/* Get number of subvnics */
+	enic_sriov_detect_vf_type(enic);
+
+	/* Auto-enable SR-IOV only for the legacy VF types.  V2 VFs require
+	 * the admin channel, which is not yet set up at probe time (V2 SR-IOV
+	 * will be enabled through the sysfs .sriov_configure callback once a
+	 * follow-up series wires it up); and a V2-capable device whose
+	 * firmware lacks V2 support is downgraded to ENIC_VF_TYPE_NONE by
+	 * enic_sriov_detect_vf_type() and must not be brought up through the
+	 * legacy pci_enable_sriov() path either.
+	 */
 	pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
 	if (pos) {
 		pci_read_config_word(pdev, pos + PCI_SRIOV_TOTAL_VF,
 			&enic->num_vfs);
-		if (enic->num_vfs) {
+		if (enic->num_vfs &&
+		    (enic->vf_type == ENIC_VF_TYPE_V1 ||
+		     enic->vf_type == ENIC_VF_TYPE_USNIC)) {
 			err = pci_enable_sriov(pdev, enic->num_vfs);
 			if (err) {
 				dev_err(dev, "SRIOV enable failed, aborting."
@@ -2993,7 +3114,7 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 #endif
 
 	/* Allocate structure for port profiles */
-	enic->pp = kcalloc(num_pps, sizeof(*enic->pp), GFP_KERNEL);
+	enic->pp = kzalloc_objs(*enic->pp, num_pps);
 	if (!enic->pp) {
 		err = -ENOMEM;
 		goto err_out_disable_sriov_pp;
@@ -3054,6 +3175,42 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto err_out_dev_close;
 	}
 
+	/* Initialise link_notify_work before the V2-VF admin-open block below:
+	 * its error path (err_out_admin_close -> enic_admin_channel_close() ->
+	 * cancel_work_sync()) would otherwise act on an uninitialised work.
+	 */
+	INIT_WORK(&enic->link_notify_work, enic_link_notify_work_handler);
+
+	/* V2 VF: open admin channel and register with PF.
+	 * Must happen before register_netdev so the VF is fully
+	 * initialized before the interface is visible to userspace.
+	 *
+	 * enic_mbox_init() installs the receive handler and resets the
+	 * sequence number; it must run before enic_admin_channel_open()
+	 * unmasks the admin interrupt so an early completion is not dropped.
+	 */
+	if (enic_is_sriov_vf_v2(enic)) {
+		enic_mbox_init(enic);
+		err = enic_admin_channel_open(enic);
+		if (err) {
+			dev_err(dev,
+				"Failed to open admin channel: %d\n", err);
+			goto err_out_dev_deinit;
+		}
+		err = enic_mbox_vf_capability_check(enic);
+		if (err) {
+			dev_err(dev,
+				"MBOX capability check failed: %d\n", err);
+			goto err_out_admin_close;
+		}
+		err = enic_mbox_vf_register(enic);
+		if (err) {
+			dev_err(dev,
+				"MBOX VF registration failed: %d\n", err);
+			goto err_out_admin_close;
+		}
+	}
+
 	netif_set_real_num_tx_queues(netdev, enic->wq_count);
 	netif_set_real_num_rx_queues(netdev, enic->rq_count);
 
@@ -3063,7 +3220,6 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	timer_setup(&enic->notify_timer, enic_notify_timer, 0);
 
 	enic_rfs_flw_tbl_init(enic);
-	enic_set_rx_coal_setting(enic);
 	INIT_WORK(&enic->reset, enic_reset);
 	INIT_WORK(&enic->tx_hang_reset, enic_tx_hang_reset);
 	INIT_WORK(&enic->change_mtu_work, enic_change_mtu_work);
@@ -3079,7 +3235,7 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	err = enic_set_mac_addr(netdev, enic->mac_addr);
 	if (err) {
 		dev_err(dev, "Invalid MAC address, aborting\n");
-		goto err_out_dev_deinit;
+		goto err_out_admin_close;
 	}
 
 	enic->tx_coalesce_usecs = enic->config.intr_timer_usec;
@@ -3164,8 +3320,7 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	netdev->hw_features |= NETIF_F_NTUPLE;
 #endif
 
-	if (using_dac)
-		netdev->features |= NETIF_F_HIGHDMA;
+	netdev->features |= NETIF_F_HIGHDMA;
 
 	netdev->priv_flags |= IFF_UNICAST_FLT;
 
@@ -3177,12 +3332,23 @@ static int enic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	err = register_netdev(netdev);
 	if (err) {
 		dev_err(dev, "Cannot register net device, aborting\n");
-		goto err_out_dev_deinit;
+		goto err_out_admin_close;
 	}
-	enic->rx_copybreak = RX_COPYBREAK_DEFAULT;
 
 	return 0;
 
+err_out_admin_close:
+	if (enic_is_sriov_vf_v2(enic)) {
+		if (READ_ONCE(enic->vf_registered)) {
+			int unreg_err = enic_mbox_vf_unregister(enic);
+
+			if (unreg_err)
+				netdev_warn(netdev,
+					    "Failed to unregister from PF: %d\n",
+					    unreg_err);
+		}
+		enic_admin_channel_close(enic);
+	}
 err_out_dev_deinit:
 	enic_dev_deinit(enic);
 err_out_dev_close:
@@ -3217,17 +3383,43 @@ static void enic_remove(struct pci_dev *pdev)
 	if (netdev) {
 		struct enic *enic = netdev_priv(netdev);
 
-		cancel_work_sync(&enic->reset);
-		cancel_work_sync(&enic->change_mtu_work);
+		disable_work_sync(&enic->reset);
+		disable_work_sync(&enic->tx_hang_reset);
+		disable_work_sync(&enic->change_mtu_work);
+
+		/* Close the admin channel and unregister from the PF before
+		 * unregister_netdev() to prevent a late PF notification from
+		 * touching a netdev that is being torn down.
+		 */
+		if (enic_is_sriov_vf_v2(enic)) {
+			if (READ_ONCE(enic->vf_registered)) {
+				int unreg_err = enic_mbox_vf_unregister(enic);
+
+				if (unreg_err)
+					netdev_warn(netdev,
+						    "Failed to unregister from PF: %d\n",
+						    unreg_err);
+			}
+			enic_admin_channel_close(enic);
+		}
+
 		unregister_netdev(netdev);
-		enic_dev_deinit(enic);
-		vnic_dev_close(enic->vdev);
+		/* unregister_netdev() -> enic_stop() stops the notify timer, so
+		 * no new link_notify_work can be queued past this point.  Cancel
+		 * unconditionally to cover the narrow window where
+		 * enic_link_check() scheduled it just as SR-IOV was disabled.
+		 */
+		cancel_work_sync(&enic->link_notify_work);
 #ifdef CONFIG_PCI_IOV
 		if (enic_sriov_enabled(enic)) {
-			pci_disable_sriov(pdev);
-			enic->priv_flags &= ~ENIC_SRIOV_ENABLED;
+			if (enic->vf_type == ENIC_VF_TYPE_V2)
+				enic_sriov_v2_disable(enic);
+			else
+				pci_disable_sriov(pdev);
 		}
 #endif
+		enic_dev_deinit(enic);
+		vnic_dev_close(enic->vdev);
 		kfree(enic->pp);
 		vnic_dev_unregister(enic->vdev);
 		enic_iounmap(enic);

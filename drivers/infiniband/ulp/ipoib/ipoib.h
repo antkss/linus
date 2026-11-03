@@ -87,6 +87,7 @@ enum {
 	IPOIB_FLAG_INITIALIZED	  = 1,
 	IPOIB_FLAG_ADMIN_UP	  = 2,
 	IPOIB_PKEY_ASSIGNED	  = 3,
+	IPOIB_FLAG_MCAST_FLUSH	  = 4,
 	IPOIB_FLAG_SUBINTERFACE	  = 5,
 	IPOIB_STOP_REAPER	  = 7,
 	IPOIB_FLAG_ADMIN_CM	  = 9,
@@ -329,14 +330,6 @@ struct ipoib_dev_priv {
 
 	unsigned long flags;
 
-	/*
-	 * This protects access to the child_intfs list.
-	 * To READ from child_intfs the RTNL or vlan_rwsem read side must be
-	 * held.  To WRITE RTNL and the vlan_rwsem write side must be held (in
-	 * that order) This lock exists because we have a few contexts where
-	 * we need the child_intfs, but do not want to grab the RTNL.
-	 */
-	struct rw_semaphore vlan_rwsem;
 	struct mutex mcast_mutex;
 
 	struct rb_root  path_tree;
@@ -399,6 +392,9 @@ struct ipoib_dev_priv {
 	struct ib_event_handler event_handler;
 
 	struct net_device *parent;
+	/* 'child_intfs' and 'list' membership of all child devices are
+	 * protected by the netdev instance lock of 'dev'.
+	 */
 	struct list_head child_intfs;
 	struct list_head list;
 	int    child_type;
@@ -418,6 +414,12 @@ struct ipoib_dev_priv {
 	unsigned int max_send_sge;
 	const struct net_device_ops	*rn_ops;
 };
+
+static inline bool ipoib_mcast_allowed(struct ipoib_dev_priv *priv)
+{
+	return test_bit(IPOIB_FLAG_OPER_UP, &priv->flags) &&
+	       !test_bit(IPOIB_FLAG_MCAST_FLUSH, &priv->flags);
+}
 
 struct ipoib_ah {
 	struct net_device *dev;
@@ -512,6 +514,8 @@ int ipoib_intf_init(struct ib_device *hca, u32 port, const char *format,
 void ipoib_ib_dev_flush_light(struct work_struct *work);
 void ipoib_ib_dev_flush_normal(struct work_struct *work);
 void ipoib_ib_dev_flush_heavy(struct work_struct *work);
+void ipoib_queue_work(struct ipoib_dev_priv *priv,
+		      enum ipoib_flush_level level);
 void ipoib_ib_tx_timeout_work(struct work_struct *work);
 void ipoib_ib_dev_cleanup(struct net_device *dev);
 

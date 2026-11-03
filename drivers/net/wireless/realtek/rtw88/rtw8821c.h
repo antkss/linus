@@ -27,7 +27,7 @@ struct rtw8821cu_efuse {
 	u8 res11[0xcf];
 	u8 package_type;		/* 0x1fb */
 	u8 res12[0x4];
-};
+} __packed;
 
 struct rtw8821ce_efuse {
 	u8 mac_addr[ETH_ALEN];		/* 0xd0 */
@@ -47,7 +47,8 @@ struct rtw8821ce_efuse {
 	u8 ltr_en:1;
 	u8 res1:2;
 	u8 obff:2;
-	u8 res2:3;
+	u8 res2_1:1;
+	u8 res2_2:2;
 	u8 obff_cap:2;
 	u8 res3:4;
 	u8 res4[3];
@@ -63,7 +64,7 @@ struct rtw8821ce_efuse {
 	u8 res6:1;
 	u8 port_t_power_on_value:5;
 	u8 res7;
-};
+} __packed;
 
 struct rtw8821cs_efuse {
 	u8 res4[0x4a];			/* 0xd0 */
@@ -101,7 +102,7 @@ struct rtw8821c_efuse {
 		struct rtw8821cu_efuse u;
 		struct rtw8821cs_efuse s;
 	};
-};
+} __packed;
 
 static inline void
 _rtw_write32s_mask(struct rtw_dev *rtwdev, u32 addr, u32 mask, u32 data)
@@ -138,7 +139,8 @@ extern const struct rtw_chip_info rtw8821c_hw_spec;
 #define WLAN_DRV_EARLY_INT	0x04
 #define WLAN_BCN_DMA_TIME	0x02
 
-#define WLAN_RX_FILTER0		0x0FFFFFFF
+#define WLAN_RX_FILTER0		0xFFFF
+#define WLAN_RX_FILTER1		0x0FFF
 #define WLAN_RX_FILTER2		0xFFFF
 #define WLAN_RCR_CFG		0xE400220E
 #define WLAN_RXPKT_MAX_SZ	12288

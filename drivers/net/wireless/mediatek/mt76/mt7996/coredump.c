@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: ISC
+// SPDX-License-Identifier: BSD-3-Clause-Clear
 /* Copyright (C) 2023 MediaTek Inc. */
 
 #include <linux/devcoredump.h>
@@ -48,8 +48,8 @@ const struct mt7996_mem_region*
 mt7996_coredump_get_mem_layout(struct mt7996_dev *dev, u32 *num)
 {
 	switch (mt76_chip(&dev->mt76)) {
-	case 0x7990:
-	case 0x7991:
+	case MT7996_DEVICE_ID:
+	case MT7996_DEVICE_ID_2:
 		*num = ARRAY_SIZE(mt7996_mem_regions);
 		return &mt7996_mem_regions[0];
 	default:
@@ -202,11 +202,12 @@ static struct mt7996_coredump *mt7996_coredump_build(struct mt7996_dev *dev)
 	mt7996_coredump_fw_stack(dev, dump, exception);
 
 	/* gather memory content */
-	dump_mem = (struct mt7996_coredump_mem *)(buf + sofar);
-	dump_mem->len = crash_data->memdump_buf_len;
-	if (coredump_memdump && crash_data->memdump_buf_len)
+	if (coredump_memdump && crash_data->memdump_buf_len) {
+		dump_mem = (struct mt7996_coredump_mem *)(buf + sofar);
+		dump_mem->len = crash_data->memdump_buf_len;
 		memcpy(dump_mem->data, crash_data->memdump_buf,
 		       crash_data->memdump_buf_len);
+	}
 
 	mutex_unlock(&dev->dump_mutex);
 

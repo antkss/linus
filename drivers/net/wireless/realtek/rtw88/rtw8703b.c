@@ -187,11 +187,39 @@ static const struct rtw_pwr_seq_cmd trans_pre_enable_8703b[] = {
 };
 
 static const struct rtw_pwr_seq_cmd trans_carddis_to_cardemu_8703b[] = {
+	/* clear WL suspend enable and HW power down enable */
 	{0x0005,
 	 RTW_PWR_CUT_ALL_MSK,
 	 RTW_PWR_INTF_ALL_MSK,
 	 RTW_PWR_ADDR_MAC,
-	 RTW_PWR_CMD_WRITE, BIT(7), 0},
+	 RTW_PWR_CMD_WRITE, BIT(3) | BIT(7), 0},
+	/* withdraw the SDIO suspend request */
+	{0x0086,
+	 RTW_PWR_CUT_ALL_MSK,
+	 RTW_PWR_INTF_SDIO_MSK,
+	 RTW_PWR_ADDR_SDIO,
+	 RTW_PWR_CMD_WRITE, BIT(0), 0},
+	/* and wait for the interface to leave the suspended state */
+	{0x0086,
+	 RTW_PWR_CUT_ALL_MSK,
+	 RTW_PWR_INTF_SDIO_MSK,
+	 RTW_PWR_ADDR_SDIO,
+	 RTW_PWR_CMD_POLLING, BIT(1), BIT(1)},
+	/* disable WL suspend */
+	{0x0005,
+	 RTW_PWR_CUT_ALL_MSK,
+	 RTW_PWR_INTF_ALL_MSK,
+	 RTW_PWR_ADDR_MAC,
+	 RTW_PWR_CMD_WRITE, BIT(3) | BIT(4), 0},
+	/*
+	 * take the 12H LDO back out of sleep mode, which the card-disable
+	 * transition put it into
+	 */
+	{0x0023,
+	 RTW_PWR_CUT_ALL_MSK,
+	 RTW_PWR_INTF_SDIO_MSK,
+	 RTW_PWR_ADDR_MAC,
+	 RTW_PWR_CMD_WRITE, BIT(4), 0},
 	{TRANS_SEQ_END},
 };
 
@@ -412,7 +440,7 @@ static const struct rtw_pwr_seq_cmd trans_act_to_reset_mcu_8703b[] = {
 static const struct rtw_pwr_seq_cmd trans_act_to_lps_8703b[] = {
 	{0x0301,
 	 RTW_PWR_CUT_ALL_MSK,
-	 RTW_PWR_INTF_ALL_MSK,
+	 RTW_PWR_INTF_PCI_MSK,
 	 RTW_PWR_ADDR_MAC,
 	 RTW_PWR_CMD_WRITE, 0xff, 0xff},
 	{0x0522,
@@ -519,15 +547,6 @@ static const struct rtw_rqpn rqpn_table_8703b[] = {
 	 RTW_DMA_MAPPING_EXTRA, RTW_DMA_MAPPING_HIGH},
 };
 
-/* Default power index table for RTL8703B, used if EFUSE does not
- * contain valid data. Replaces EFUSE data from offset 0x10 (start of
- * txpwr_idx_table).
- */
-static const u8 rtw8703b_txpwr_idx_table[] = {
-	0x2D, 0x2D, 0x2D, 0x2D, 0x2D, 0x2D,
-	0x2D, 0x2D, 0x2D, 0x2D, 0x2D, 0x02
-};
-
 static void try_mac_from_devicetree(struct rtw_dev *rtwdev)
 {
 	struct device_node *node = rtwdev->dev->of_node;
@@ -544,15 +563,9 @@ static void try_mac_from_devicetree(struct rtw_dev *rtwdev)
 	}
 }
 
-#define DBG_EFUSE_FIX(rtwdev, name)					\
-	rtw_dbg(rtwdev, RTW_DBG_EFUSE, "Fixed invalid EFUSE value: "	\
-		# name "=0x%x\n", rtwdev->efuse.name)
-
 static int rtw8703b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 {
 	struct rtw_efuse *efuse = &rtwdev->efuse;
-	u8 *pwr = (u8 *)efuse->txpwr_idx_table;
-	bool valid = false;
 	int ret;
 
 	ret = rtw8723x_read_efuse(rtwdev, log_map);
@@ -561,51 +574,6 @@ static int rtw8703b_read_efuse(struct rtw_dev *rtwdev, u8 *log_map)
 
 	if (!is_valid_ether_addr(efuse->addr))
 		try_mac_from_devicetree(rtwdev);
-
-	/* If TX power index table in EFUSE is invalid, fall back to
-	 * built-in table.
-	 */
-	for (int i = 0; i < ARRAY_SIZE(rtw8703b_txpwr_idx_table); i++)
-		if (pwr[i] != 0xff) {
-			valid = true;
-			break;
-		}
-	if (!valid) {
-		for (int i = 0; i < ARRAY_SIZE(rtw8703b_txpwr_idx_table); i++)
-			pwr[i] = rtw8703b_txpwr_idx_table[i];
-		rtw_dbg(rtwdev, RTW_DBG_EFUSE,
-			"Replaced invalid EFUSE TX power index table.");
-		rtw8723x_debug_txpwr_limit(rtwdev,
-					   efuse->txpwr_idx_table, 2);
-	}
-
-	/* Override invalid antenna settings. */
-	if (efuse->bt_setting == 0xff) {
-		/* shared antenna */
-		efuse->bt_setting |= BIT(0);
-		/* RF path A */
-		efuse->bt_setting &= ~BIT(6);
-		DBG_EFUSE_FIX(rtwdev, bt_setting);
-	}
-
-	/* Override invalid board options: The coex code incorrectly
-	 * assumes that if bits 6 & 7 are set the board doesn't
-	 * support coex. Regd is also derived from rf_board_option and
-	 * should be 0 if there's no valid data.
-	 */
-	if (efuse->rf_board_option == 0xff) {
-		efuse->regd = 0;
-		efuse->rf_board_option &= GENMASK(5, 0);
-		DBG_EFUSE_FIX(rtwdev, rf_board_option);
-	}
-
-	/* Override invalid crystal cap setting, default comes from
-	 * vendor driver. Chip specific.
-	 */
-	if (efuse->crystal_cap == 0xff) {
-		efuse->crystal_cap = 0x20;
-		DBG_EFUSE_FIX(rtwdev, crystal_cap);
-	}
 
 	return 0;
 }
@@ -903,7 +871,7 @@ static void rtw8703b_set_channel_bb(struct rtw_dev *rtwdev, u8 channel, u8 bw,
 		rtw_write32_mask(rtwdev, REG_FPGA0_RFMOD, BIT_MASK_RFMOD, 0x0);
 		rtw_write32_mask(rtwdev, REG_FPGA1_RFMOD, BIT_MASK_RFMOD, 0x0);
 		rtw_write32_mask(rtwdev, REG_OFDM0_TX_PSD_NOISE,
-				 GENMASK(31, 20), 0x0);
+				 GENMASK(31, 30), 0x0);
 		rtw_write32(rtwdev, REG_BBRX_DFIR, 0x4A880000);
 		rtw_write32(rtwdev, REG_OFDM0_A_TX_AFE, 0x19F60000);
 		break;
@@ -962,7 +930,7 @@ static s8 get_cck_rx_pwr(struct rtw_dev *rtwdev, u8 lna_idx, u8 vga_idx)
 static void query_phy_status_cck(struct rtw_dev *rtwdev, u8 *phy_raw,
 				 struct rtw_rx_pkt_stat *pkt_stat)
 {
-	struct phy_status_8703b *phy_status = (struct phy_status_8703b *)phy_raw;
+	struct phy_status_8723x *phy_status = (struct phy_status_8723x *)phy_raw;
 	u8 vga_idx = phy_status->cck_agc_rpt_ofdm_cfosho_a & VGA_BITS;
 	u8 lna_idx = phy_status->cck_agc_rpt_ofdm_cfosho_a & LNA_L_BITS;
 	s8 rx_power;
@@ -984,7 +952,7 @@ static void query_phy_status_cck(struct rtw_dev *rtwdev, u8 *phy_raw,
 static void query_phy_status_ofdm(struct rtw_dev *rtwdev, u8 *phy_raw,
 				  struct rtw_rx_pkt_stat *pkt_stat)
 {
-	struct phy_status_8703b *phy_status = (struct phy_status_8703b *)phy_raw;
+	struct phy_status_8723x *phy_status = (struct phy_status_8723x *)phy_raw;
 	struct rtw_dm_info *dm_info = &rtwdev->dm_info;
 	s8 val_s8;
 
@@ -1198,9 +1166,9 @@ static u8 rtw8703b_iqk_rx_path(struct rtw_dev *rtwdev,
 	rtw_write32(rtwdev, REG_RXIQK_TONE_A_11N, 0x38008c1c);
 	rtw_write32(rtwdev, REG_TX_IQK_TONE_B, 0x38008c1c);
 	rtw_write32(rtwdev, REG_RX_IQK_TONE_B, 0x38008c1c);
-	rtw_write32(rtwdev, REG_TXIQK_PI_A_11N, 0x8216000f);
+	rtw_write32(rtwdev, REG_TXIQK_PI_A_11N, 0x8214030f);
 	rtw_write32(rtwdev, REG_RXIQK_PI_A_11N, 0x28110000);
-	rtw_write32(rtwdev, REG_TXIQK_PI_B, 0x28110000);
+	rtw_write32(rtwdev, REG_TXIQK_PI_B, 0x82110000);
 	rtw_write32(rtwdev, REG_RXIQK_PI_B, 0x28110000);
 
 	/* LOK setting */
@@ -1372,7 +1340,7 @@ void rtw8703b_iqk_fill_a_matrix(struct rtw_dev *rtwdev, const s32 result[])
 		return;
 
 	tmp_rx_iqi |= FIELD_PREP(BIT_MASK_RXIQ_S1_X, result[IQK_S1_RX_X]);
-	tmp_rx_iqi |= FIELD_PREP(BIT_MASK_RXIQ_S1_Y1, result[IQK_S1_RX_X]);
+	tmp_rx_iqi |= FIELD_PREP(BIT_MASK_RXIQ_S1_Y1, result[IQK_S1_RX_Y]);
 	rtw_write32(rtwdev, REG_A_RXIQI, tmp_rx_iqi);
 	rtw_write32_mask(rtwdev, REG_RXIQK_MATRIX_LSB_11N, BIT_MASK_RXIQ_S1_Y2,
 			 BIT_SET_RXIQ_S1_Y2(result[IQK_S1_RX_Y]));
@@ -1854,6 +1822,11 @@ static const struct coex_table_para table_sant_8703b[] = {
 	{0x66556aaa, 0x6a5a6aaa}, /* case-30 */
 	{0xffffffff, 0x5aaa5aaa},
 	{0x56555555, 0x5a5a5aaa},
+	{0xdaffdaff, 0xdaffdaff},
+	{0xddffddff, 0xddffddff},
+	{0xe5555555, 0xe5555555}, /* case-35 */
+	{0xea5a5a5a, 0xea5a5a5a},
+	{0xea6a6a6a, 0xea6a6a6a},
 };
 
 /* Shared-Antenna TDMA */
@@ -1892,6 +1865,7 @@ static const struct rtw_chip_ops rtw8703b_ops = {
 	.power_on		= rtw_power_on,
 	.power_off		= rtw_power_off,
 	.mac_init		= rtw8723x_mac_init,
+	.mac_postinit		= rtw8723x_mac_postinit,
 	.dump_fw_crash		= NULL,
 	.shutdown		= NULL,
 	.read_efuse		= rtw8703b_read_efuse,
@@ -1904,6 +1878,7 @@ static const struct rtw_chip_ops rtw8703b_ops = {
 	.set_antenna		= NULL,
 	.cfg_ldo25		= rtw8723x_cfg_ldo25,
 	.efuse_grant		= rtw8723x_efuse_grant,
+	.set_ampdu_factor	= NULL,
 	.false_alarm_statistics	= rtw8723x_false_alarm_statistics,
 	.phy_calibration	= rtw8703b_phy_calibration,
 	.dpk_track		= NULL,
@@ -1941,7 +1916,7 @@ const struct rtw_chip_info rtw8703b_hw_spec = {
 	.id = RTW_CHIP_TYPE_8703B,
 
 	.fw_name = "rtw88/rtw8703b_fw.bin",
-	.wlan_cpu = RTW_WCPU_11N,
+	.wlan_cpu = RTW_WCPU_8051,
 	.tx_pkt_desc_sz = 40,
 	.tx_buf_desc_sz = 16,
 	.rx_pkt_desc_sz = 24,

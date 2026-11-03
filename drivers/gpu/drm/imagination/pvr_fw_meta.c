@@ -16,6 +16,8 @@
 #include <linux/ktime.h>
 #include <linux/types.h>
 
+#include <drm/drm_print.h>
+
 #define ROGUE_FW_HEAP_META_SHIFT 25 /* 32 MB */
 
 #define POLL_TIMEOUT_USEC 1000000
@@ -370,13 +372,12 @@ configure_seg_mmu(struct pvr_device *pvr_dev, u32 **boot_conf_ptr)
 	const struct pvr_fw_layout_entry *layout_entries = pvr_dev->fw_dev.layout_entries;
 	u32 num_layout_entries = pvr_dev->fw_dev.header->layout_entry_num;
 	u64 seg_out_addr_top;
-	u32 i;
 
 	seg_out_addr_top =
 		ROGUE_FW_SEGMMU_OUTADDR_TOP_SLC(MMU_CONTEXT_MAPPING_FWPRIV,
 						ROGUE_FW_SEGMMU_META_BIFDM_ID);
 
-	for (i = 0; i < num_layout_entries; i++) {
+	for (u32 i = 0; i < num_layout_entries; i++) {
 		/*
 		 * FW code is using the bootloader segment which is already
 		 * configured on boot. FW coremem code and data don't use the
@@ -499,7 +500,18 @@ pvr_meta_init(struct pvr_device *pvr_dev)
 {
 	pvr_fw_heap_info_init(pvr_dev, ROGUE_FW_HEAP_META_SHIFT, 0);
 
+	pvr_dev->kernel_vm_ctx = pvr_vm_create_context(pvr_dev, false);
+	if (IS_ERR(pvr_dev->kernel_vm_ctx))
+		return PTR_ERR(pvr_dev->kernel_vm_ctx);
+
 	return 0;
+}
+
+static void
+pvr_meta_fini(struct pvr_device *pvr_dev)
+{
+	WARN_ON(!pvr_vm_context_put(pvr_dev->kernel_vm_ctx));
+	pvr_dev->kernel_vm_ctx = NULL;
 }
 
 static u32
@@ -508,9 +520,13 @@ pvr_meta_get_fw_addr_with_offset(struct pvr_fw_object *fw_obj, u32 offset)
 	u32 fw_addr = fw_obj->fw_addr_offset + offset + ROGUE_FW_SEGMMU_DATA_BASE_ADDRESS;
 
 	/* META cacheability is determined by address. */
-	if (fw_obj->gem->flags & PVR_BO_FW_FLAGS_DEVICE_UNCACHED)
+	if (fw_obj->gem->flags & PVR_BO_FW_FLAGS_DEVICE_UNCACHED) {
 		fw_addr |= ROGUE_FW_SEGMMU_DATA_META_UNCACHED |
 			   ROGUE_FW_SEGMMU_DATA_VIVT_SLC_UNCACHED;
+	} else {
+		fw_addr |= ROGUE_FW_SEGMMU_DATA_META_CACHED |
+			   ROGUE_FW_SEGMMU_DATA_VIVT_SLC_CACHED;
+	}
 
 	return fw_addr;
 }
@@ -527,29 +543,35 @@ pvr_meta_vm_map(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj)
 static void
 pvr_meta_vm_unmap(struct pvr_device *pvr_dev, struct pvr_fw_object *fw_obj)
 {
-	pvr_vm_unmap(pvr_dev->kernel_vm_ctx, fw_obj->fw_mm_node.start,
-		     fw_obj->fw_mm_node.size);
+	struct pvr_gem_object *pvr_obj = fw_obj->gem;
+
+	pvr_vm_unmap_obj(pvr_dev->kernel_vm_ctx, pvr_obj,
+			 fw_obj->fw_mm_node.start, fw_obj->fw_mm_node.size);
 }
 
 static bool
-pvr_meta_has_fixed_data_addr(void)
+pvr_meta_irq_pending(struct pvr_device *pvr_dev)
 {
-	return false;
+	return pvr_cr_read32(pvr_dev, ROGUE_CR_META_SP_MSLVIRQSTATUS) &
+	       ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_EN;
+}
+
+static void
+pvr_meta_irq_clear(struct pvr_device *pvr_dev)
+{
+	pvr_cr_write32(pvr_dev, ROGUE_CR_META_SP_MSLVIRQSTATUS,
+		       ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_CLRMSK);
 }
 
 const struct pvr_fw_defs pvr_fw_defs_meta = {
 	.init = pvr_meta_init,
+	.fini = pvr_meta_fini,
 	.fw_process = pvr_meta_fw_process,
 	.vm_map = pvr_meta_vm_map,
 	.vm_unmap = pvr_meta_vm_unmap,
 	.get_fw_addr_with_offset = pvr_meta_get_fw_addr_with_offset,
 	.wrapper_init = pvr_meta_wrapper_init,
-	.has_fixed_data_addr = pvr_meta_has_fixed_data_addr,
-	.irq = {
-		.enable_reg = ROGUE_CR_META_SP_MSLVIRQENABLE,
-		.status_reg = ROGUE_CR_META_SP_MSLVIRQSTATUS,
-		.clear_reg = ROGUE_CR_META_SP_MSLVIRQSTATUS,
-		.event_mask = ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_EN,
-		.clear_mask = ROGUE_CR_META_SP_MSLVIRQSTATUS_TRIGVECT2_CLRMSK,
-	},
+	.irq_pending = pvr_meta_irq_pending,
+	.irq_clear = pvr_meta_irq_clear,
+	.has_fixed_data_addr = false,
 };

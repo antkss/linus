@@ -1,7 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0
 
-TEST_GEN_PROGS := dev_in_maps set_layers_via_fds
+CFLAGS += -Wall
+CFLAGS += $(KHDR_INCLUDES)
+LDLIBS += -lcap
 
-CFLAGS := -Wall -Werror
+LOCAL_HDRS += ../wrappers.h log.h
+
+TEST_GEN_PROGS := dev_in_maps
+TEST_GEN_PROGS += set_layers_via_fds
+TEST_GEN_PROGS += idmapped_mounts
+TEST_GEN_PROGS += automount_in_layer
 
 include ../../lib.mk
+
+$(OUTPUT)/set_layers_via_fds: ../utils.c
+$(OUTPUT)/idmapped_mounts: ../utils.c

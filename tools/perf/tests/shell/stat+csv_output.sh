@@ -1,12 +1,11 @@
 #!/bin/bash
-# perf stat CSV output linter
+# perf stat CSV output linter (no_mlock)
 # SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
 # Tests various perf stat CSV output commands for the
 # correct number of fields and the CSV separator set to ','.
 
 set -e
 
-# shellcheck source=lib/stat_output.sh
 . "$(dirname $0)"/lib/stat_output.sh
 
 csv_sep=@
@@ -44,6 +43,7 @@ function commachecker()
 	;; "--per-die")		exp=8
 	;; "--per-cluster")	exp=8
 	;; "--per-cache")	exp=8
+	;; "--metric-only")	exp=1
 	esac
 
 	while read line
@@ -75,6 +75,7 @@ check_interval "CSV" "$perf_cmd"
 check_event "CSV" "$perf_cmd"
 check_per_thread "CSV" "$perf_cmd"
 check_per_node "CSV" "$perf_cmd"
+check_metric_only "CSV" "$perf_cmd"
 if [ $skip_test -ne 1 ]
 then
 	check_system_wide_no_aggr "CSV" "$perf_cmd"

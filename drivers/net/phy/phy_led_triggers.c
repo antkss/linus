@@ -5,6 +5,8 @@
 #include <linux/phy_led_triggers.h>
 #include <linux/netdevice.h>
 
+#include "phylib-internal.h"
+
 static struct phy_led_trigger *phy_speed_to_led_trigger(struct phy_device *phy,
 							unsigned int speed)
 {
@@ -91,9 +93,7 @@ int phy_led_triggers_register(struct phy_device *phy)
 	if (!phy->phy_num_led_triggers)
 		return 0;
 
-	phy->led_link_trigger = devm_kzalloc(&phy->mdio.dev,
-					     sizeof(*phy->led_link_trigger),
-					     GFP_KERNEL);
+	phy->led_link_trigger = kzalloc_obj(*phy->led_link_trigger);
 	if (!phy->led_link_trigger) {
 		err = -ENOMEM;
 		goto out_clear;
@@ -103,10 +103,8 @@ int phy_led_triggers_register(struct phy_device *phy)
 	if (err)
 		goto out_free_link;
 
-	phy->phy_led_triggers = devm_kcalloc(&phy->mdio.dev,
-					    phy->phy_num_led_triggers,
-					    sizeof(struct phy_led_trigger),
-					    GFP_KERNEL);
+	phy->phy_led_triggers = kzalloc_objs(struct phy_led_trigger,
+					     phy->phy_num_led_triggers);
 	if (!phy->phy_led_triggers) {
 		err = -ENOMEM;
 		goto out_unreg_link;
@@ -127,11 +125,12 @@ int phy_led_triggers_register(struct phy_device *phy)
 out_unreg:
 	while (i--)
 		phy_led_trigger_unregister(&phy->phy_led_triggers[i]);
-	devm_kfree(&phy->mdio.dev, phy->phy_led_triggers);
+	kfree(phy->phy_led_triggers);
+	phy->phy_led_triggers = NULL;
 out_unreg_link:
 	phy_led_trigger_unregister(phy->led_link_trigger);
 out_free_link:
-	devm_kfree(&phy->mdio.dev, phy->led_link_trigger);
+	kfree(phy->led_link_trigger);
 	phy->led_link_trigger = NULL;
 out_clear:
 	phy->phy_num_led_triggers = 0;
@@ -143,10 +142,17 @@ void phy_led_triggers_unregister(struct phy_device *phy)
 {
 	int i;
 
-	for (i = 0; i < phy->phy_num_led_triggers; i++)
-		phy_led_trigger_unregister(&phy->phy_led_triggers[i]);
+	if (phy->phy_led_triggers) {
+		for (i = 0; i < phy->phy_num_led_triggers; i++)
+			phy_led_trigger_unregister(&phy->phy_led_triggers[i]);
+		kfree(phy->phy_led_triggers);
+		phy->phy_led_triggers = NULL;
+	}
 
-	if (phy->led_link_trigger)
+	if (phy->led_link_trigger) {
 		phy_led_trigger_unregister(phy->led_link_trigger);
+		kfree(phy->led_link_trigger);
+		phy->led_link_trigger = NULL;
+	}
 }
 EXPORT_SYMBOL_GPL(phy_led_triggers_unregister);

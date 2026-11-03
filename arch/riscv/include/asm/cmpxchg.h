@@ -13,6 +13,8 @@
 #include <asm/hwcap.h>
 #include <asm/insn-def.h>
 #include <asm/cpufeature-macros.h>
+#include <asm/processor.h>
+#include <asm/errata_list.h>
 
 #define __arch_xchg_masked(sc_sfx, swap_sfx, prepend, sc_append,		\
 			   swap_append, r, p, n)				\
@@ -21,7 +23,10 @@
 	    riscv_has_extension_unlikely(RISCV_ISA_EXT_ZABHA)) {		\
 		__asm__ __volatile__ (						\
 			prepend							\
+			"	.option push\n"					\
+			"	.option arch, +zabha\n"				\
 			"	amoswap" swap_sfx " %0, %z2, %1\n"		\
+			"	.option pop\n"					\
 			swap_append						\
 			: "=&r" (r), "+A" (*(p))				\
 			: "rJ" (n)						\
@@ -37,6 +42,7 @@
 										\
 		__asm__ __volatile__ (						\
 		       prepend							\
+		       PREFETCHW_ASM(%5)					\
 		       "0:	lr.w %0, %2\n"					\
 		       "	and  %1, %0, %z4\n"				\
 		       "	or   %1, %1, %z3\n"				\
@@ -44,7 +50,7 @@
 		       "	bnez %1, 0b\n"					\
 		       sc_append						\
 		       : "=&r" (__retx), "=&r" (__rc), "+A" (*(__ptr32b))	\
-		       : "rJ" (__newx), "rJ" (~__mask)				\
+		       : "rJ" (__newx), "rJ" (~__mask), "rJ" (__ptr32b)		\
 		       : "memory");						\
 										\
 		r = (__typeof__(*(p)))((__retx & __mask) >> __s);		\
@@ -131,13 +137,17 @@
 ({										\
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZABHA) &&				\
 	    IS_ENABLED(CONFIG_RISCV_ISA_ZACAS) &&				\
+	    IS_ENABLED(CONFIG_TOOLCHAIN_HAS_ZACAS) &&				\
 	    riscv_has_extension_unlikely(RISCV_ISA_EXT_ZABHA) &&		\
 	    riscv_has_extension_unlikely(RISCV_ISA_EXT_ZACAS)) {		\
 		r = o;								\
 										\
 		__asm__ __volatile__ (						\
 			cas_prepend							\
+			"	.option push\n"					\
+			"	.option arch, +zacas, +zabha\n"				\
 			"	amocas" cas_sfx " %0, %z2, %1\n"		\
+			"	.option pop\n"					\
 			cas_append							\
 			: "+&r" (r), "+A" (*(p))				\
 			: "rJ" (n)						\
@@ -178,12 +188,16 @@
 		       r, p, co, o, n)					\
 ({									\
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZACAS) &&			\
+	    IS_ENABLED(CONFIG_TOOLCHAIN_HAS_ZACAS) &&			\
 	    riscv_has_extension_unlikely(RISCV_ISA_EXT_ZACAS)) {	\
 		r = o;							\
 									\
 		__asm__ __volatile__ (					\
 			cas_prepend					\
+			"	.option push\n"				\
+			"	.option arch, +zacas\n"			\
 			"	amocas" cas_sfx " %0, %z2, %1\n"	\
+			"	.option pop\n"				\
 			cas_append					\
 			: "+&r" (r), "+A" (*(p))			\
 			: "rJ" (n)					\
@@ -231,7 +245,7 @@
 		__arch_cmpxchg(".w", ".w" sc_sfx, ".w" cas_sfx,		\
 			       sc_prepend, sc_append,			\
 			       cas_prepend, cas_append,			\
-			       __ret, __ptr, (long), __old, __new);	\
+			       __ret, __ptr, (long)(int)(long), __old, __new);	\
 		break;							\
 	case 8:								\
 		__arch_cmpxchg(".d", ".d" sc_sfx, ".d" cas_sfx,		\
@@ -313,7 +327,7 @@
 	arch_cmpxchg_release((ptr), (o), (n));				\
 })
 
-#if defined(CONFIG_64BIT) && defined(CONFIG_RISCV_ISA_ZACAS)
+#if defined(CONFIG_64BIT) && defined(CONFIG_RISCV_ISA_ZACAS) && defined(CONFIG_TOOLCHAIN_HAS_ZACAS)
 
 #define system_has_cmpxchg128()        riscv_has_extension_unlikely(RISCV_ISA_EXT_ZACAS)
 
@@ -335,7 +349,10 @@ union __u128_halves {
 	register unsigned long t4 asm ("t4") = __ho.high;			\
 										\
 	__asm__ __volatile__ (							\
-		 "       amocas.q" cas_sfx " %0, %z3, %2"			\
+		 "       .option push\n"					\
+		 "       .option arch, +zacas\n"				\
+		 "       amocas.q" cas_sfx " %0, %z3, %2\n"			\
+		 "       .option pop\n"						\
 		 : "+&r" (t3), "+&r" (t4), "+A" (*(p))				\
 		 : "rJ" (t1), "rJ" (t2)						\
 		 : "memory");							\
@@ -349,7 +366,7 @@ union __u128_halves {
 #define arch_cmpxchg128_local(ptr, o, n)					\
 	__arch_cmpxchg128((ptr), (o), (n), "")
 
-#endif /* CONFIG_64BIT && CONFIG_RISCV_ISA_ZACAS */
+#endif /* CONFIG_64BIT && CONFIG_RISCV_ISA_ZACAS && CONFIG_TOOLCHAIN_HAS_ZACAS */
 
 #ifdef CONFIG_RISCV_ISA_ZAWRS
 /*
@@ -365,16 +382,49 @@ static __always_inline void __cmpwait(volatile void *ptr,
 {
 	unsigned long tmp;
 
-	asm goto(ALTERNATIVE("j %l[no_zawrs]", "nop",
-			     0, RISCV_ISA_EXT_ZAWRS, 1)
-		 : : : : no_zawrs);
+	u32 *__ptr32b;
+	ulong __s, __val, __mask;
+
+	if (!riscv_has_extension_likely(RISCV_ISA_EXT_ZAWRS)) {
+		ALT_RISCV_PAUSE();
+		return;
+	}
 
 	switch (size) {
 	case 1:
-		fallthrough;
+		__ptr32b = (u32 *)((ulong)(ptr) & ~0x3);
+		__s = ((ulong)(ptr) & 0x3) * BITS_PER_BYTE;
+		__val = val << __s;
+		__mask = 0xff << __s;
+
+		asm volatile(
+		"	lr.w	%0, %1\n"
+		"	and	%0, %0, %3\n"
+		"	xor	%0, %0, %2\n"
+		"	bnez	%0, 1f\n"
+			ZAWRS_WRS_NTO "\n"
+		"1:"
+		: "=&r" (tmp), "+A" (*(__ptr32b))
+		: "r" (__val), "r" (__mask)
+		: "memory");
+		break;
 	case 2:
-		/* RISC-V doesn't have lr instructions on byte and half-word. */
-		goto no_zawrs;
+		__ptr32b = (u32 *)((ulong)(ptr) & ~0x3);
+		__s = ((ulong)(ptr) & 0x2) * BITS_PER_BYTE;
+		__val = val << __s;
+		__mask = 0xffff << __s;
+
+		asm volatile(
+		"	lr.w	%0, %1\n"
+		"	and	%0, %0, %3\n"
+		"	xor	%0, %0, %2\n"
+		"	bnez	%0, 1f\n"
+			ZAWRS_WRS_NTO "\n"
+		"1:"
+		: "=&r" (tmp), "+A" (*(__ptr32b))
+		: "r" (__val), "r" (__mask)
+		: "memory");
+		break;
 	case 4:
 		asm volatile(
 		"	lr.w	%0, %1\n"
@@ -400,11 +450,6 @@ static __always_inline void __cmpwait(volatile void *ptr,
 	default:
 		BUILD_BUG();
 	}
-
-	return;
-
-no_zawrs:
-	asm volatile(RISCV_PAUSE : : : "memory");
 }
 
 #define __cmpwait_relaxed(ptr, val) \

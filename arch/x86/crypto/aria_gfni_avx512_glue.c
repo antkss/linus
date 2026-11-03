@@ -6,7 +6,6 @@
  */
 
 #include <crypto/algapi.h>
-#include <crypto/internal/simd.h>
 #include <crypto/aria.h>
 #include <linux/crypto.h>
 #include <linux/err.h>
@@ -165,10 +164,9 @@ static int aria_avx512_init_tfm(struct crypto_skcipher *tfm)
 
 static struct skcipher_alg aria_algs[] = {
 	{
-		.base.cra_name		= "__ecb(aria)",
-		.base.cra_driver_name	= "__ecb-aria-avx512",
+		.base.cra_name		= "ecb(aria)",
+		.base.cra_driver_name	= "ecb-aria-avx512",
 		.base.cra_priority	= 600,
-		.base.cra_flags		= CRYPTO_ALG_INTERNAL,
 		.base.cra_blocksize	= ARIA_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct aria_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -178,11 +176,10 @@ static struct skcipher_alg aria_algs[] = {
 		.encrypt		= aria_avx512_ecb_encrypt,
 		.decrypt		= aria_avx512_ecb_decrypt,
 	}, {
-		.base.cra_name		= "__ctr(aria)",
-		.base.cra_driver_name	= "__ctr-aria-avx512",
+		.base.cra_name		= "ctr(aria)",
+		.base.cra_driver_name	= "ctr-aria-avx512",
 		.base.cra_priority	= 600,
-		.base.cra_flags		= CRYPTO_ALG_INTERNAL |
-					  CRYPTO_ALG_SKCIPHER_REQSIZE_LARGE,
+		.base.cra_flags		= CRYPTO_ALG_SKCIPHER_REQSIZE_LARGE,
 		.base.cra_blocksize	= 1,
 		.base.cra_ctxsize	= sizeof(struct aria_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -197,25 +194,14 @@ static struct skcipher_alg aria_algs[] = {
 	}
 };
 
-static struct simd_skcipher_alg *aria_simd_algs[ARRAY_SIZE(aria_algs)];
-
 static int __init aria_avx512_init(void)
 {
-	const char *feature_name;
-
 	if (!boot_cpu_has(X86_FEATURE_AVX) ||
 	    !boot_cpu_has(X86_FEATURE_AVX2) ||
 	    !boot_cpu_has(X86_FEATURE_AVX512F) ||
 	    !boot_cpu_has(X86_FEATURE_AVX512VL) ||
-	    !boot_cpu_has(X86_FEATURE_GFNI) ||
-	    !boot_cpu_has(X86_FEATURE_OSXSAVE)) {
+	    !boot_cpu_has(X86_FEATURE_GFNI)) {
 		pr_info("AVX512/GFNI instructions are not detected.\n");
-		return -ENODEV;
-	}
-
-	if (!cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM |
-			       XFEATURE_MASK_AVX512, &feature_name)) {
-		pr_info("CPU feature '%s' is not supported.\n", feature_name);
 		return -ENODEV;
 	}
 
@@ -229,15 +215,12 @@ static int __init aria_avx512_init(void)
 	aria_ops.aria_decrypt_64way = aria_gfni_avx512_decrypt_64way;
 	aria_ops.aria_ctr_crypt_64way = aria_gfni_avx512_ctr_crypt_64way;
 
-	return simd_register_skciphers_compat(aria_algs,
-					      ARRAY_SIZE(aria_algs),
-					      aria_simd_algs);
+	return crypto_register_skciphers(aria_algs, ARRAY_SIZE(aria_algs));
 }
 
 static void __exit aria_avx512_exit(void)
 {
-	simd_unregister_skciphers(aria_algs, ARRAY_SIZE(aria_algs),
-				  aria_simd_algs);
+	crypto_unregister_skciphers(aria_algs, ARRAY_SIZE(aria_algs));
 }
 
 module_init(aria_avx512_init);

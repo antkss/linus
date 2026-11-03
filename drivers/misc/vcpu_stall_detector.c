@@ -111,8 +111,7 @@ static int start_stall_detector_cpu(unsigned int cpu)
 	ping_timeout_ms = vcpu_stall_config.stall_timeout_sec *
 			  MSEC_PER_SEC / 2;
 
-	hrtimer_init(vcpu_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	vcpu_hrtimer->function = vcpu_stall_detect_timer_fn;
+	hrtimer_setup(vcpu_hrtimer, vcpu_stall_detect_timer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	vcpu_stall_detector->is_initialized = true;
 
 	hrtimer_start(vcpu_hrtimer, ms_to_ktime(ping_timeout_ms),
@@ -225,8 +224,8 @@ static void vcpu_stall_detect_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id vcpu_stall_detect_of_match[] = {
-	{ .compatible = "qemu,vcpu-stall-detector", },
-	{}
+	{ .compatible = "qemu,vcpu-stall-detector" },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(of, vcpu_stall_detect_of_match);

@@ -2,6 +2,8 @@
 #include <linux/of.h>
 #include <linux/slab.h>
 
+#include <kunit/visibility.h>
+
 #include "of_private.h"
 
 /* true when node is initialized */
@@ -27,9 +29,10 @@ static void of_node_release(struct kobject *kobj)
 const struct kobj_type of_node_ktype = {
 	.release = of_node_release,
 };
+EXPORT_SYMBOL_IF_KUNIT(of_node_ktype);
 
 static ssize_t of_node_property_read(struct file *filp, struct kobject *kobj,
-				struct bin_attribute *bin_attr, char *buf,
+				const struct bin_attribute *bin_attr, char *buf,
 				loff_t offset, size_t count)
 {
 	struct property *pp = container_of(bin_attr, struct property, attr);

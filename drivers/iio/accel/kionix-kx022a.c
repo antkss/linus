@@ -5,25 +5,36 @@
  * ROHM/KIONIX accelerometer driver
  */
 
+#include <linux/array_size.h>
+#include <linux/bitmap.h>
+#include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/errno.h>
+#include <linux/export.h>
 #include <linux/interrupt.h>
+#include <linux/math64.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/string_choices.h>
+#include <linux/sysfs.h>
+#include <linux/time64.h>
 #include <linux/types.h>
 #include <linux/units.h>
 
 #include <linux/iio/iio.h>
+#include <linux/iio/buffer.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/trigger.h>
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
+
+#include <asm/byteorder.h>
 
 #include "kionix-kx022a.h"
 
@@ -148,7 +159,7 @@ static const struct regmap_config kx022a_regmap_config = {
 	.rd_noinc_table = &kx022a_nir_regs,
 	.precious_table = &kx022a_precious_regs,
 	.max_register = KX022A_MAX_REGISTER,
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 };
 
 /* Regmap configs kx132 */
@@ -259,7 +270,7 @@ static const struct regmap_config kx132_regmap_config = {
 	.rd_noinc_table = &kx132_nir_regs,
 	.precious_table = &kx132_precious_regs,
 	.max_register = KX132_MAX_REGISTER,
-	.cache_type = REGCACHE_RBTREE,
+	.cache_type = REGCACHE_MAPLE,
 };
 
 struct kx022a_data {
@@ -290,11 +301,10 @@ struct kx022a_data {
 	__le16 *fifo_buffer;
 
 	/* 3 x 16bit accel data + timestamp */
-	__le16 buffer[8] __aligned(IIO_DMA_MINALIGN);
 	struct {
 		__le16 channels[3];
 		aligned_s64 ts;
-	} scan;
+	} scan __aligned(IIO_DMA_MINALIGN);
 };
 
 static const struct iio_mount_matrix *
@@ -407,11 +417,21 @@ static const int kx022a_scale_table[][2] = {
 	{ 0, 4788403 },
 };
 
+/* KX134ACR-LBZ ranges are (+/-) 8, 16, 32, 64 G */
+static const int kx134acr_lbz_scale_table[][2] = {
+	{ 0, 2394202 },
+	{ 0, 4788403 },
+	{ 0, 9576807 },
+	{ 0, 19153613 },
+};
+
 static int kx022a_read_avail(struct iio_dev *indio_dev,
 			     struct iio_chan_spec const *chan,
 			     const int **vals, int *type, int *length,
 			     long mask)
 {
+	struct kx022a_data *data = iio_priv(indio_dev);
+
 	switch (mask) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		*vals = (const int *)kx022a_accel_samp_freq_table;
@@ -420,9 +440,8 @@ static int kx022a_read_avail(struct iio_dev *indio_dev,
 		*type = IIO_VAL_INT_PLUS_MICRO;
 		return IIO_AVAIL_LIST;
 	case IIO_CHAN_INFO_SCALE:
-		*vals = (const int *)kx022a_scale_table;
-		*length = ARRAY_SIZE(kx022a_scale_table) *
-			  ARRAY_SIZE(kx022a_scale_table[0]);
+		*vals = (const int *)data->chip_info->scale_table;
+		*length = data->chip_info->scale_table_size;
 		*type = IIO_VAL_INT_PLUS_NANO;
 		return IIO_AVAIL_LIST;
 	default:
@@ -438,17 +457,17 @@ static void kx022a_reg2freq(unsigned int val,  int *val1, int *val2)
 	*val2 = kx022a_accel_samp_freq_table[val & KX022A_MASK_ODR][1];
 }
 
-static void kx022a_reg2scale(unsigned int val, unsigned int *val1,
-			     unsigned int *val2)
+static void kx022a_reg2scale(struct kx022a_data *data, unsigned int val,
+			     unsigned int *val1, unsigned int *val2)
 {
 	val &= KX022A_MASK_GSEL;
 	val >>= KX022A_GSEL_SHIFT;
 
-	*val1 = kx022a_scale_table[val][0];
-	*val2 = kx022a_scale_table[val][1];
+	*val1 = data->chip_info->scale_table[val][0];
+	*val2 = data->chip_info->scale_table[val][1];
 }
 
-static int kx022a_turn_on_off_unlocked(struct kx022a_data *data, bool on)
+static int __kx022a_turn_on_off(struct kx022a_data *data, bool on)
 {
 	int ret;
 
@@ -469,7 +488,7 @@ static int kx022a_turn_off_lock(struct kx022a_data *data)
 	int ret;
 
 	mutex_lock(&data->mutex);
-	ret = kx022a_turn_on_off_unlocked(data, false);
+	ret = __kx022a_turn_on_off(data, false);
 	if (ret)
 		mutex_unlock(&data->mutex);
 
@@ -480,7 +499,7 @@ static int kx022a_turn_on_unlock(struct kx022a_data *data)
 {
 	int ret;
 
-	ret = kx022a_turn_on_off_unlocked(data, true);
+	ret = __kx022a_turn_on_off(data, true);
 	mutex_unlock(&data->mutex);
 
 	return ret;
@@ -500,12 +519,63 @@ static int kx022a_write_raw_get_fmt(struct iio_dev *idev,
 	}
 }
 
+static int __kx022a_write_raw(struct iio_dev *idev,
+			      struct iio_chan_spec const *chan,
+			      int val, int val2, long mask)
+{
+	struct kx022a_data *data = iio_priv(idev);
+	int ret, n;
+
+	switch (mask) {
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		n = ARRAY_SIZE(kx022a_accel_samp_freq_table);
+
+		while (n--)
+			if (val == kx022a_accel_samp_freq_table[n][0] &&
+			    val2 == kx022a_accel_samp_freq_table[n][1])
+				break;
+		if (n < 0)
+			return -EINVAL;
+
+		ret = kx022a_turn_off_lock(data);
+		if (ret)
+			return ret;
+
+		ret = regmap_update_bits(data->regmap,
+					 data->chip_info->odcntl,
+					 KX022A_MASK_ODR, n);
+		data->odr_ns = kx022a_odrs[n];
+		kx022a_turn_on_unlock(data);
+		return ret;
+	case IIO_CHAN_INFO_SCALE:
+		n = data->chip_info->scale_table_size / 2;
+
+		while (n-- > 0)
+			if (val == data->chip_info->scale_table[n][0] &&
+			    val2 == data->chip_info->scale_table[n][1])
+				break;
+		if (n < 0)
+			return -EINVAL;
+
+		ret = kx022a_turn_off_lock(data);
+		if (ret)
+			return ret;
+
+		ret = regmap_update_bits(data->regmap, data->chip_info->cntl,
+					 KX022A_MASK_GSEL,
+					 n << KX022A_GSEL_SHIFT);
+		kx022a_turn_on_unlock(data);
+		return ret;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int kx022a_write_raw(struct iio_dev *idev,
 			    struct iio_chan_spec const *chan,
 			    int val, int val2, long mask)
 {
-	struct kx022a_data *data = iio_priv(idev);
-	int ret, n;
+	int ret;
 
 	/*
 	 * We should not allow changing scale or frequency when FIFO is running
@@ -516,60 +586,12 @@ static int kx022a_write_raw(struct iio_dev *idev,
 	 * issues if users trust the watermark to be reached within known
 	 * time-limit).
 	 */
-	ret = iio_device_claim_direct_mode(idev);
-	if (ret)
-		return ret;
+	if (!iio_device_claim_direct(idev))
+		return -EBUSY;
 
-	switch (mask) {
-	case IIO_CHAN_INFO_SAMP_FREQ:
-		n = ARRAY_SIZE(kx022a_accel_samp_freq_table);
+	ret = __kx022a_write_raw(idev, chan, val, val2, mask);
 
-		while (n--)
-			if (val == kx022a_accel_samp_freq_table[n][0] &&
-			    val2 == kx022a_accel_samp_freq_table[n][1])
-				break;
-		if (n < 0) {
-			ret = -EINVAL;
-			goto unlock_out;
-		}
-		ret = kx022a_turn_off_lock(data);
-		if (ret)
-			break;
-
-		ret = regmap_update_bits(data->regmap,
-					 data->chip_info->odcntl,
-					 KX022A_MASK_ODR, n);
-		data->odr_ns = kx022a_odrs[n];
-		kx022a_turn_on_unlock(data);
-		break;
-	case IIO_CHAN_INFO_SCALE:
-		n = ARRAY_SIZE(kx022a_scale_table);
-
-		while (n-- > 0)
-			if (val == kx022a_scale_table[n][0] &&
-			    val2 == kx022a_scale_table[n][1])
-				break;
-		if (n < 0) {
-			ret = -EINVAL;
-			goto unlock_out;
-		}
-
-		ret = kx022a_turn_off_lock(data);
-		if (ret)
-			break;
-
-		ret = regmap_update_bits(data->regmap, data->chip_info->cntl,
-					 KX022A_MASK_GSEL,
-					 n << KX022A_GSEL_SHIFT);
-		kx022a_turn_on_unlock(data);
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-
-unlock_out:
-	iio_device_release_direct_mode(idev);
+	iio_device_release_direct(idev);
 
 	return ret;
 }
@@ -588,14 +610,15 @@ static int kx022a_get_axis(struct kx022a_data *data,
 			   struct iio_chan_spec const *chan,
 			   int *val)
 {
+	__le16 *buf = &data->scan.channels[0];
 	int ret;
 
-	ret = regmap_bulk_read(data->regmap, chan->address, &data->buffer[0],
-			       sizeof(__le16));
+	ret = regmap_bulk_read(data->regmap, chan->address,
+			       buf, sizeof(*buf));
 	if (ret)
 		return ret;
 
-	*val = (s16)le16_to_cpu(data->buffer[0]);
+	*val = (s16)le16_to_cpup(buf);
 
 	return IIO_VAL_INT;
 }
@@ -610,15 +633,14 @@ static int kx022a_read_raw(struct iio_dev *idev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		ret = iio_device_claim_direct_mode(idev);
-		if (ret)
-			return ret;
+		if (!iio_device_claim_direct(idev))
+			return -EBUSY;
 
 		mutex_lock(&data->mutex);
 		ret = kx022a_get_axis(data, chan, val);
 		mutex_unlock(&data->mutex);
 
-		iio_device_release_direct_mode(idev);
+		iio_device_release_direct(idev);
 
 		return ret;
 
@@ -627,7 +649,7 @@ static int kx022a_read_raw(struct iio_dev *idev,
 		if (ret)
 			return ret;
 
-		if ((regval & KX022A_MASK_ODR) >
+		if ((regval & KX022A_MASK_ODR) >=
 		    ARRAY_SIZE(kx022a_accel_samp_freq_table)) {
 			dev_err(data->dev, "Invalid ODR\n");
 			return -EINVAL;
@@ -642,7 +664,7 @@ static int kx022a_read_raw(struct iio_dev *idev,
 		if (ret < 0)
 			return ret;
 
-		kx022a_reg2scale(regval, val, val2);
+		kx022a_reg2scale(data, regval, val, val2);
 
 		return IIO_VAL_INT_PLUS_NANO;
 	}
@@ -787,7 +809,7 @@ static int __kx022a_fifo_flush(struct iio_dev *idev, unsigned int samples,
 		 * the timestamps. If we are ran from IRQ, then the
 		 * IRQF_ONESHOT has us covered - but if we are ran by the
 		 * user-space read we need to disable the IRQ to be on a safe
-		 * side. We do this usng synchronous disable so that if the
+		 * side. We do this using synchronous disable so that if the
 		 * IRQ thread is being ran on other CPU we wait for it to be
 		 * finished.
 		 */
@@ -842,7 +864,8 @@ static int __kx022a_fifo_flush(struct iio_dev *idev, unsigned int samples,
 		for_each_set_bit(bit, idev->active_scan_mask, AXIS_MAX)
 			chs[bit] = sam[bit];
 
-		iio_push_to_buffers_with_timestamp(idev, &data->scan, tstamp);
+		iio_push_to_buffers_with_ts(idev, &data->scan,
+					    sizeof(data->scan), tstamp);
 
 		tstamp += sample_period;
 	}
@@ -912,18 +935,19 @@ static int kx022a_fifo_disable(struct kx022a_data *data)
 {
 	int ret = 0;
 
-	ret = kx022a_turn_off_lock(data);
+	guard(mutex)(&data->mutex);
+	ret = __kx022a_turn_on_off(data, false);
 	if (ret)
 		return ret;
 
 	ret = regmap_clear_bits(data->regmap, data->ien_reg, KX022A_MASK_WMI);
 	if (ret)
-		goto unlock_out;
+		return ret;
 
 	ret = regmap_clear_bits(data->regmap, data->chip_info->buf_cntl2,
 				KX022A_MASK_BUF_EN);
 	if (ret)
-		goto unlock_out;
+		return ret;
 
 	data->state &= ~KX022A_STATE_FIFO;
 
@@ -931,12 +955,7 @@ static int kx022a_fifo_disable(struct kx022a_data *data)
 
 	kfree(data->fifo_buffer);
 
-	return kx022a_turn_on_unlock(data);
-
-unlock_out:
-	mutex_unlock(&data->mutex);
-
-	return ret;
+	return __kx022a_turn_on_off(data, true);
 }
 
 static int kx022a_buffer_predisable(struct iio_dev *idev)
@@ -959,31 +978,45 @@ static int kx022a_fifo_enable(struct kx022a_data *data)
 	if (!data->fifo_buffer)
 		return -ENOMEM;
 
-	ret = kx022a_turn_off_lock(data);
+	guard(mutex)(&data->mutex);
+	ret = __kx022a_turn_on_off(data, false);
 	if (ret)
-		return ret;
+		goto err_free_out;
 
 	/* Update watermark to HW */
 	ret = kx022a_fifo_set_wmi(data);
 	if (ret)
-		goto unlock_out;
+		goto err_turn_on_out;
 
 	/* Enable buffer */
 	ret = regmap_set_bits(data->regmap, data->chip_info->buf_cntl2,
 			      KX022A_MASK_BUF_EN);
 	if (ret)
-		goto unlock_out;
+		goto err_turn_on_out;
 
 	data->state |= KX022A_STATE_FIFO;
 	ret = regmap_set_bits(data->regmap, data->ien_reg,
 			      KX022A_MASK_WMI);
 	if (ret)
-		goto unlock_out;
+		goto err_buf_disable_out;
 
-	return kx022a_turn_on_unlock(data);
+	ret = __kx022a_turn_on_off(data, true);
+	if (ret)
+		goto err_wmi_clear_out;
 
-unlock_out:
-	mutex_unlock(&data->mutex);
+	return ret;
+
+err_wmi_clear_out:
+	regmap_clear_bits(data->regmap, data->ien_reg,
+			  KX022A_MASK_WMI);
+err_buf_disable_out:
+	regmap_clear_bits(data->regmap, data->chip_info->buf_cntl2,
+			  KX022A_MASK_BUF_EN);
+	data->state &= ~KX022A_STATE_FIFO;
+err_turn_on_out:
+	__kx022a_turn_on_off(data, true);
+err_free_out:
+	kfree(data->fifo_buffer);
 
 	return ret;
 }
@@ -1015,12 +1048,13 @@ static irqreturn_t kx022a_trigger_handler(int irq, void *p)
 	struct kx022a_data *data = iio_priv(idev);
 	int ret;
 
-	ret = regmap_bulk_read(data->regmap, data->chip_info->xout_l, data->buffer,
-			       KX022A_FIFO_SAMPLES_SIZE_BYTES);
+	ret = regmap_bulk_read(data->regmap, data->chip_info->xout_l,
+			       data->scan.channels, KX022A_FIFO_SAMPLES_SIZE_BYTES);
 	if (ret < 0)
 		goto err_read;
 
-	iio_push_to_buffers_with_timestamp(idev, data->buffer, data->timestamp);
+	iio_push_to_buffers_with_ts(idev, &data->scan, sizeof(data->scan),
+				    data->timestamp);
 err_read:
 	iio_trigger_notify_done(idev->trig);
 
@@ -1053,7 +1087,7 @@ static irqreturn_t kx022a_irq_thread_handler(int irq, void *private)
 	struct kx022a_data *data = iio_priv(idev);
 	irqreturn_t ret = IRQ_NONE;
 
-	mutex_lock(&data->mutex);
+	guard(mutex)(&data->mutex);
 
 	if (data->trigger_enabled) {
 		iio_trigger_poll_nested(data->trig);
@@ -1068,8 +1102,6 @@ static irqreturn_t kx022a_irq_thread_handler(int irq, void *private)
 			ret = IRQ_HANDLED;
 	}
 
-	mutex_unlock(&data->mutex);
-
 	return ret;
 }
 
@@ -1079,32 +1111,26 @@ static int kx022a_trigger_set_state(struct iio_trigger *trig,
 	struct kx022a_data *data = iio_trigger_get_drvdata(trig);
 	int ret = 0;
 
-	mutex_lock(&data->mutex);
+	guard(mutex)(&data->mutex);
 
 	if (data->trigger_enabled == state)
-		goto unlock_out;
+		return 0;
 
 	if (data->state & KX022A_STATE_FIFO) {
 		dev_warn(data->dev, "Can't set trigger when FIFO enabled\n");
-		ret = -EBUSY;
-		goto unlock_out;
+		return -EBUSY;
 	}
 
-	ret = kx022a_turn_on_off_unlocked(data, false);
+	ret = __kx022a_turn_on_off(data, false);
 	if (ret)
-		goto unlock_out;
+		return ret;
 
 	data->trigger_enabled = state;
 	ret = kx022a_set_drdy_irq(data, state);
 	if (ret)
-		goto unlock_out;
+		return ret;
 
-	ret = kx022a_turn_on_off_unlocked(data, true);
-
-unlock_out:
-	mutex_unlock(&data->mutex);
-
-	return ret;
+	return __kx022a_turn_on_off(data, true);
 }
 
 static const struct iio_trigger_ops kx022a_trigger_ops = {
@@ -1121,10 +1147,15 @@ static int kx022a_chip_init(struct kx022a_data *data)
 		return ret;
 
 	/*
-	 * I've seen I2C read failures if we poll too fast after the sensor
-	 * reset. Slight delay gives I2C block the time to recover.
+	 * According to the power-on procedure documents, there is (at least)
+	 * 2ms delay required after the software reset. This should be same for
+	 * all, KX022ACR-Z, KX132-1211, KX132ACR-LBZ and KX134ACR-LBZ.
+	 *
+	 * https://fscdn.rohm.com/kionix/en/document/AN010_KX022ACR-Z_Power-on_Procedure_E.pdf
+	 * https://fscdn.rohm.com/kionix/en/document/TN027-Power-On-Procedure.pdf
+	 * https://fscdn.rohm.com/kionix/en/document/AN011_KX134ACR-LBZ_Power-on_Procedure_E.pdf
 	 */
-	msleep(1);
+	msleep(2);
 
 	ret = regmap_read_poll_timeout(data->regmap, data->chip_info->cntl2, val,
 				       !(val & KX022A_MASK_SRST),
@@ -1158,6 +1189,9 @@ const struct kx022a_chip_info kx022a_chip_info = {
 	.regmap_config			= &kx022a_regmap_config,
 	.channels			= kx022a_channels,
 	.num_channels			= ARRAY_SIZE(kx022a_channels),
+	.scale_table			= kx022a_scale_table,
+	.scale_table_size		= ARRAY_SIZE(kx022a_scale_table) *
+					  ARRAY_SIZE(kx022a_scale_table[0]),
 	.fifo_length			= KX022A_FIFO_LENGTH,
 	.who				= KX022A_REG_WHO,
 	.id				= KX022A_ID,
@@ -1183,6 +1217,9 @@ const struct kx022a_chip_info kx132_chip_info = {
 	.regmap_config		  = &kx132_regmap_config,
 	.channels		  = kx132_channels,
 	.num_channels		  = ARRAY_SIZE(kx132_channels),
+	.scale_table			= kx022a_scale_table,
+	.scale_table_size		= ARRAY_SIZE(kx022a_scale_table) *
+					  ARRAY_SIZE(kx022a_scale_table[0]),
 	.fifo_length		  = KX132_FIFO_LENGTH,
 	.who			  = KX132_REG_WHO,
 	.id			  = KX132_ID,
@@ -1204,6 +1241,35 @@ const struct kx022a_chip_info kx132_chip_info = {
 };
 EXPORT_SYMBOL_NS_GPL(kx132_chip_info, "IIO_KX022A");
 
+const struct kx022a_chip_info kx134_chip_info = {
+	.name			  = "kx134-1211",
+	.regmap_config		  = &kx132_regmap_config,
+	.channels		  = kx132_channels,
+	.num_channels		  = ARRAY_SIZE(kx132_channels),
+	.scale_table			= kx134acr_lbz_scale_table,
+	.scale_table_size		= ARRAY_SIZE(kx134acr_lbz_scale_table) *
+					  ARRAY_SIZE(kx134acr_lbz_scale_table[0]),
+	.fifo_length		  = KX132_FIFO_LENGTH,
+	.who			  = KX132_REG_WHO,
+	.id			  = KX134_1211_ID,
+	.cntl			  = KX132_REG_CNTL,
+	.cntl2			  = KX132_REG_CNTL2,
+	.odcntl			  = KX132_REG_ODCNTL,
+	.buf_cntl1		  = KX132_REG_BUF_CNTL1,
+	.buf_cntl2		  = KX132_REG_BUF_CNTL2,
+	.buf_clear		  = KX132_REG_BUF_CLEAR,
+	.buf_status1		  = KX132_REG_BUF_STATUS_1,
+	.buf_smp_lvl_mask	  = KX132_MASK_BUF_SMP_LVL,
+	.buf_read		  = KX132_REG_BUF_READ,
+	.inc1			  = KX132_REG_INC1,
+	.inc4			  = KX132_REG_INC4,
+	.inc5			  = KX132_REG_INC5,
+	.inc6			  = KX132_REG_INC6,
+	.xout_l			  = KX132_REG_XOUT_L,
+	.get_fifo_bytes_available = kx132_get_fifo_bytes_available,
+};
+EXPORT_SYMBOL_NS_GPL(kx134_chip_info, "IIO_KX022A");
+
 /*
  * Despite the naming, KX132ACR-LBZ is not similar to KX132-1211 but it is
  * exact subset of KX022A. KX132ACR-LBZ is meant to be used for industrial
@@ -1216,6 +1282,9 @@ const struct kx022a_chip_info kx132acr_chip_info = {
 	.regmap_config			= &kx022a_regmap_config,
 	.channels			= kx022a_channels,
 	.num_channels			= ARRAY_SIZE(kx022a_channels),
+	.scale_table			= kx022a_scale_table,
+	.scale_table_size		= ARRAY_SIZE(kx022a_scale_table) *
+					  ARRAY_SIZE(kx022a_scale_table[0]),
 	.fifo_length			= KX022A_FIFO_LENGTH,
 	.who				= KX022A_REG_WHO,
 	.id				= KX132ACR_LBZ_ID,
@@ -1235,6 +1304,34 @@ const struct kx022a_chip_info kx132acr_chip_info = {
 	.get_fifo_bytes_available	= kx022a_get_fifo_bytes_available,
 };
 EXPORT_SYMBOL_NS_GPL(kx132acr_chip_info, "IIO_KX022A");
+
+const struct kx022a_chip_info kx134acr_chip_info = {
+	.name				= "kx134acr-lbz",
+	.regmap_config			= &kx022a_regmap_config,
+	.channels			= kx022a_channels,
+	.num_channels			= ARRAY_SIZE(kx022a_channels),
+	.scale_table			= kx134acr_lbz_scale_table,
+	.scale_table_size		= ARRAY_SIZE(kx134acr_lbz_scale_table) *
+					  ARRAY_SIZE(kx134acr_lbz_scale_table[0]),
+	.fifo_length			= KX022A_FIFO_LENGTH,
+	.who				= KX022A_REG_WHO,
+	.id				= KX134ACR_LBZ_ID,
+	.cntl				= KX022A_REG_CNTL,
+	.cntl2				= KX022A_REG_CNTL2,
+	.odcntl				= KX022A_REG_ODCNTL,
+	.buf_cntl1			= KX022A_REG_BUF_CNTL1,
+	.buf_cntl2			= KX022A_REG_BUF_CNTL2,
+	.buf_clear			= KX022A_REG_BUF_CLEAR,
+	.buf_status1			= KX022A_REG_BUF_STATUS_1,
+	.buf_read			= KX022A_REG_BUF_READ,
+	.inc1				= KX022A_REG_INC1,
+	.inc4				= KX022A_REG_INC4,
+	.inc5				= KX022A_REG_INC5,
+	.inc6				= KX022A_REG_INC6,
+	.xout_l				= KX022A_REG_XOUT_L,
+	.get_fifo_bytes_available	= kx022a_get_fifo_bytes_available,
+};
+EXPORT_SYMBOL_NS_GPL(kx134acr_chip_info, "IIO_KX022A");
 
 int kx022a_probe_internal(struct device *dev, const struct kx022a_chip_info *chip_info)
 {
@@ -1358,7 +1455,7 @@ int kx022a_probe_internal(struct device *dev, const struct kx022a_chip_info *chi
 					&kx022a_irq_thread_handler,
 					IRQF_ONESHOT, name, idev);
 	if (ret)
-		return dev_err_probe(data->dev, ret, "Could not request IRQ\n");
+		return ret;
 
 	ret = devm_iio_trigger_register(dev, indio_trig);
 	if (ret)

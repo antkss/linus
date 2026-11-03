@@ -8,12 +8,20 @@
 /**
  * DOC: page_pool allocator
  *
- * The page_pool allocator is optimized for recycling page or page fragment used
- * by skb packet and xdp frame.
+ * The page_pool allocator is optimized for recycling network memory
+ * (netmem_ref) or fragments used by skb packets and xdp frames.
  *
- * Basic use involves replacing any alloc_pages() calls with page_pool_alloc(),
- * which allocate memory with or without page splitting depending on the
- * requested memory size.
+ * page_pool natively operates on netmem_ref, which abstracts the underlying
+ * memory type (struct page or struct net_iov) supplied by the page allocator
+ * or a memory provider. Drivers and core networking code should use the
+ * netmem-based APIs (e.g. page_pool_alloc_netmem(), page_pool_put_netmem()).
+ * The struct page-based APIs (e.g. page_pool_alloc(), page_pool_alloc_pages(),
+ * page_pool_put_page()) are legacy compatibility wrappers for drivers not yet
+ * converted to netmem.
+ *
+ * Basic use involves replacing any alloc_pages() calls with
+ * page_pool_alloc_netmem() (or legacy page_pool_alloc()), which allocate memory
+ * with or without splitting depending on the requested memory size.
  *
  * If the driver knows that it always requires full pages or its allocations are
  * always smaller than half a page, it can use one of the more specific API
@@ -64,7 +72,7 @@ int page_pool_ethtool_stats_get_count(void);
 u8 *page_pool_ethtool_stats_get_strings(u8 *data);
 u64 *page_pool_ethtool_stats_get(u64 *data, const void *stats);
 
-bool page_pool_get_stats(const struct page_pool *pool,
+void page_pool_get_stats(const struct page_pool *pool,
 			 struct page_pool_stats *stats);
 #else
 static inline int page_pool_ethtool_stats_get_count(void)
@@ -104,8 +112,7 @@ static inline struct page *page_pool_dev_alloc_pages(struct page_pool *pool)
  *
  * Get a page fragment from the page allocator or page_pool caches.
  *
- * Return:
- * Return allocated page fragment, otherwise return NULL.
+ * Return: allocated page fragment, otherwise return NULL.
  */
 static inline struct page *page_pool_dev_alloc_frag(struct page_pool *pool,
 						    unsigned int *offset,
@@ -116,22 +123,22 @@ static inline struct page *page_pool_dev_alloc_frag(struct page_pool *pool,
 	return page_pool_alloc_frag(pool, offset, size, gfp);
 }
 
-static inline struct page *page_pool_alloc(struct page_pool *pool,
-					   unsigned int *offset,
-					   unsigned int *size, gfp_t gfp)
+static inline netmem_ref page_pool_alloc_netmem(struct page_pool *pool,
+						unsigned int *offset,
+						unsigned int *size, gfp_t gfp)
 {
 	unsigned int max_size = PAGE_SIZE << pool->p.order;
-	struct page *page;
+	netmem_ref netmem;
 
 	if ((*size << 1) > max_size) {
 		*size = max_size;
 		*offset = 0;
-		return page_pool_alloc_pages(pool, gfp);
+		return page_pool_alloc_netmems(pool, gfp);
 	}
 
-	page = page_pool_alloc_frag(pool, offset, *size, gfp);
-	if (unlikely(!page))
-		return NULL;
+	netmem = page_pool_alloc_frag_netmem(pool, offset, *size, gfp);
+	if (unlikely(!netmem))
+		return 0;
 
 	/* There is very likely not enough space for another fragment, so append
 	 * the remaining size to the current fragment to avoid truesize
@@ -142,7 +149,30 @@ static inline struct page *page_pool_alloc(struct page_pool *pool,
 		pool->frag_offset = max_size;
 	}
 
-	return page;
+	return netmem;
+}
+
+static inline netmem_ref page_pool_dev_alloc_netmem(struct page_pool *pool,
+						    unsigned int *offset,
+						    unsigned int *size)
+{
+	gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN;
+
+	return page_pool_alloc_netmem(pool, offset, size, gfp);
+}
+
+static inline netmem_ref page_pool_dev_alloc_netmems(struct page_pool *pool)
+{
+	gfp_t gfp = GFP_ATOMIC | __GFP_NOWARN;
+
+	return page_pool_alloc_netmems(pool, gfp);
+}
+
+static inline struct page *page_pool_alloc(struct page_pool *pool,
+					   unsigned int *offset,
+					   unsigned int *size, gfp_t gfp)
+{
+	return netmem_to_page(page_pool_alloc_netmem(pool, offset, size, gfp));
 }
 
 /**
@@ -155,8 +185,7 @@ static inline struct page *page_pool_alloc(struct page_pool *pool,
  * depending on the requested size in order to allocate memory with least memory
  * utilization and performance penalty.
  *
- * Return:
- * Return allocated page or page fragment, otherwise return NULL.
+ * Return: allocated page or page fragment, otherwise return NULL.
  */
 static inline struct page *page_pool_dev_alloc(struct page_pool *pool,
 					       unsigned int *offset,
@@ -190,8 +219,7 @@ static inline void *page_pool_alloc_va(struct page_pool *pool,
  * This is just a thin wrapper around the page_pool_alloc() API, and
  * it returns va of the allocated page or page fragment.
  *
- * Return:
- * Return the va for the allocated page or page fragment, otherwise return NULL.
+ * Return: the va for the allocated page or page fragment, otherwise return NULL.
  */
 static inline void *page_pool_dev_alloc_va(struct page_pool *pool,
 					   unsigned int *size)
@@ -294,7 +322,7 @@ static inline long page_pool_unref_page(struct page *page, long nr)
 
 static inline void page_pool_ref_netmem(netmem_ref netmem)
 {
-	atomic_long_inc(&netmem_to_page(netmem)->pp_ref_count);
+	atomic_long_inc(netmem_get_pp_ref_count_ref(netmem));
 }
 
 static inline void page_pool_ref_page(struct page *page)
@@ -302,7 +330,7 @@ static inline void page_pool_ref_page(struct page *page)
 	page_pool_ref_netmem(page_to_netmem(page));
 }
 
-static inline bool page_pool_is_last_ref(netmem_ref netmem)
+static inline bool page_pool_unref_and_test(netmem_ref netmem)
 {
 	/* If page_pool_unref_page() returns 0, we were the last user */
 	return page_pool_unref_netmem(netmem, 1) == 0;
@@ -317,7 +345,7 @@ static inline void page_pool_put_netmem(struct page_pool *pool,
 	 * allow registering MEM_TYPE_PAGE_POOL, but shield linker.
 	 */
 #ifdef CONFIG_PAGE_POOL
-	if (!page_pool_is_last_ref(netmem))
+	if (!page_pool_unref_and_test(netmem))
 		return;
 
 	page_pool_put_unrefed_netmem(pool, netmem, dma_sync_size, allow_direct);
@@ -382,8 +410,11 @@ static inline void page_pool_recycle_direct(struct page_pool *pool,
 	page_pool_put_full_page(pool, page, true);
 }
 
-#define PAGE_POOL_32BIT_ARCH_WITH_64BIT_DMA	\
-		(sizeof(dma_addr_t) > sizeof(unsigned long))
+static inline void page_pool_recycle_direct_netmem(struct page_pool *pool,
+						   netmem_ref netmem)
+{
+	page_pool_put_full_netmem(pool, netmem, true);
+}
 
 /**
  * page_pool_free_va() - free a va into the page_pool
@@ -391,7 +422,7 @@ static inline void page_pool_recycle_direct(struct page_pool *pool,
  * @va: va to be freed
  * @allow_direct: freed by the consumer, allow lockless caching
  *
- * Free a va allocated from page_pool_allo_va().
+ * Free a va allocated from page_pool_alloc_va().
  */
 static inline void page_pool_free_va(struct page_pool *pool, void *va,
 				     bool allow_direct)
@@ -401,12 +432,7 @@ static inline void page_pool_free_va(struct page_pool *pool, void *va,
 
 static inline dma_addr_t page_pool_get_dma_addr_netmem(netmem_ref netmem)
 {
-	dma_addr_t ret = netmem_get_dma_addr(netmem);
-
-	if (PAGE_POOL_32BIT_ARCH_WITH_64BIT_DMA)
-		ret <<= PAGE_SHIFT;
-
-	return ret;
+	return netmem_dma_addr_decode(netmem_get_dma_addr(netmem));
 }
 
 /**
@@ -418,7 +444,16 @@ static inline dma_addr_t page_pool_get_dma_addr_netmem(netmem_ref netmem)
  */
 static inline dma_addr_t page_pool_get_dma_addr(const struct page *page)
 {
-	return page_pool_get_dma_addr_netmem(page_to_netmem((struct page *)page));
+	return page_pool_get_dma_addr_netmem(page_to_netmem(page));
+}
+
+static inline void __page_pool_dma_sync_for_cpu(const struct page_pool *pool,
+						const dma_addr_t dma_addr,
+						u32 offset, u32 dma_sync_size)
+{
+	dma_sync_single_range_for_cpu(pool->p.dev, dma_addr,
+				      offset + pool->p.offset, dma_sync_size,
+				      page_pool_get_dma_dir(pool));
 }
 
 /**
@@ -437,10 +472,26 @@ static inline void page_pool_dma_sync_for_cpu(const struct page_pool *pool,
 					      const struct page *page,
 					      u32 offset, u32 dma_sync_size)
 {
-	dma_sync_single_range_for_cpu(pool->p.dev,
-				      page_pool_get_dma_addr(page),
-				      offset + pool->p.offset, dma_sync_size,
-				      page_pool_get_dma_dir(pool));
+	__page_pool_dma_sync_for_cpu(pool, page_pool_get_dma_addr(page), offset,
+				     dma_sync_size);
+}
+
+static inline void
+page_pool_dma_sync_netmem_for_cpu(const struct page_pool *pool,
+				  const netmem_ref netmem, u32 offset,
+				  u32 dma_sync_size)
+{
+	if (!pool->dma_sync_for_cpu)
+		return;
+
+	__page_pool_dma_sync_for_cpu(pool,
+				     page_pool_get_dma_addr_netmem(netmem),
+				     offset, dma_sync_size);
+}
+
+static inline void page_pool_get(struct page_pool *pool)
+{
+	refcount_inc(&pool->user_cnt);
 }
 
 static inline bool page_pool_put(struct page_pool *pool)
@@ -452,6 +503,23 @@ static inline void page_pool_nid_changed(struct page_pool *pool, int new_nid)
 {
 	if (unlikely(pool->p.nid != new_nid))
 		page_pool_update_nid(pool, new_nid);
+}
+
+/**
+ * page_pool_is_unreadable() - will allocated buffers be unreadable for the CPU
+ * @pool: queried page pool
+ *
+ * Check if page pool will return buffers which are unreadable to the CPU /
+ * kernel. This will only be the case if user space bound a memory provider (mp)
+ * which returns unreadable memory to the queue served by the page pool.
+ * If %PP_FLAG_ALLOW_UNREADABLE_NETMEM was set but there is no mp bound
+ * this helper will return false. See also netif_rxq_has_unreadable_mp().
+ *
+ * Return: true if memory allocated by the page pool may be unreadable
+ */
+static inline bool page_pool_is_unreadable(struct page_pool *pool)
+{
+	return !!pool->mp_ops;
 }
 
 #endif /* _NET_PAGE_POOL_HELPERS_H */

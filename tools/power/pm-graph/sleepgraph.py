@@ -210,13 +210,13 @@ class SystemValues:
 		'hibernate_preallocate_memory': {},
 		'create_basic_memory_bitmaps': {},
 		'swsusp_write': {},
-		'suspend_console': {},
+		'console_suspend_all': {},
 		'acpi_pm_prepare': {},
 		'syscore_suspend': {},
 		'arch_enable_nonboot_cpus_end': {},
 		'syscore_resume': {},
 		'acpi_pm_finish': {},
-		'resume_console': {},
+		'console_resume_all': {},
 		'acpi_pm_end': {},
 		'pm_restore_gfp_mask': {},
 		'thaw_processes': {},
@@ -1448,7 +1448,7 @@ class DevProps:
 
 # Class: DeviceNode
 # Description:
-#	 A container used to create a device hierachy, with a single root node
+#	 A container used to create a device hierarchy, with a single root node
 #	 and a tree of child nodes. Used by Data.deviceTopology()
 class DeviceNode:
 	def __init__(self, nodename, nodedepth):
@@ -3155,7 +3155,7 @@ class TestProps:
 			dev = f[0]
 			props[dev] = DevProps()
 			props[dev].altname = f[1]
-			if int(f[2]):
+			if len(f) > 2 and f[2] and int(f[2]):
 				props[dev].isasync = True
 			else:
 				props[dev].isasync = False
@@ -3459,7 +3459,7 @@ def parseTraceLog(live=False):
 	tracewatch = ['irq_wakeup']
 	if sysvals.usekprobes:
 		tracewatch += ['sync_filesystems', 'freeze_processes', 'syscore_suspend',
-			'syscore_resume', 'resume_console', 'thaw_processes', 'CPU_ON',
+			'syscore_resume', 'console_resume_all', 'thaw_processes', 'CPU_ON',
 			'CPU_OFF', 'acpi_suspend']
 
 	# extract the callgraph and traceevent data
@@ -4017,7 +4017,8 @@ def parseKernelLog(data):
 							'PM: early restore of devices complete after.*'],
 		'resume_complete': ['PM: resume of devices complete after.*',
 							'PM: restore of devices complete after.*'],
-		    'post_resume': [r'.*Restarting tasks \.\.\..*'],
+		    'post_resume': [r'.*Restarting tasks \.\.\..*',
+							'Done restarting tasks.*'],
 	}
 
 	# action table (expected events that occur and show up in dmesg)

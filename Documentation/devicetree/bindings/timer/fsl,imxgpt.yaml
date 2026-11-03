@@ -14,6 +14,7 @@ properties:
     oneOf:
       - const: fsl,imx1-gpt
       - const: fsl,imx21-gpt
+      - const: fsl,imx25-epit
       - items:
           - const: fsl,imx27-gpt
           - const: fsl,imx21-gpt
@@ -21,6 +22,7 @@ properties:
       - items:
           - enum:
               - fsl,imx25-gpt
+              - fsl,imx35-gpt
               - fsl,imx50-gpt
               - fsl,imx51-gpt
               - fsl,imx53-gpt
@@ -31,6 +33,7 @@ properties:
           - enum:
               - fsl,imx6sl-gpt
               - fsl,imx6sx-gpt
+              - fsl,imx7d-gpt
               - fsl,imx8mp-gpt
               - fsl,imxrt1050-gpt
               - fsl,imxrt1170-gpt
@@ -38,7 +41,6 @@ properties:
       - items:
           - enum:
               - fsl,imx6ul-gpt
-              - fsl,imx7d-gpt
           - const: fsl,imx6sx-gpt
 
   reg:

@@ -1731,7 +1731,7 @@ void rtl92ee_update_interrupt_mask(struct ieee80211_hw *hw,
 	rtl92ee_enable_interrupt(hw);
 }
 
-static u8 _rtl92ee_get_chnl_group(u8 chnl)
+static __always_inline u8 _rtl92ee_get_chnl_group(u8 chnl)
 {
 	u8 group = 0;
 
@@ -2009,8 +2009,9 @@ static void _rtl8192ee_read_power_value_fromprom(struct ieee80211_hw *hw,
 	}
 }
 
-static void _rtl92ee_read_txpower_info_from_hwpg(struct ieee80211_hw *hw,
-						 bool autoload_fail, u8 *hwinfo)
+static noinline_for_stack void
+_rtl92ee_read_txpower_info_from_hwpg(struct ieee80211_hw *hw,
+				     bool autoload_fail, u8 *hwinfo)
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_efuse *efu = rtl_efuse(rtl_priv(hw));
@@ -2265,7 +2266,6 @@ static void rtl92ee_update_hal_rate_mask(struct ieee80211_hw *hw,
 	bool b_shortgi = false;
 	u8 rate_mask[7] = {0};
 	u8 macid = 0;
-	/*u8 mimo_ps = IEEE80211_SMPS_OFF;*/
 	sta_entry = (struct rtl_sta_info *)sta->drv_priv;
 	wirelessmode = sta_entry->wireless_mode;
 	if (mac->opmode == NL80211_IFTYPE_STATION ||

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
+#include "enum_defs.autogen.h"
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -66,10 +67,14 @@ typedef int64_t s64;
 		bpf_map__set_value_size((__skel)->maps.elfsec##_##arr,			\
 				sizeof((__skel)->elfsec##_##arr->arr[0]) * (n));	\
 		(__skel)->elfsec##_##arr =						\
+			(typeof((__skel)->elfsec##_##arr))				\
 			bpf_map__initial_value((__skel)->maps.elfsec##_##arr, &__sz);	\
 	} while (0)
 
 #include "user_exit_info.h"
 #include "compat.h"
+#include "enums.h"
+
+#include "bpf_arena_common.h"
 
 #endif	/* __SCHED_EXT_COMMON_H */

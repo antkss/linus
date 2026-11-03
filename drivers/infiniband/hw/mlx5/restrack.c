@@ -96,9 +96,18 @@ static int fill_stat_mr_entry(struct sk_buff *msg, struct ib_mr *ibmr)
 					 atomic64_read(&mr->odp_stats.faults)))
 		goto err_table;
 	if (rdma_nl_stat_hwcounter_entry(
+		    msg, "page_faults_handled",
+		    atomic64_read(&mr->odp_stats.faults_handled)))
+		goto err_table;
+	if (rdma_nl_stat_hwcounter_entry(
 		    msg, "page_invalidations",
 		    atomic64_read(&mr->odp_stats.invalidations)))
 		goto err_table;
+	if (rdma_nl_stat_hwcounter_entry(
+		    msg, "page_invalidations_handled",
+		    atomic64_read(&mr->odp_stats.invalidations_handled)))
+		goto err_table;
+
 	if (rdma_nl_stat_hwcounter_entry(msg, "page_prefetch",
 					 atomic64_read(&mr->odp_stats.prefetch)))
 		goto err_table;
@@ -168,9 +177,6 @@ static int fill_res_qp_entry(struct sk_buff *msg, struct ib_qp *ibqp)
 	case MLX5_IB_QPT_REG_UMR:
 		ret = nla_put_string(msg, RDMA_NLDEV_ATTR_RES_SUBTYPE,
 				     "REG_UMR");
-		break;
-	case MLX5_IB_QPT_DCT:
-		ret = nla_put_string(msg, RDMA_NLDEV_ATTR_RES_SUBTYPE, "DCT");
 		break;
 	case MLX5_IB_QPT_DCI:
 		ret = nla_put_string(msg, RDMA_NLDEV_ATTR_RES_SUBTYPE, "DCI");

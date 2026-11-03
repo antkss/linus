@@ -43,6 +43,7 @@ int dwc2_backup_global_registers(struct dwc2_hsotg *hsotg)
 	/* Backup global regs */
 	gr = &hsotg->gr_backup;
 
+	gr->gintsts = dwc2_readl(hsotg, GINTSTS);
 	gr->gotgctl = dwc2_readl(hsotg, GOTGCTL);
 	gr->gintmsk = dwc2_readl(hsotg, GINTMSK);
 	gr->gahbcfg = dwc2_readl(hsotg, GAHBCFG);
@@ -172,7 +173,7 @@ static void dwc2_restore_essential_regs(struct dwc2_hsotg *hsotg, int rmode,
 	/* Umnask global Interrupt in GAHBCFG and restore it */
 	dwc2_writel(hsotg, gr->gahbcfg | GAHBCFG_GLBL_INTR_EN, GAHBCFG);
 
-	/* Clear all pending interupts */
+	/* Clear all pending interrupts */
 	dwc2_writel(hsotg, 0xffffffff, GINTSTS);
 
 	/* Unmask restore done interrupt */
@@ -577,6 +578,7 @@ void dwc2_force_dr_mode(struct dwc2_hsotg *hsotg)
 {
 	switch (hsotg->dr_mode) {
 	case USB_DR_MODE_HOST:
+		dwc2_force_mode(hsotg, true);
 		/*
 		 * NOTE: This is required for some rockchip soc based
 		 * platforms on their host-only dwc2.

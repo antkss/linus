@@ -15,6 +15,10 @@ struct brcmf_fwvid_ops {
 	void (*feat_attach)(struct brcmf_if *ifp);
 	int (*set_sae_password)(struct brcmf_if *ifp, struct cfg80211_crypto_settings *crypto);
 	int (*alloc_fweh_info)(struct brcmf_pub *drvr);
+	int (*activate_events)(struct brcmf_if *ifp);
+	void (*get_cfg80211_ops)(struct brcmf_pub *drvr);
+	void (*register_event_handlers)(struct brcmf_pub *drvr);
+	int (*configure_sae_pwe)(struct brcmf_if *ifp, u32 sae_pwe);
 };
 
 /* exported functions */
@@ -37,6 +41,16 @@ static inline void brcmf_fwvid_feat_attach(struct brcmf_if *ifp)
 	vops->feat_attach(ifp);
 }
 
+static inline int brcmf_fwvid_configure_sae_pwe(struct brcmf_if *ifp, u32 sae_pwe)
+{
+	const struct brcmf_fwvid_ops *vops = ifp->drvr->vops;
+
+	if (!vops || !vops->configure_sae_pwe)
+		return -EOPNOTSUPP;
+
+	return vops->configure_sae_pwe(ifp, sae_pwe);
+}
+
 static inline int brcmf_fwvid_set_sae_password(struct brcmf_if *ifp,
 					       struct cfg80211_crypto_settings *crypto)
 {
@@ -54,6 +68,32 @@ static inline int brcmf_fwvid_alloc_fweh_info(struct brcmf_pub *drvr)
 		return -EIO;
 
 	return drvr->vops->alloc_fweh_info(drvr);
+}
+
+static inline int brcmf_fwvid_activate_events(struct brcmf_if *ifp)
+{
+	const struct brcmf_fwvid_ops *vops = ifp->drvr->vops;
+
+	if (!vops || !vops->activate_events)
+		return -EOPNOTSUPP;
+
+	return vops->activate_events(ifp);
+}
+
+static inline void brcmf_fwvid_get_cfg80211_ops(struct brcmf_pub *drvr)
+{
+	if (!drvr->vops || !drvr->vops->get_cfg80211_ops)
+		return;
+
+	drvr->vops->get_cfg80211_ops(drvr);
+}
+
+static inline void brcmf_fwvid_register_event_handlers(struct brcmf_pub *drvr)
+{
+	if (!drvr->vops || !drvr->vops->register_event_handlers)
+		return;
+
+	drvr->vops->register_event_handlers(drvr);
 }
 
 #endif /* FWVID_H_ */

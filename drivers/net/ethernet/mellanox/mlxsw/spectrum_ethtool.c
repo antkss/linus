@@ -262,7 +262,7 @@ err_port_pause_configure:
 }
 
 struct mlxsw_sp_port_hw_stats {
-	char str[ETH_GSTRING_LEN];
+	char str[ETH_GSTRING_LEN] __nonstring;
 	u64 (*getter)(const char *payload);
 	bool cells_bytes;
 };
@@ -542,6 +542,10 @@ static struct mlxsw_sp_port_hw_stats mlxsw_sp_port_hw_prio_stats[] = {
 		.str = "tx_pause_duration_prio",
 		.getter = mlxsw_reg_ppcnt_tx_pause_duration_get,
 	},
+	{
+		.str = "rx_discards_pg",
+		.getter = mlxsw_reg_ppcnt_rx_discards_get,
+	},
 };
 
 #define MLXSW_SP_PORT_HW_PRIO_STATS_LEN ARRAY_SIZE(mlxsw_sp_port_hw_prio_stats)
@@ -768,7 +772,9 @@ static void __mlxsw_sp_port_get_stats(struct net_device *dev,
 	err = mlxsw_sp_get_hw_stats_by_group(&hw_stats, &len, grp);
 	if (err)
 		return;
-	mlxsw_sp_port_get_stats_raw(dev, grp, prio, ppcnt_pl);
+	err = mlxsw_sp_port_get_stats_raw(dev, grp, prio, ppcnt_pl);
+	if (err)
+		return;
 	for (i = 0; i < len; i++) {
 		data[data_index + i] = hw_stats[i].getter(ppcnt_pl);
 		if (!hw_stats[i].cells_bytes)
@@ -1256,6 +1262,8 @@ mlxsw_sp_set_module_power_mode(struct net_device *dev,
 
 const struct ethtool_ops mlxsw_sp_port_ethtool_ops = {
 	.cap_link_lanes_supported	= true,
+	.op_needs_rtnl			= ETHTOOL_OP_NEEDS_RTNL_SPAUSEPARAM |
+					  ETHTOOL_OP_NEEDS_RTNL_GLINK,
 	.get_drvinfo			= mlxsw_sp_port_get_drvinfo,
 	.get_link			= ethtool_op_get_link,
 	.get_link_ext_state		= mlxsw_sp_port_get_link_ext_state,

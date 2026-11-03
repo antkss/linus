@@ -131,7 +131,7 @@ batadv_mcast_forw_orig_entry(struct hlist_node *node,
 
 /**
  * batadv_mcast_forw_push_dest() - push an originator MAC address onto an skb
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination address onto
  * @vid: the vlan identifier
  * @orig_node: the originator node to get the MAC address from
@@ -174,7 +174,7 @@ static bool batadv_mcast_forw_push_dest(struct batadv_priv *bat_priv,
 
 /**
  * batadv_mcast_forw_push_dests_list() - push originators from list onto an skb
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination addresses onto
  * @vid: the vlan identifier
  * @head: the list to gather originators from
@@ -195,8 +195,8 @@ static int batadv_mcast_forw_push_dests_list(struct batadv_priv *bat_priv,
 					     unsigned short *num_dests,
 					     unsigned short *tvlv_len)
 {
-	struct hlist_node *node;
 	struct batadv_orig_node *orig_node;
+	struct hlist_node *node;
 
 	rcu_read_lock();
 	__hlist_for_each_rcu(node, head) {
@@ -215,7 +215,7 @@ static int batadv_mcast_forw_push_dests_list(struct batadv_priv *bat_priv,
 
 /**
  * batadv_mcast_forw_push_tt() - push originators with interest through TT
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination addresses onto
  * @vid: the vlan identifier
  * @num_dests: a pointer to store the number of pushed addresses in
@@ -232,12 +232,9 @@ batadv_mcast_forw_push_tt(struct batadv_priv *bat_priv, struct sk_buff *skb,
 			  unsigned short *tvlv_len)
 {
 	struct batadv_tt_orig_list_entry *orig_entry;
-
 	struct batadv_tt_global_entry *tt_global;
 	const u8 *addr = eth_hdr(skb)->h_dest;
-
-	/* ok */
-	int ret = true;
+	int ret = true; /* ok */
 
 	tt_global = batadv_tt_global_hash_find(bat_priv, addr, vid);
 	if (!tt_global)
@@ -262,7 +259,7 @@ out:
 
 /**
  * batadv_mcast_forw_push_want_all() - push originators with want-all flag
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination addresses onto
  * @vid: the vlan identifier
  * @num_dests: a pointer to store the number of pushed addresses in
@@ -308,7 +305,7 @@ static bool batadv_mcast_forw_push_want_all(struct batadv_priv *bat_priv,
 
 /**
  * batadv_mcast_forw_push_want_rtr() - push originators with want-router flag
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination addresses onto
  * @vid: the vlan identifier
  * @num_dests: a pointer to store the number of pushed addresses in
@@ -368,7 +365,8 @@ static void batadv_mcast_forw_scrape(struct sk_buff *skb,
 				     unsigned short offset,
 				     unsigned short len)
 {
-	char *to, *from;
+	char *from;
+	char *to;
 
 	SKB_LINEAR_ASSERT(skb);
 
@@ -411,7 +409,8 @@ static bool batadv_mcast_forw_push_insert_padding(struct sk_buff *skb,
 						  unsigned short *tvlv_len)
 {
 	unsigned short offset =	*tvlv_len;
-	char *to, *from = skb->data;
+	char *from = skb->data;
+	char *to;
 
 	to = batadv_mcast_forw_push_padding(skb, tvlv_len);
 	if (!to)
@@ -475,7 +474,7 @@ out:
 
 /**
  * batadv_mcast_forw_push_dests() - push originator addresses onto an skb
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the destination addresses onto
  * @vid: the vlan identifier
  * @is_routable: indicates whether the destination is routable
@@ -567,7 +566,7 @@ static int batadv_mcast_forw_push_tracker(struct sk_buff *skb, int num_dests,
 
 /**
  * batadv_mcast_forw_push_tvlvs() - push a multicast tracker TVLV onto an skb
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the skb to push the tracker TVLV onto
  * @vid: the vlan identifier
  * @is_routable: indicates whether the destination is routable
@@ -634,7 +633,7 @@ batadv_mcast_forw_push_hdr(struct sk_buff *skb, unsigned short tvlv_len)
 
 /**
  * batadv_mcast_forw_scrub_dests() - scrub destinations in a tracker TVLV
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @comp_neigh: next hop neighbor to scrub+collect destinations for
  * @dest: start MAC entry in original skb's tracker TVLV
  * @next_dest: start MAC entry in to be sent skb's tracker TVLV
@@ -905,7 +904,7 @@ static void batadv_mcast_forw_shrink_tracker(struct sk_buff *skb)
 
 /**
  * batadv_mcast_forw_packet() - forward a batman-adv multicast packet
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the received or locally generated batman-adv multicast packet
  * @local_xmit: indicates that the packet was locally generated and not received
  *
@@ -920,29 +919,29 @@ static void batadv_mcast_forw_shrink_tracker(struct sk_buff *skb)
  *
  * Return: NET_RX_SUCCESS or NET_RX_DROP on success or a negative error
  * code on failure. NET_RX_SUCCESS if the received packet is supposed to be
- * decapsulated and forwarded to the own soft interface, NET_RX_DROP otherwise.
+ * decapsulated and forwarded to the own mesh interface, NET_RX_DROP otherwise.
  */
 static int batadv_mcast_forw_packet(struct batadv_priv *bat_priv,
 				    struct sk_buff *skb, bool local_xmit)
 {
 	struct batadv_tvlv_mcast_tracker *mcast_tracker;
 	struct batadv_neigh_node *neigh_node;
-	unsigned long offset, num_dests_off;
 	struct sk_buff *nexthop_skb;
 	unsigned char *skb_net_hdr;
 	bool local_recv = false;
 	unsigned int tvlv_len;
+	unsigned long offset;
 	bool xmitted = false;
-	u8 *dest, *next_dest;
+	u8 *next_dest;
 	u16 num_dests;
+	u8 *dest;
 	int ret;
 
 	/* (at least) TVLV part needs to be linearized */
 	SKB_LINEAR_ASSERT(skb);
 
-	/* check if num_dests is within skb length */
-	num_dests_off = offsetof(struct batadv_tvlv_mcast_tracker, num_dests);
-	if (num_dests_off > skb_network_header_len(skb))
+	/* check if batadv_tvlv_mcast_tracker header is within skb length */
+	if (sizeof(*mcast_tracker) > skb_network_header_len(skb))
 		return -EINVAL;
 
 	skb_net_hdr = skb_network_header(skb);
@@ -1028,7 +1027,7 @@ static int batadv_mcast_forw_packet(struct batadv_priv *bat_priv,
 
 /**
  * batadv_mcast_forw_tracker_tvlv_handler() - handle an mcast tracker tvlv
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the received batman-adv multicast packet
  *
  * Parses the tracker TVLV of an incoming batman-adv multicast packet and
@@ -1042,7 +1041,7 @@ static int batadv_mcast_forw_packet(struct batadv_priv *bat_priv,
  *
  * Return: NET_RX_SUCCESS or NET_RX_DROP on success or a negative error
  * code on failure. NET_RX_SUCCESS if the received packet is supposed to be
- * decapsulated and forwarded to the own soft interface, NET_RX_DROP otherwise.
+ * decapsulated and forwarded to the own mesh interface, NET_RX_DROP otherwise.
  */
 int batadv_mcast_forw_tracker_tvlv_handler(struct batadv_priv *bat_priv,
 					   struct sk_buff *skb)
@@ -1075,11 +1074,16 @@ unsigned int batadv_mcast_forw_packet_hdrlen(unsigned int num_dests)
 
 /**
  * batadv_mcast_forw_expand_head() - expand headroom for an mcast packet
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the multicast packet to send
  *
  * Tries to expand an skb's headroom so that its head to tail is 1298
  * bytes (minimum IPv6 MTU + vlan ethernet header size) large.
+ *
+ * Warning: This function may reallocate the skb data buffer via
+ * skb_cow()/skb_linearize()/... Any pointer into the skb data (e.g.
+ * obtained from skb->data or eth_hdr()) before this call must be
+ * considered invalid afterwards and has to be reacquired.
  *
  * Return: -EINVAL if the given skb's length is too large or -ENOMEM on memory
  * allocation failure. Otherwise, on success, zero is returned.
@@ -1101,8 +1105,11 @@ static int batadv_mcast_forw_expand_head(struct batadv_priv *bat_priv,
 		return -EINVAL;
 	}
 
-	if (skb_headroom(skb) < hdr_size &&
-	    pskb_expand_head(skb, hdr_size, 0, GFP_ATOMIC) < 0)
+	if (skb_cow(skb, hdr_size) < 0)
+		return -ENOMEM;
+
+	/* batadv_mcast_forw_scrape() + batadv_mcast_forw_packet() require linearized skb */
+	if (skb_linearize(skb) < 0)
 		return -ENOMEM;
 
 	return 0;
@@ -1110,7 +1117,7 @@ static int batadv_mcast_forw_expand_head(struct batadv_priv *bat_priv,
 
 /**
  * batadv_mcast_forw_push() - encapsulate skb in a batman-adv multicast packet
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the multicast packet to encapsulate and send
  * @vid: the vlan identifier
  * @is_routable: indicates whether the destination is routable
@@ -1120,6 +1127,11 @@ static int batadv_mcast_forw_expand_head(struct batadv_priv *bat_priv,
  * A multicast tracker TVLV with destination originator addresses for any node
  * that signaled interest in it, that is either via the translation table or the
  * according want-all flags, is attached accordingly.
+ *
+ * Warning: This function may reallocate the skb data buffer via
+ * batadv_mcast_forw_expand_head()/... Any pointer into the skb data (e.g.
+ * obtained from skb->data or eth_hdr()) before this call must be
+ * considered invalid afterwards and has to be reacquired.
  *
  * Return: true on success, false otherwise.
  */
@@ -1154,7 +1166,7 @@ err:
 
 /**
  * batadv_mcast_forw_mcsend() - send a self prepared batman-adv multicast packet
- * @bat_priv: the bat priv with all the soft interface information
+ * @bat_priv: the bat priv with all the mesh interface information
  * @skb: the multicast packet to encapsulate and send
  *
  * Transmits a batman-adv multicast packet that was locally prepared and

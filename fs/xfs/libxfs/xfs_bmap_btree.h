@@ -89,7 +89,7 @@ xfs_bmbt_key_addr(
 {
 	return (struct xfs_bmbt_key *)
 		((char *)block + xfs_bmbt_block_len(mp) +
-		 (index - 1) * sizeof(struct xfs_bmbt_key *));
+		 (index - 1) * sizeof(struct xfs_bmbt_key));
 }
 
 static inline xfs_bmbt_ptr_t *
@@ -197,5 +197,8 @@ xfs_bmap_bmdr_space(struct xfs_btree_block *bb)
 {
 	return xfs_bmdr_space_calc(be16_to_cpu(bb->bb_numrecs));
 }
+
+struct xfs_btree_block *xfs_bmap_broot_realloc(struct xfs_inode *ip,
+		int whichfork, unsigned int new_numrecs);
 
 #endif	/* __XFS_BMAP_BTREE_H__ */

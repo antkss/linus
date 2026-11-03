@@ -41,12 +41,12 @@ static inline struct kvm_pmc *get_gp_pmc_amd(struct kvm_pmu *pmu, u32 msr,
 	struct kvm_vcpu *vcpu = pmu_to_vcpu(pmu);
 	unsigned int idx;
 
-	if (!vcpu->kvm->arch.enable_pmu)
+	if (!pmu->version)
 		return NULL;
 
 	switch (msr) {
 	case MSR_F15H_PERF_CTL0 ... MSR_F15H_PERF_CTR5:
-		if (!guest_cpuid_has(vcpu, X86_FEATURE_PERFCTR_CORE))
+		if (!guest_cpu_cap_has(vcpu, X86_FEATURE_PERFCTR_CORE))
 			return NULL;
 		/*
 		 * Each PMU counter has a pair of CTL and CTR MSRs. CTLn
@@ -109,10 +109,11 @@ static bool amd_is_valid_msr(struct kvm_vcpu *vcpu, u32 msr)
 	case MSR_K7_EVNTSEL0 ... MSR_K7_PERFCTR3:
 		return pmu->version > 0;
 	case MSR_F15H_PERF_CTL0 ... MSR_F15H_PERF_CTR5:
-		return guest_cpuid_has(vcpu, X86_FEATURE_PERFCTR_CORE);
+		return guest_cpu_cap_has(vcpu, X86_FEATURE_PERFCTR_CORE);
 	case MSR_AMD64_PERF_CNTR_GLOBAL_STATUS:
 	case MSR_AMD64_PERF_CNTR_GLOBAL_CTL:
 	case MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR:
+	case MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_SET:
 		return pmu->version > 1;
 	default:
 		if (msr > MSR_F15H_PERF_CTR5 &&
@@ -165,6 +166,14 @@ static int amd_pmu_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		data &= ~pmu->reserved_bits;
 		if (data != pmc->eventsel) {
 			pmc->eventsel = data;
+			pmc->eventsel_hw = (data & ~AMD64_EVENTSEL_HOSTONLY) |
+					   AMD64_EVENTSEL_GUESTONLY;
+
+			if (data & AMD64_EVENTSEL_HOST_GUEST_MASK)
+				__set_bit(pmc->idx, pmu->pmc_has_mode_specific_enables);
+			else
+				__clear_bit(pmc->idx, pmu->pmc_has_mode_specific_enables);
+
 			kvm_pmu_request_counter_reprogram(pmc);
 		}
 		return 0;
@@ -179,7 +188,7 @@ static void amd_pmu_refresh(struct kvm_vcpu *vcpu)
 	union cpuid_0x80000022_ebx ebx;
 
 	pmu->version = 1;
-	if (guest_cpuid_has(vcpu, X86_FEATURE_PERFMON_V2)) {
+	if (guest_cpu_cap_has(vcpu, X86_FEATURE_PERFMON_V2)) {
 		pmu->version = 2;
 		/*
 		 * Note, PERFMON_V2 is also in 0x80000022.0x0, i.e. the guest
@@ -189,7 +198,7 @@ static void amd_pmu_refresh(struct kvm_vcpu *vcpu)
 			     x86_feature_cpuid(X86_FEATURE_PERFMON_V2).index);
 		ebx.full = kvm_find_cpuid_entry_index(vcpu, 0x80000022, 0)->ebx;
 		pmu->nr_arch_gp_counters = ebx.split.num_core_pmc;
-	} else if (guest_cpuid_has(vcpu, X86_FEATURE_PERFCTR_CORE)) {
+	} else if (guest_cpu_cap_has(vcpu, X86_FEATURE_PERFCTR_CORE)) {
 		pmu->nr_arch_gp_counters = AMD64_NUM_COUNTERS_CORE;
 	} else {
 		pmu->nr_arch_gp_counters = AMD64_NUM_COUNTERS;
@@ -199,17 +208,20 @@ static void amd_pmu_refresh(struct kvm_vcpu *vcpu)
 					 kvm_pmu_cap.num_counters_gp);
 
 	if (pmu->version > 1) {
-		pmu->global_ctrl_rsvd = ~((1ull << pmu->nr_arch_gp_counters) - 1);
+		pmu->global_ctrl_rsvd = ~(BIT_ULL(pmu->nr_arch_gp_counters) - 1);
 		pmu->global_status_rsvd = pmu->global_ctrl_rsvd;
 	}
 
-	pmu->counter_bitmask[KVM_PMC_GP] = ((u64)1 << 48) - 1;
+	pmu->counter_bitmask[KVM_PMC_GP] = BIT_ULL(48) - 1;
+
 	pmu->reserved_bits = 0xfffffff000280000ull;
+	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SVM) && kvm_vcpu_has_mediated_pmu(vcpu))
+		pmu->reserved_bits &= ~AMD64_EVENTSEL_HOST_GUEST_MASK;
+
 	pmu->raw_event_mask = AMD64_RAW_EVENT_MASK;
 	/* not applicable to AMD; but clean them to prevent any fall out */
 	pmu->counter_bitmask[KVM_PMC_FIXED] = 0;
 	pmu->nr_arch_fixed_counters = 0;
-	bitmap_set(pmu->all_valid_pmc_idx, 0, pmu->nr_arch_gp_counters);
 }
 
 static void amd_pmu_init(struct kvm_vcpu *vcpu)
@@ -227,6 +239,68 @@ static void amd_pmu_init(struct kvm_vcpu *vcpu)
 	}
 }
 
+static bool amd_pmu_is_mediated_pmu_supported(struct x86_pmu_capability *host_pmu)
+{
+	return host_pmu->version >= 2;
+}
+
+static void amd_mediated_pmu_load(struct kvm_vcpu *vcpu)
+{
+	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+	u64 global_status;
+
+	rdmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS, global_status);
+	/* Clear host global_status MSR if non-zero. */
+	if (global_status)
+		wrmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR, global_status);
+
+	wrmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_SET, pmu->global_status);
+	wrmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, pmu->global_ctrl);
+}
+
+static void amd_mediated_pmu_put(struct kvm_vcpu *vcpu)
+{
+	struct kvm_pmu *pmu = vcpu_to_pmu(vcpu);
+
+	wrmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, 0);
+	rdmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS, pmu->global_status);
+
+	/* Clear global status bits if non-zero */
+	if (pmu->global_status)
+		wrmsrq(MSR_AMD64_PERF_CNTR_GLOBAL_STATUS_CLR, pmu->global_status);
+}
+
+static bool amd_pmc_is_disabled_in_current_mode(struct kvm_pmc *pmc)
+{
+	struct kvm_vcpu *vcpu = pmc->vcpu;
+	u64 host_guest_bits;
+
+	if (!kvm_vcpu_has_mediated_pmu(vcpu))
+		return false;
+
+	/* Common code is supposed to check the common enable bit */
+	if (WARN_ON_ONCE(!(pmc->eventsel & ARCH_PERFMON_EVENTSEL_ENABLE)))
+		return false;
+
+	/* If both bits are cleared, the counter is always enabled */
+	host_guest_bits = pmc->eventsel & AMD64_EVENTSEL_HOST_GUEST_MASK;
+	if (!host_guest_bits)
+		return false;
+
+	/* If EFER.SVME=0 and either bit is set, the counter is disabled */
+	if (!(vcpu->arch.efer & EFER_SVME))
+		return true;
+
+	/*
+	 * If EFER.SVME=1, the counter is disabled iff only one of the bits is
+	 * set AND the set bit doesn't match the vCPU mode.
+	 */
+	if (host_guest_bits == AMD64_EVENTSEL_HOST_GUEST_MASK)
+		return false;
+
+	return !!(host_guest_bits & AMD64_EVENTSEL_GUESTONLY) != is_guest_mode(vcpu);
+}
+
 struct kvm_pmu_ops amd_pmu_ops __initdata = {
 	.rdpmc_ecx_to_pmc = amd_rdpmc_ecx_to_pmc,
 	.msr_idx_to_pmc = amd_msr_idx_to_pmc,
@@ -236,7 +310,19 @@ struct kvm_pmu_ops amd_pmu_ops __initdata = {
 	.set_msr = amd_pmu_set_msr,
 	.refresh = amd_pmu_refresh,
 	.init = amd_pmu_init,
+	.pmc_is_disabled_in_current_mode = amd_pmc_is_disabled_in_current_mode,
+
+	.is_mediated_pmu_supported = amd_pmu_is_mediated_pmu_supported,
+	.mediated_load = amd_mediated_pmu_load,
+	.mediated_put = amd_mediated_pmu_put,
+
 	.EVENTSEL_EVENT = AMD64_EVENTSEL_EVENT,
 	.MAX_NR_GP_COUNTERS = KVM_MAX_NR_AMD_GP_COUNTERS,
 	.MIN_NR_GP_COUNTERS = AMD64_NUM_COUNTERS,
+
+	.PERF_GLOBAL_CTRL = MSR_AMD64_PERF_CNTR_GLOBAL_CTL,
+	.GP_EVENTSEL_BASE = MSR_F15H_PERF_CTL0,
+	.GP_COUNTER_BASE = MSR_F15H_PERF_CTR0,
+	.FIXED_COUNTER_BASE = 0,
+	.MSR_STRIDE = 2,
 };

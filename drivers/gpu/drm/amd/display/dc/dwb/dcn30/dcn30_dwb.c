@@ -45,6 +45,7 @@
 
 static bool dwb3_get_caps(struct dwbc *dwbc, struct dwb_caps *caps)
 {
+	(void)dwbc;
 	if (caps) {
 		caps->adapter_id = 0;	/* we only support 1 adapter currently */
 		caps->hw_version = DCN_VERSION_3_0;
@@ -269,17 +270,4 @@ void dcn30_dwbc_construct(struct dcn30_dwbc *dwbc30,
 	dwbc30->dwbc_regs = dwbc_regs;
 	dwbc30->dwbc_shift = dwbc_shift;
 	dwbc30->dwbc_mask = dwbc_mask;
-}
-
-void dwb3_set_host_read_rate_control(struct dwbc *dwbc, bool host_read_delay)
-{
-	struct dcn30_dwbc *dwbc30 = TO_DCN30_DWBC(dwbc);
-
-	/*
-	 * Set maximum delay of host read access to DWBSCL LUT or OGAM LUT if there are no
-	 * idle cycles in HW pipeline (in number of clock cycles times 4)
-	 */
-	REG_UPDATE(DWB_HOST_READ_CONTROL, DWB_HOST_READ_RATE_CONTROL, host_read_delay);
-
-	DC_LOG_DWB("%s dwb3_rate_control at inst = %d", __func__, dwbc->inst);
 }

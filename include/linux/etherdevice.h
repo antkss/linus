@@ -38,11 +38,40 @@ int fwnode_get_mac_address(struct fwnode_handle *fwnode, char *addr);
 
 u32 eth_get_headlen(const struct net_device *dev, const void *data, u32 len);
 __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
+
+/**
+ * eth_type_trans_careful - eth_type_trans() for skbs coming from the stack
+ * @skb: buffer, possibly with less than ETH_HLEN bytes in its linear area
+ * @dev: receiving network device
+ *
+ * eth_type_trans() expects ETH_HLEN bytes in skb->head, which NIC drivers
+ * provide. Devices looping skbs from their transmit path back to the
+ * receive path (loopback, OVS internal ports) get skbs built by the stack,
+ * whose link-layer header might have been popped by tc or OVS actions.
+ *
+ * Sets skb->protocol on success.
+ *
+ * Return: SKB_NOT_DROPPED_YET on success, or a drop reason. In the latter
+ * case, the caller must free @skb.
+ */
+static inline enum skb_drop_reason
+eth_type_trans_careful(struct sk_buff *skb, struct net_device *dev)
+{
+	enum skb_drop_reason reason = pskb_may_pull_reason(skb, ETH_HLEN);
+
+	if (unlikely(reason))
+		return reason;
+
+	skb->protocol = eth_type_trans(skb, dev);
+	return SKB_NOT_DROPPED_YET;
+}
+
 extern const struct header_ops eth_header_ops;
 
 int eth_header(struct sk_buff *skb, struct net_device *dev, unsigned short type,
 	       const void *daddr, const void *saddr, unsigned len);
-int eth_header_parse(const struct sk_buff *skb, unsigned char *haddr);
+int eth_header_parse(const struct sk_buff *skb, const struct net_device *dev,
+		     unsigned char *haddr);
 int eth_header_cache(const struct neighbour *neigh, struct hh_cache *hh,
 		     __be16 type);
 void eth_header_cache_update(struct hh_cache *hh, const struct net_device *dev,
@@ -81,7 +110,7 @@ static const u8 eth_ipv6_mcast_addr_base[ETH_ALEN] __aligned(2) =
  * is_link_local_ether_addr - Determine if given Ethernet address is link-local
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if address is link local reserved addr (01:80:c2:00:00:0X) per
+ * Return: true if address is link local reserved addr (01:80:c2:00:00:0X) per
  * IEEE 802.1Q 8.6.3 Frame filtering.
  *
  * Please note: addr must be aligned to u16.
@@ -104,7 +133,7 @@ static inline bool is_link_local_ether_addr(const u8 *addr)
  * is_zero_ether_addr - Determine if give Ethernet address is all zeros.
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if the address is all zeroes.
+ * Return: true if the address is all zeroes.
  *
  * Please note: addr must be aligned to u16.
  */
@@ -123,7 +152,7 @@ static inline bool is_zero_ether_addr(const u8 *addr)
  * is_multicast_ether_addr - Determine if the Ethernet address is a multicast.
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if the address is a multicast address.
+ * Return: true if the address is a multicast address.
  * By definition the broadcast address is also a multicast address.
  */
 static inline bool is_multicast_ether_addr(const u8 *addr)
@@ -157,7 +186,7 @@ static inline bool is_multicast_ether_addr_64bits(const u8 *addr)
  * is_local_ether_addr - Determine if the Ethernet address is locally-assigned one (IEEE 802).
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if the address is a local address.
+ * Return: true if the address is a local address.
  */
 static inline bool is_local_ether_addr(const u8 *addr)
 {
@@ -168,7 +197,7 @@ static inline bool is_local_ether_addr(const u8 *addr)
  * is_broadcast_ether_addr - Determine if the Ethernet address is broadcast
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if the address is the broadcast address.
+ * Return: true if the address is the broadcast address.
  *
  * Please note: addr must be aligned to u16.
  */
@@ -183,7 +212,7 @@ static inline bool is_broadcast_ether_addr(const u8 *addr)
  * is_unicast_ether_addr - Determine if the Ethernet address is unicast
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return true if the address is a unicast address.
+ * Return: true if the address is a unicast address.
  */
 static inline bool is_unicast_ether_addr(const u8 *addr)
 {
@@ -197,7 +226,7 @@ static inline bool is_unicast_ether_addr(const u8 *addr)
  * Check that the Ethernet address (MAC) is not 00:00:00:00:00:00, is not
  * a multicast address, and is not FF:FF:FF:FF:FF:FF.
  *
- * Return true if the address is valid.
+ * Return: true if the address is valid.
  *
  * Please note: addr must be aligned to u16.
  */
@@ -214,7 +243,7 @@ static inline bool is_valid_ether_addr(const u8 *addr)
  *
  * Check that the value from the Ethertype/length field is a valid Ethertype.
  *
- * Return true if the valid is an 802.3 supported Ethertype.
+ * Return: true if the valid is an 802.3 supported Ethertype.
  */
 static inline bool eth_proto_is_802_3(__be16 proto)
 {
@@ -458,7 +487,7 @@ static inline bool ether_addr_is_ip_mcast(const u8 *addr)
  * ether_addr_to_u64 - Convert an Ethernet address into a u64 value.
  * @addr: Pointer to a six-byte array containing the Ethernet address
  *
- * Return a u64 value of the address
+ * Return: a u64 value of the address
  */
 static inline u64 ether_addr_to_u64(const u8 *addr)
 {

@@ -13,9 +13,26 @@
 #include <sound/soc.h>
 #include <sound/soc-acpi.h>
 #include "../../../codecs/hda.h"
+#include "../utils.h"
+
+static int avs_link_startup(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	const struct snd_soc_pcm_stream *stream_info;
+	struct snd_soc_dai *codec_dai;
+
+	codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+	stream_info = snd_soc_dai_get_pcm_stream(codec_dai, substream->stream);
+
+	return snd_pcm_hw_constraint_msbits(substream->runtime, 0, 0, stream_info->sig_bits);
+}
+
+static const struct snd_soc_ops avs_link_ops = {
+	.startup = avs_link_startup,
+};
 
 static int avs_create_dai_links(struct device *dev, struct hda_codec *codec, int pcm_count,
-				const char *platform_name, struct snd_soc_dai_link **links)
+				struct snd_soc_dai_link **links)
 {
 	struct snd_soc_dai_link_component *platform;
 	struct snd_soc_dai_link *dl;
@@ -28,7 +45,7 @@ static int avs_create_dai_links(struct device *dev, struct hda_codec *codec, int
 	if (!dl || !platform)
 		return -ENOMEM;
 
-	platform->name = platform_name;
+	platform->name = dev_name(dev);
 	pcm = list_first_entry(&codec->pcm_list_head, struct hda_pcm, list);
 
 	for (i = 0; i < pcm_count; i++, pcm = list_next_entry(pcm, list)) {
@@ -42,6 +59,7 @@ static int avs_create_dai_links(struct device *dev, struct hda_codec *codec, int
 		dl[i].platforms = platform;
 		dl[i].num_platforms = 1;
 		dl[i].ignore_pmdown_time = 1;
+		dl[i].ops = &avs_link_ops;
 
 		dl[i].codecs = devm_kzalloc(dev, sizeof(*dl->codecs), GFP_KERNEL);
 		dl[i].cpus = devm_kzalloc(dev, sizeof(*dl->cpus), GFP_KERNEL);
@@ -95,7 +113,8 @@ avs_card_hdmi_pcm_at(struct snd_soc_card *card, int hdmi_idx)
 static int avs_card_late_probe(struct snd_soc_card *card)
 {
 	struct snd_soc_acpi_mach *mach = dev_get_platdata(card->dev);
-	struct hda_codec *codec = mach->pdata;
+	struct avs_mach_pdata *pdata = mach->pdata;
+	struct hda_codec *codec = pdata->codec;
 	struct hda_pcm *hpcm;
 	/* Topology pcm indexing is 1-based */
 	int i = 1;
@@ -124,21 +143,21 @@ static int avs_card_late_probe(struct snd_soc_card *card)
 static int avs_probing_link_init(struct snd_soc_pcm_runtime *rtm)
 {
 	struct snd_soc_acpi_mach *mach;
+	struct avs_mach_pdata *pdata;
 	struct snd_soc_dai_link *links = NULL;
 	struct snd_soc_card *card = rtm->card;
 	struct hda_codec *codec;
-	struct hda_pcm *pcm;
-	int ret, pcm_count = 0;
+	int ret, pcm_count;
 
 	mach = dev_get_platdata(card->dev);
-	codec = mach->pdata;
+	pdata = mach->pdata;
+	codec = pdata->codec;
+	pcm_count = list_count_nodes(&codec->pcm_list_head);
 
-	if (list_empty(&codec->pcm_list_head))
+	if (!pcm_count)
 		return -EINVAL;
-	list_for_each_entry(pcm, &codec->pcm_list_head, list)
-		pcm_count++;
 
-	ret = avs_create_dai_links(card->dev, codec, pcm_count, mach->mach_params.platform, &links);
+	ret = avs_create_dai_links(card->dev, codec, pcm_count, &links);
 	if (ret < 0) {
 		dev_err(card->dev, "create links failed: %d\n", ret);
 		return ret;
@@ -167,12 +186,14 @@ static int avs_hdaudio_probe(struct platform_device *pdev)
 {
 	struct snd_soc_dai_link *binder;
 	struct snd_soc_acpi_mach *mach;
+	struct avs_mach_pdata *pdata;
 	struct snd_soc_card *card;
 	struct device *dev = &pdev->dev;
 	struct hda_codec *codec;
 
 	mach = dev_get_platdata(dev);
-	codec = mach->pdata;
+	pdata = mach->pdata;
+	codec = pdata->codec;
 
 	/* codec may be unloaded before card's probe() fires */
 	if (!device_is_registered(&codec->core.dev))
@@ -191,7 +212,7 @@ static int avs_hdaudio_probe(struct platform_device *pdev)
 	if (!binder->codecs->name)
 		return -ENOMEM;
 
-	binder->platforms->name = mach->mach_params.platform;
+	binder->platforms->name = dev_name(dev);
 	binder->num_platforms = 1;
 	binder->codecs->dai_name = "codec-probing-DAI";
 	binder->num_codecs = 1;
@@ -200,7 +221,19 @@ static int avs_hdaudio_probe(struct platform_device *pdev)
 	if (!card)
 		return -ENOMEM;
 
-	card->name = binder->codecs->name;
+	if (pdata->obsolete_card_names) {
+		card->name = devm_kasprintf(dev, GFP_KERNEL, "hdaudioB%dD%d", codec->bus->core.idx,
+					    codec->core.addr);
+		if (!card->name)
+			return -ENOMEM;
+	} else {
+		card->driver_name = "avs_hdaudio";
+		if (hda_codec_is_display(codec))
+			card->long_name = card->name = "AVS HDMI";
+		else
+			card->long_name = card->name = "AVS HD-Audio";
+	}
+
 	card->dev = dev;
 	card->owner = THIS_MODULE;
 	card->dai_link = binder;
@@ -209,14 +242,12 @@ static int avs_hdaudio_probe(struct platform_device *pdev)
 	if (hda_codec_is_display(codec))
 		card->late_probe = avs_card_late_probe;
 
-	return devm_snd_soc_register_card(dev, card);
+	return devm_snd_soc_register_deferrable_card(dev, card);
 }
 
 static const struct platform_device_id avs_hdaudio_driver_ids[] = {
-	{
-		.name = "avs_hdaudio",
-	},
-	{},
+	{ .name = "avs_hdaudio" },
+	{ }
 };
 MODULE_DEVICE_TABLE(platform, avs_hdaudio_driver_ids);
 

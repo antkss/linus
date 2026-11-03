@@ -154,7 +154,7 @@ static const struct attribute_group ds1682_group = {
  * User data attribute
  */
 static ssize_t ds1682_eeprom_read(struct file *filp, struct kobject *kobj,
-				  struct bin_attribute *attr,
+				  const struct bin_attribute *attr,
 				  char *buf, loff_t off, size_t count)
 {
 	struct i2c_client *client = kobj_to_i2c_client(kobj);
@@ -172,7 +172,7 @@ static ssize_t ds1682_eeprom_read(struct file *filp, struct kobject *kobj,
 }
 
 static ssize_t ds1682_eeprom_write(struct file *filp, struct kobject *kobj,
-				   struct bin_attribute *attr,
+				   const struct bin_attribute *attr,
 				   char *buf, loff_t off, size_t count)
 {
 	struct i2c_client *client = kobj_to_i2c_client(kobj);
@@ -271,14 +271,14 @@ static void ds1682_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id ds1682_id[] = {
-	{ "ds1682" },
+	{ .name = "ds1682" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ds1682_id);
 
 static const struct of_device_id ds1682_of_match[] = {
-	{ .compatible = "dallas,ds1682", },
-	{}
+	{ .compatible = "dallas,ds1682" },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, ds1682_of_match);
 

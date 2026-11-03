@@ -6,9 +6,13 @@
 #define DEFINE_DROP_REASON(FN, FNe)	\
 	FN(NOT_SPECIFIED)		\
 	FN(NO_SOCKET)			\
+	FN(SOCKET_CLOSE)		\
+	FN(SOCKET_FILTER)		\
+	FN(SOCKET_RCVBUFF)		\
+	FN(UNIX_DISCONNECT)		\
+	FN(UNIX_SKIP_OOB)		\
 	FN(PKT_TOO_SMALL)		\
 	FN(TCP_CSUM)			\
-	FN(SOCKET_FILTER)		\
 	FN(UDP_CSUM)			\
 	FN(NETFILTER_DROP)		\
 	FN(OTHERHOST)			\
@@ -18,7 +22,6 @@
 	FN(UNICAST_IN_L2_MULTICAST)	\
 	FN(XFRM_POLICY)			\
 	FN(IP_NOPROTO)			\
-	FN(SOCKET_RCVBUFF)		\
 	FN(PROTO_MEM)			\
 	FN(TCP_AUTH_HDR)		\
 	FN(TCP_MD5NOTFOUND)		\
@@ -36,8 +39,13 @@
 	FN(TCP_OVERWINDOW)		\
 	FN(TCP_OFOMERGE)		\
 	FN(TCP_RFC7323_PAWS)		\
+	FN(TCP_RFC7323_PAWS_ACK)	\
+	FN(TCP_RFC7323_TW_PAWS)		\
+	FN(TCP_RFC7323_TSECR)		\
+	FN(TCP_LISTEN_OVERFLOW)		\
 	FN(TCP_OLD_SEQUENCE)		\
 	FN(TCP_INVALID_SEQUENCE)	\
+	FN(TCP_INVALID_END_SEQUENCE)	\
 	FN(TCP_INVALID_ACK_SEQUENCE)	\
 	FN(TCP_RESET)			\
 	FN(TCP_INVALID_SYN)		\
@@ -55,21 +63,25 @@
 	FN(NEIGH_FAILED)		\
 	FN(NEIGH_QUEUEFULL)		\
 	FN(NEIGH_DEAD)			\
+	FN(NEIGH_HH_FILLFAIL)		\
 	FN(TC_EGRESS)			\
 	FN(SECURITY_HOOK)		\
 	FN(QDISC_DROP)			\
+	FN(QDISC_BURST_DROP)		\
 	FN(CPU_BACKLOG)			\
+	FN(MACVLAN_BROADCAST_BACKLOG)		\
+	FN(IPVLAN_MULTICAST_BACKLOG)		\
 	FN(XDP)				\
 	FN(TC_INGRESS)			\
 	FN(UNHANDLED_PROTO)		\
 	FN(SKB_CSUM)			\
 	FN(SKB_GSO_SEG)			\
+	FN(SKB_BAD_GSO)			\
 	FN(SKB_UCOPY_FAULT)		\
 	FN(DEV_HDR)			\
 	FN(DEV_READY)			\
 	FN(FULL_RING)			\
 	FN(NOMEM)			\
-	FN(HDR_TRUNC)			\
 	FN(TAP_FILTER)			\
 	FN(TAP_TXFILTER)		\
 	FN(ICMP_CSUM)			\
@@ -80,12 +92,14 @@
 	FN(IP_INVALID_SOURCE)		\
 	FN(IP_LOCALNET)			\
 	FN(IP_INVALID_DEST)		\
+	FN(IP_TTL_EXCEEDED)		\
 	FN(PKT_TOO_BIG)			\
 	FN(DUP_FRAG)			\
 	FN(FRAG_REASM_TIMEOUT)		\
 	FN(FRAG_TOO_FAR)		\
 	FN(TCP_MINTTL)			\
 	FN(IPV6_BAD_EXTHDR)		\
+	FN(IPV6_TOO_MANY_EXTHDRS)	\
 	FN(IPV6_NDISC_FRAG)		\
 	FN(IPV6_NDISC_HOP_LIMIT)	\
 	FN(IPV6_NDISC_BAD_CODE)		\
@@ -96,15 +110,24 @@
 	FN(PACKET_SOCK_ERROR)		\
 	FN(TC_CHAIN_NOTFOUND)		\
 	FN(TC_RECLASSIFY_LOOP)		\
-	FN(VXLAN_INVALID_HDR)		\
-	FN(VXLAN_VNI_NOT_FOUND)		\
+	FN(TUNNEL_INVALID_HDR)		\
+	FN(TUNNEL_NOT_FOUND)		\
 	FN(MAC_INVALID_SOURCE)		\
 	FN(VXLAN_ENTRY_EXISTS)		\
-	FN(VXLAN_NO_REMOTE)		\
+	FN(NO_TX_TARGET)		\
 	FN(IP_TUNNEL_ECN)		\
 	FN(TUNNEL_TXINFO)		\
 	FN(LOCAL_MAC)			\
 	FN(ARP_PVLAN_DISABLE)		\
+	FN(MAC_IEEE_MAC_CONTROL)	\
+	FN(BRIDGE_INGRESS_STP_STATE)	\
+	FN(CAN_RX_INVALID_FRAME)	\
+	FN(CANFD_RX_INVALID_FRAME)	\
+	FN(CANXL_RX_INVALID_FRAME)	\
+	FN(PFMEMALLOC)	\
+	FN(PSP_INPUT)			\
+	FN(PSP_OUTPUT)			\
+	FN(RECURSION_LIMIT)		\
 	FNe(MAX)
 
 /**
@@ -129,12 +152,27 @@ enum skb_drop_reason {
 	 * 3) no valid child socket during 3WHS process
 	 */
 	SKB_DROP_REASON_NO_SOCKET,
+	/** @SKB_DROP_REASON_SOCKET_CLOSE: socket is close()d */
+	SKB_DROP_REASON_SOCKET_CLOSE,
+	/** @SKB_DROP_REASON_SOCKET_FILTER: dropped by socket filter */
+	SKB_DROP_REASON_SOCKET_FILTER,
+	/** @SKB_DROP_REASON_SOCKET_RCVBUFF: socket receive buff is full */
+	SKB_DROP_REASON_SOCKET_RCVBUFF,
+	/**
+	 * @SKB_DROP_REASON_UNIX_DISCONNECT: recv queue is purged when SOCK_DGRAM
+	 * or SOCK_SEQPACKET socket re-connect()s to another socket or notices
+	 * during send() that the peer has been close()d.
+	 */
+	SKB_DROP_REASON_UNIX_DISCONNECT,
+	/**
+	 * @SKB_DROP_REASON_UNIX_SKIP_OOB: Out-Of-Band data is skipped by
+	 * recv() without MSG_OOB so dropped.
+	 */
+	SKB_DROP_REASON_UNIX_SKIP_OOB,
 	/** @SKB_DROP_REASON_PKT_TOO_SMALL: packet size is too small */
 	SKB_DROP_REASON_PKT_TOO_SMALL,
 	/** @SKB_DROP_REASON_TCP_CSUM: TCP checksum error */
 	SKB_DROP_REASON_TCP_CSUM,
-	/** @SKB_DROP_REASON_SOCKET_FILTER: dropped by socket filter */
-	SKB_DROP_REASON_SOCKET_FILTER,
 	/** @SKB_DROP_REASON_UDP_CSUM: UDP checksum error */
 	SKB_DROP_REASON_UDP_CSUM,
 	/** @SKB_DROP_REASON_NETFILTER_DROP: dropped by netfilter */
@@ -165,8 +203,6 @@ enum skb_drop_reason {
 	SKB_DROP_REASON_XFRM_POLICY,
 	/** @SKB_DROP_REASON_IP_NOPROTO: no support for IP protocol */
 	SKB_DROP_REASON_IP_NOPROTO,
-	/** @SKB_DROP_REASON_SOCKET_RCVBUFF: socket receive buff is full */
-	SKB_DROP_REASON_SOCKET_RCVBUFF,
 	/**
 	 * @SKB_DROP_REASON_PROTO_MEM: proto memory limitation, such as
 	 * udp packet drop out of udp_memory_allocated.
@@ -251,10 +287,34 @@ enum skb_drop_reason {
 	 * LINUX_MIB_PAWSESTABREJECTED, LINUX_MIB_PAWSACTIVEREJECTED
 	 */
 	SKB_DROP_REASON_TCP_RFC7323_PAWS,
+	/**
+	 * @SKB_DROP_REASON_TCP_RFC7323_PAWS_ACK: PAWS check, old ACK packet.
+	 * Corresponds to LINUX_MIB_PAWS_OLD_ACK.
+	 */
+	SKB_DROP_REASON_TCP_RFC7323_PAWS_ACK,
+	/**
+	 * @SKB_DROP_REASON_TCP_RFC7323_TW_PAWS: PAWS check, socket is in
+	 * TIME_WAIT state.
+	 * Corresponds to LINUX_MIB_PAWS_TW_REJECTED.
+	 */
+	SKB_DROP_REASON_TCP_RFC7323_TW_PAWS,
+	/**
+	 * @SKB_DROP_REASON_TCP_RFC7323_TSECR: PAWS check, invalid TSEcr.
+	 * Corresponds to LINUX_MIB_TSECRREJECTED.
+	 */
+	SKB_DROP_REASON_TCP_RFC7323_TSECR,
+	/** @SKB_DROP_REASON_TCP_LISTEN_OVERFLOW: listener queue full. */
+	SKB_DROP_REASON_TCP_LISTEN_OVERFLOW,
 	/** @SKB_DROP_REASON_TCP_OLD_SEQUENCE: Old SEQ field (duplicate packet) */
 	SKB_DROP_REASON_TCP_OLD_SEQUENCE,
-	/** @SKB_DROP_REASON_TCP_INVALID_SEQUENCE: Not acceptable SEQ field */
+	/** @SKB_DROP_REASON_TCP_INVALID_SEQUENCE: Not acceptable SEQ field. */
 	SKB_DROP_REASON_TCP_INVALID_SEQUENCE,
+	/**
+	 * @SKB_DROP_REASON_TCP_INVALID_END_SEQUENCE:
+	 * Not acceptable END_SEQ field.
+	 * Corresponds to LINUX_MIB_BEYOND_WINDOW.
+	 */
+	SKB_DROP_REASON_TCP_INVALID_END_SEQUENCE,
 	/**
 	 * @SKB_DROP_REASON_TCP_INVALID_ACK_SEQUENCE: Not acceptable ACK SEQ
 	 * field because ack sequence is not in the window between snd_una
@@ -302,21 +362,40 @@ enum skb_drop_reason {
 	SKB_DROP_REASON_NEIGH_QUEUEFULL,
 	/** @SKB_DROP_REASON_NEIGH_DEAD: neigh entry is dead */
 	SKB_DROP_REASON_NEIGH_DEAD,
+	/** @SKB_DROP_REASON_NEIGH_HH_FILLFAIL: failed to fill the device hard header */
+	SKB_DROP_REASON_NEIGH_HH_FILLFAIL,
 	/** @SKB_DROP_REASON_TC_EGRESS: dropped in TC egress HOOK */
 	SKB_DROP_REASON_TC_EGRESS,
 	/** @SKB_DROP_REASON_SECURITY_HOOK: dropped due to security HOOK */
 	SKB_DROP_REASON_SECURITY_HOOK,
 	/**
-	 * @SKB_DROP_REASON_QDISC_DROP: dropped by qdisc when packet outputting (
-	 * failed to enqueue to current qdisc)
+	 * @SKB_DROP_REASON_QDISC_DROP: dropped by qdisc during enqueue or
+	 * dequeue. More specific drop reasons are available via the
+	 * qdisc:qdisc_drop tracepoint, which also provides qdisc handle
+	 * and name for identifying the source.
 	 */
 	SKB_DROP_REASON_QDISC_DROP,
+	/**
+	 * @SKB_DROP_REASON_QDISC_BURST_DROP: dropped when net.core.qdisc_max_burst
+	 * limit is hit.
+	 */
+	SKB_DROP_REASON_QDISC_BURST_DROP,
 	/**
 	 * @SKB_DROP_REASON_CPU_BACKLOG: failed to enqueue the skb to the per CPU
 	 * backlog queue. This can be caused by backlog queue full (see
 	 * netdev_max_backlog in net.rst) or RPS flow limit
 	 */
 	SKB_DROP_REASON_CPU_BACKLOG,
+	/**
+	 * @SKB_DROP_REASON_MACVLAN_BROADCAST_BACKLOG: failed to enqueue the skb
+	 * to macvlan broadcast queue.
+	 */
+	SKB_DROP_REASON_MACVLAN_BROADCAST_BACKLOG,
+	/**
+	 * @SKB_DROP_REASON_IPVLAN_MULTICAST_BACKLOG: failed to enqueue the skb
+	 * to ipvlan multicast queue.
+	 */
+	SKB_DROP_REASON_IPVLAN_MULTICAST_BACKLOG,
 	/** @SKB_DROP_REASON_XDP: dropped by XDP in input path */
 	SKB_DROP_REASON_XDP,
 	/** @SKB_DROP_REASON_TC_INGRESS: dropped in TC ingress HOOK */
@@ -327,6 +406,8 @@ enum skb_drop_reason {
 	SKB_DROP_REASON_SKB_CSUM,
 	/** @SKB_DROP_REASON_SKB_GSO_SEG: gso segmentation error */
 	SKB_DROP_REASON_SKB_GSO_SEG,
+	/** @SKB_DROP_REASON_SKB_BAD_GSO: malicious gso packet. */
+	SKB_DROP_REASON_SKB_BAD_GSO,
 	/**
 	 * @SKB_DROP_REASON_SKB_UCOPY_FAULT: failed to copy data from user space,
 	 * e.g., via zerocopy_sg_from_iter() or skb_orphan_frags_rx()
@@ -345,12 +426,6 @@ enum skb_drop_reason {
 	SKB_DROP_REASON_FULL_RING,
 	/** @SKB_DROP_REASON_NOMEM: error due to OOM */
 	SKB_DROP_REASON_NOMEM,
-	/**
-	 * @SKB_DROP_REASON_HDR_TRUNC: failed to trunc/extract the header from
-	 * networking data, e.g., failed to pull the protocol header from
-	 * frags via pskb_may_pull()
-	 */
-	SKB_DROP_REASON_HDR_TRUNC,
 	/**
 	 * @SKB_DROP_REASON_TAP_FILTER: dropped by (ebpf) filter directly attached
 	 * to tun/tap, e.g., via TUNSETFILTEREBPF
@@ -394,6 +469,11 @@ enum skb_drop_reason {
 	 */
 	SKB_DROP_REASON_IP_INVALID_DEST,
 	/**
+	 * @SKB_DROP_REASON_IP_TTL_EXCEEDED: IPv4 TTL or IPv6 hop limit <= 1
+	 * (see IPSTATS_MIB_INHDRERRORS)
+	 */
+	SKB_DROP_REASON_IP_TTL_EXCEEDED,
+	/**
 	 * @SKB_DROP_REASON_PKT_TOO_BIG: packet size is too big (maybe exceed the
 	 * MTU)
 	 */
@@ -414,6 +494,11 @@ enum skb_drop_reason {
 	SKB_DROP_REASON_TCP_MINTTL,
 	/** @SKB_DROP_REASON_IPV6_BAD_EXTHDR: Bad IPv6 extension header. */
 	SKB_DROP_REASON_IPV6_BAD_EXTHDR,
+	/**
+	 * @SKB_DROP_REASON_IPV6_TOO_MANY_EXTHDRS: Number of IPv6 extension
+	 * headers in the packet exceeds IP6_MAX_EXT_HDRS_CNT.
+	 */
+	SKB_DROP_REASON_IPV6_TOO_MANY_EXTHDRS,
 	/** @SKB_DROP_REASON_IPV6_NDISC_FRAG: invalid frag (suppress_frag_ndisc). */
 	SKB_DROP_REASON_IPV6_NDISC_FRAG,
 	/** @SKB_DROP_REASON_IPV6_NDISC_HOP_LIMIT: invalid hop limit. */
@@ -447,13 +532,16 @@ enum skb_drop_reason {
 	 */
 	SKB_DROP_REASON_TC_RECLASSIFY_LOOP,
 	/**
-	 * @SKB_DROP_REASON_VXLAN_INVALID_HDR: VXLAN header is invalid. E.g.:
-	 * 1) reserved fields are not zero
-	 * 2) "I" flag is not set
+	 * @SKB_DROP_REASON_TUNNEL_INVALID_HDR: tunnel header is invalid. E.g.:
+	 * 1) VXLAN reserved fields are not zero
+	 * 2) VXLAN "I" flag is not set
 	 */
-	SKB_DROP_REASON_VXLAN_INVALID_HDR,
-	/** @SKB_DROP_REASON_VXLAN_VNI_NOT_FOUND: no VXLAN device found for VNI */
-	SKB_DROP_REASON_VXLAN_VNI_NOT_FOUND,
+	SKB_DROP_REASON_TUNNEL_INVALID_HDR,
+	/**
+	 * @SKB_DROP_REASON_TUNNEL_NOT_FOUND: no tunnel device found for the
+	 * packet, e.g. no VXLAN device for its VNI
+	 */
+	SKB_DROP_REASON_TUNNEL_NOT_FOUND,
 	/** @SKB_DROP_REASON_MAC_INVALID_SOURCE: source mac is invalid */
 	SKB_DROP_REASON_MAC_INVALID_SOURCE,
 	/**
@@ -461,8 +549,8 @@ enum skb_drop_reason {
 	 * entry or an entry pointing to a nexthop.
 	 */
 	SKB_DROP_REASON_VXLAN_ENTRY_EXISTS,
-	/** @SKB_DROP_REASON_VXLAN_NO_REMOTE: no remote found for xmit */
-	SKB_DROP_REASON_VXLAN_NO_REMOTE,
+	/** @SKB_DROP_REASON_NO_TX_TARGET: no target found for xmit */
+	SKB_DROP_REASON_NO_TX_TARGET,
 	/**
 	 * @SKB_DROP_REASON_IP_TUNNEL_ECN: skb is dropped according to
 	 * RFC 6040 4.2, see __INET_ECN_decapsulate() for detail.
@@ -484,6 +572,46 @@ enum skb_drop_reason {
 	 * enabled.
 	 */
 	SKB_DROP_REASON_ARP_PVLAN_DISABLE,
+	/**
+	 * @SKB_DROP_REASON_MAC_IEEE_MAC_CONTROL: the destination MAC address
+	 * is an IEEE MAC Control address.
+	 */
+	SKB_DROP_REASON_MAC_IEEE_MAC_CONTROL,
+	/**
+	 * @SKB_DROP_REASON_BRIDGE_INGRESS_STP_STATE: the STP state of the
+	 * ingress bridge port does not allow frames to be forwarded.
+	 */
+	SKB_DROP_REASON_BRIDGE_INGRESS_STP_STATE,
+	/**
+	 * @SKB_DROP_REASON_CAN_RX_INVALID_FRAME: received
+	 * non conform CAN frame (or device is unable to receive CAN frames)
+	 */
+	SKB_DROP_REASON_CAN_RX_INVALID_FRAME,
+	/**
+	 * @SKB_DROP_REASON_CANFD_RX_INVALID_FRAME: received
+	 * non conform CAN-FD frame (or device is unable to receive CAN frames)
+	 */
+	SKB_DROP_REASON_CANFD_RX_INVALID_FRAME,
+	/**
+	 * @SKB_DROP_REASON_CANXL_RX_INVALID_FRAME: received
+	 * non conform CAN-XL frame (or device is unable to receive CAN frames)
+	 */
+	SKB_DROP_REASON_CANXL_RX_INVALID_FRAME,
+	/**
+	 * @SKB_DROP_REASON_PFMEMALLOC: packet allocated from memory reserve
+	 * reached a path or socket not eligible for use of memory reserves
+	 */
+	SKB_DROP_REASON_PFMEMALLOC,
+	/** @SKB_DROP_REASON_PSP_INPUT: PSP input checks failed */
+	SKB_DROP_REASON_PSP_INPUT,
+	/** @SKB_DROP_REASON_PSP_OUTPUT: PSP output checks failed */
+	SKB_DROP_REASON_PSP_OUTPUT,
+	/**
+	 * @SKB_DROP_REASON_RECURSION_LIMIT: Dead loop on virtual device, e.g. a
+	 * tunnel whose route to its remote end goes out of the tunnel device
+	 * itself.
+	 */
+	SKB_DROP_REASON_RECURSION_LIMIT,
 	/**
 	 * @SKB_DROP_REASON_MAX: the maximum of core drop reasons, which
 	 * shouldn't be used as a real 'reason' - only for tracing code gen

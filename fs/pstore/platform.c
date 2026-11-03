@@ -92,8 +92,8 @@ module_param(compress, charp, 0444);
 MODULE_PARM_DESC(compress, "compression to use");
 
 /* How much of the kernel log to snapshot */
-unsigned long kmsg_bytes = CONFIG_PSTORE_DEFAULT_KMSG_BYTES;
-module_param(kmsg_bytes, ulong, 0444);
+unsigned int kmsg_bytes = CONFIG_PSTORE_DEFAULT_KMSG_BYTES;
+module_param(kmsg_bytes, uint, 0444);
 MODULE_PARM_DESC(kmsg_bytes, "amount of kernel log to snapshot (in bytes)");
 
 static void *compress_workspace;
@@ -107,9 +107,9 @@ static void *compress_workspace;
 static char *big_oops_buf;
 static size_t max_compressed_size;
 
-void pstore_set_kmsg_bytes(int bytes)
+void pstore_set_kmsg_bytes(unsigned int bytes)
 {
-	kmsg_bytes = bytes;
+	WRITE_ONCE(kmsg_bytes, bytes);
 }
 
 /* Tag each group of saved records with a sequence number */
@@ -240,9 +240,14 @@ static void allocate_buf_for_compression(void)
 		return;
 	}
 
-	/* A non-NULL big_oops_buf indicates compression is available. */
-	big_oops_buf = buf;
 	max_compressed_size = compressed_size;
+	/*
+	 * A non-NULL big_oops_buf indicates compression is available.
+	 * pstore_dump() tests it without psinfo_lock and then reads
+	 * max_compressed_size, which is stored above. Publish the buffer
+	 * with release semantics.
+	 */
+	smp_store_release(&big_oops_buf, buf);
 
 	pr_info("Using crash dump compression: %s\n", compress);
 }
@@ -278,6 +283,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
 			struct kmsg_dump_detail *detail)
 {
 	struct kmsg_dump_iter iter;
+	unsigned int	remaining = READ_ONCE(kmsg_bytes);
 	unsigned long	total = 0;
 	const char	*why;
 	unsigned int	part = 1;
@@ -300,7 +306,7 @@ static void pstore_dump(struct kmsg_dumper *dumper,
 	kmsg_dump_rewind(&iter);
 
 	oopscount++;
-	while (total < kmsg_bytes) {
+	while (total < remaining) {
 		char *dst;
 		size_t dst_size;
 		int header_size;
@@ -315,7 +321,8 @@ static void pstore_dump(struct kmsg_dumper *dumper,
 		record.part = part;
 		record.buf = psinfo->buf;
 
-		dst = big_oops_buf ?: psinfo->buf;
+		/* Pairs with the smp_store_release() in allocate_buf_for_compression(). */
+		dst = smp_load_acquire(&big_oops_buf) ?: psinfo->buf;
 		dst_size = max_compressed_size ?: psinfo->bufsize;
 
 		/* Write dump header. */
@@ -562,7 +569,7 @@ void pstore_unregister(struct pstore_info *psi)
 		pstore_unregister_kmsg();
 
 	/* Stop timer and make sure all work has finished. */
-	del_timer_sync(&pstore_timer);
+	timer_delete_sync(&pstore_timer);
 	flush_work(&pstore_work);
 
 	/* Remove all backend records from filesystem tree. */
@@ -682,7 +689,7 @@ void pstore_get_backend_records(struct pstore_info *psi,
 		struct pstore_record *record;
 		int rc;
 
-		record = kzalloc(sizeof(*record), GFP_KERNEL);
+		record = kzalloc_obj(*record);
 		if (!record) {
 			pr_err("out of memory creating record\n");
 			break;

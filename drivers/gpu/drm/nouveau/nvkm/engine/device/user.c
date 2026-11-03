@@ -27,6 +27,7 @@
 
 #include <core/client.h>
 #include <subdev/fb.h>
+#include <subdev/gsp.h>
 #include <subdev/instmem.h>
 #include <subdev/timer.h>
 
@@ -148,6 +149,9 @@ nvkm_udevice_info(struct nvkm_udevice *udev, void *data, u32 size)
 	case TU100: args->v0.family = NV_DEVICE_INFO_V0_TURING; break;
 	case GA100: args->v0.family = NV_DEVICE_INFO_V0_AMPERE; break;
 	case AD100: args->v0.family = NV_DEVICE_INFO_V0_ADA; break;
+	case GH100: args->v0.family = NV_DEVICE_INFO_V0_HOPPER; break;
+	case GB10x: args->v0.family = NV_DEVICE_INFO_V0_BLACKWELL; break;
+	case GB20x: args->v0.family = NV_DEVICE_INFO_V0_BLACKWELL; break;
 	default:
 		args->v0.family = 0;
 		break;
@@ -187,6 +191,38 @@ nvkm_udevice_time(struct nvkm_udevice *udev, void *data, u32 size)
 }
 
 static int
+nvkm_udevice_gcx_ready(struct nvkm_udevice *udev, void *data, u32 size)
+{
+	struct nvkm_object *object = &udev->object;
+	struct nvkm_device *device = udev->device;
+	struct nvkm_gsp *gsp = device->gsp;
+	union {
+		struct nv_device_gcx_ready_v0 v0;
+	} *args = data;
+	int ret = -ENOSYS;
+
+	if (!gsp || !gsp->rm) {
+		args->v0.ready = NV_DEVICE_GC6_READY | NV_DEVICE_GCOFF_READY;
+		return 0;
+	}
+
+	nvif_ioctl(object, "device gcx ready size %d\n", size);
+	ret = nvif_unpack(ret, &data, &size, args->v0, 0, 0, false);
+	if (!ret) {
+		nvif_ioctl(object, "device gcx ready vers %d\n", args->v0.version);
+
+		ret = nvkm_gsp_gcx_ready(gsp);
+		if (ret < 0)
+			return ret;
+
+		args->v0.ready = ret;
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static int
 nvkm_udevice_mthd(struct nvkm_object *object, u32 mthd, void *data, u32 size)
 {
 	struct nvkm_udevice *udev = nvkm_udevice(object);
@@ -196,6 +232,8 @@ nvkm_udevice_mthd(struct nvkm_object *object, u32 mthd, void *data, u32 size)
 		return nvkm_udevice_info(udev, data, size);
 	case NV_DEVICE_V0_TIME:
 		return nvkm_udevice_time(udev, data, size);
+	case NV_DEVICE_V0_GCX_READY:
+		return nvkm_udevice_gcx_ready(udev, data, size);
 	default:
 		break;
 	}
@@ -209,13 +247,13 @@ nvkm_udevice_map(struct nvkm_object *object, void *argv, u32 argc,
 	struct nvkm_udevice *udev = nvkm_udevice(object);
 	struct nvkm_device *device = udev->device;
 	*type = NVKM_OBJECT_MAP_IO;
-	*addr = device->func->resource_addr(device, 0);
-	*size = device->func->resource_size(device, 0);
+	*addr = device->func->resource_addr(device, NVKM_BAR0_PRI);
+	*size = device->func->resource_size(device, NVKM_BAR0_PRI);
 	return 0;
 }
 
 static int
-nvkm_udevice_fini(struct nvkm_object *object, bool suspend)
+nvkm_udevice_fini(struct nvkm_object *object, enum nvkm_suspend_state suspend)
 {
 	struct nvkm_udevice *udev = nvkm_udevice(object);
 	struct nvkm_device *device = udev->device;
@@ -324,7 +362,7 @@ nvkm_udevice_new(const struct nvkm_oclass *oclass, void *data, u32 size,
 	struct nvkm_client *client = oclass->client;
 	struct nvkm_udevice *udev;
 
-	if (!(udev = kzalloc(sizeof(*udev), GFP_KERNEL)))
+	if (!(udev = kzalloc_obj(*udev)))
 		return -ENOMEM;
 	nvkm_object_ctor(&nvkm_udevice, oclass, &udev->object);
 	*pobject = &udev->object;

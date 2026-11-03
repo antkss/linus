@@ -437,8 +437,7 @@ message type supported.  At run time this can be queried by means of the
 RXRPC_SUPPORTED_CMSG socket option (see below).
 
 
-==============
-SOCKET OPTIONS
+Socket Options
 ==============
 
 AF_RXRPC sockets support a few socket options at the SOL_RXRPC level:
@@ -495,8 +494,7 @@ AF_RXRPC sockets support a few socket options at the SOL_RXRPC level:
      the highest control message type supported.
 
 
-========
-SECURITY
+Security
 ========
 
 Currently, only the kerberos 4 equivalent protocol has been implemented
@@ -540,8 +538,7 @@ be found at:
 	http://people.redhat.com/~dhowells/rxrpc/listen.c
 
 
-====================
-EXAMPLE CLIENT USAGE
+Example Client Usage
 ====================
 
 A client would issue an operation by:
@@ -873,7 +870,6 @@ The kernel interface functions are as follows:
 	int rxrpc_kernel_send_data(struct socket *sock,
 				   struct rxrpc_call *call,
 				   struct msghdr *msg,
-				   size_t len,
 				   rxrpc_notify_end_tx_t notify_end_rx);
 
      This is used to supply either the request part of a client call or the
@@ -882,13 +878,16 @@ The kernel interface functions are as follows:
      exclusively to in-kernel virtual addresses.  msg.msg_flags may be given
      MSG_MORE if there will be subsequent data sends for this call.
 
-     The msg must not specify a destination address, control data or any flags
-     other than MSG_MORE.  len is the total amount of data to transmit.
+     msg must not specify a destination address, control data or any flags
+     other than MSG_MORE or MSG_WAITALL.
 
      notify_end_rx can be NULL or it can be used to specify a function to be
      called when the call changes state to end the Tx phase.  This function is
      called with a spinlock held to prevent the last DATA packet from being
      transmitted until the function returns.
+
+     It returns 0 if all the provided data has been buffered and a negative
+     error code on failure.
 
  (#) Receive data from a call::
 
@@ -910,10 +909,15 @@ The kernel interface functions are as follows:
       want_more should be true if further data will be required after this is
       satisfied and false if this is the last item of the receive phase.
 
-      There are three normal returns: 0 if the buffer was filled and want_more
-      was true; 1 if the buffer was filled, the last DATA packet has been
-      emptied and want_more was false; and -EAGAIN if the function needs to be
-      called again.
+      For client calls, there are three normal returns: 0 if the buffer was
+      filled and want_more was true; 1 if the buffer was filled, the last DATA
+      packet has been emptied and want_more was false; and -EAGAIN if the
+      function needs to be called again.
+
+      For service calls, there are four normal returns: 0 and -EAGAIN are the
+      same as for client calls; 2 indicates that the last DATA packet of the
+      request has been received, want_more was false and the call is still in
+      progress; and 1 indicates that the call is now successfully complete.
 
       If the last DATA packet is processed but the buffer contains less than
       the amount requested, EBADMSG is returned.  If want_more wasn't set, but
@@ -1062,30 +1066,6 @@ The kernel interface functions are as follows:
      first function to change.  Note that this must be called in TASK_RUNNING
      state.
 
- (#) Get remote client epoch::
-
-	u32 rxrpc_kernel_get_epoch(struct socket *sock,
-				   struct rxrpc_call *call)
-
-     This allows the epoch that's contained in packets of an incoming client
-     call to be queried.  This value is returned.  The function always
-     successful if the call is still in progress.  It shouldn't be called once
-     the call has expired.  Note that calling this on a local client call only
-     returns the local epoch.
-
-     This value can be used to determine if the remote client has been
-     restarted as it shouldn't change otherwise.
-
- (#) Set the maximum lifespan on a call::
-
-	void rxrpc_kernel_set_max_life(struct socket *sock,
-				       struct rxrpc_call *call,
-				       unsigned long hard_timeout)
-
-     This sets the maximum lifespan on a call to hard_timeout (which is in
-     jiffies).  In the event of the timeout occurring, the call will be
-     aborted and -ETIME or -ETIMEDOUT will be returned.
-
  (#) Apply the RXRPC_MIN_SECURITY_LEVEL sockopt to a socket from within in the
      kernel::
 
@@ -1172,3 +1152,18 @@ adjusted through sysctls in /proc/net/rxrpc/:
      header plus exactly 1412 bytes of data.  The terminal packet must contain
      a four byte header plus any amount of data.  In any event, a jumbo packet
      may not exceed rxrpc_rx_mtu in size.
+
+
+API Function Reference
+======================
+
+.. kernel-doc:: net/rxrpc/af_rxrpc.c
+.. kernel-doc:: net/rxrpc/call_object.c
+.. kernel-doc:: net/rxrpc/key.c
+.. kernel-doc:: net/rxrpc/oob.c
+.. kernel-doc:: net/rxrpc/peer_object.c
+.. kernel-doc:: net/rxrpc/recvmsg.c
+.. kernel-doc:: net/rxrpc/rxgk.c
+.. kernel-doc:: net/rxrpc/rxkad.c
+.. kernel-doc:: net/rxrpc/sendmsg.c
+.. kernel-doc:: net/rxrpc/server_key.c

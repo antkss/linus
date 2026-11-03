@@ -42,13 +42,6 @@
 extern unsigned long __atags_pointer;
 
 /*
- * empty_zero_page is a special page that is used for
- * zero-initialized data and COW.
- */
-struct page *empty_zero_page;
-EXPORT_SYMBOL(empty_zero_page);
-
-/*
  * The pmd table for the upper-most set of pages.
  */
 pmd_t *top_pmd;
@@ -726,13 +719,8 @@ EXPORT_SYMBOL(phys_mem_access_prot);
 
 static void __init *early_alloc(unsigned long sz)
 {
-	void *ptr = memblock_alloc(sz, sz);
+	return memblock_alloc_or_panic(sz, sz);
 
-	if (!ptr)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, sz, sz);
-
-	return ptr;
 }
 
 static void *__init late_alloc(unsigned long sz)
@@ -740,9 +728,9 @@ static void *__init late_alloc(unsigned long sz)
 	void *ptdesc = pagetable_alloc(GFP_PGTABLE_KERNEL & ~__GFP_HIGHMEM,
 			get_order(sz));
 
-	if (!ptdesc || !pagetable_pte_ctor(ptdesc))
+	if (!ptdesc || !pagetable_pte_ctor(NULL, ptdesc))
 		BUG();
-	return ptdesc_to_virt(ptdesc);
+	return ptdesc_address(ptdesc);
 }
 
 static pte_t * __init arm_pte_alloc(pmd_t *pmd, unsigned long addr,
@@ -866,69 +854,6 @@ static void __init alloc_init_p4d(pgd_t *pgd, unsigned long addr,
 	} while (p4d++, addr = next, addr != end);
 }
 
-#ifndef CONFIG_ARM_LPAE
-static void __init create_36bit_mapping(struct mm_struct *mm,
-					struct map_desc *md,
-					const struct mem_type *type,
-					bool ng)
-{
-	unsigned long addr, length, end;
-	phys_addr_t phys;
-	pgd_t *pgd;
-
-	addr = md->virtual;
-	phys = __pfn_to_phys(md->pfn);
-	length = PAGE_ALIGN(md->length);
-
-	if (!(cpu_architecture() >= CPU_ARCH_ARMv6 || cpu_is_xsc3())) {
-		pr_err("MM: CPU does not support supersection mapping for 0x%08llx at 0x%08lx\n",
-		       (long long)__pfn_to_phys((u64)md->pfn), addr);
-		return;
-	}
-
-	/* N.B.	ARMv6 supersections are only defined to work with domain 0.
-	 *	Since domain assignments can in fact be arbitrary, the
-	 *	'domain == 0' check below is required to insure that ARMv6
-	 *	supersections are only allocated for domain 0 regardless
-	 *	of the actual domain assignments in use.
-	 */
-	if (type->domain) {
-		pr_err("MM: invalid domain in supersection mapping for 0x%08llx at 0x%08lx\n",
-		       (long long)__pfn_to_phys((u64)md->pfn), addr);
-		return;
-	}
-
-	if ((addr | length | __pfn_to_phys(md->pfn)) & ~SUPERSECTION_MASK) {
-		pr_err("MM: cannot create mapping for 0x%08llx at 0x%08lx invalid alignment\n",
-		       (long long)__pfn_to_phys((u64)md->pfn), addr);
-		return;
-	}
-
-	/*
-	 * Shift bits [35:32] of address into bits [23:20] of PMD
-	 * (See ARMv6 spec).
-	 */
-	phys |= (((md->pfn >> (32 - PAGE_SHIFT)) & 0xF) << 20);
-
-	pgd = pgd_offset(mm, addr);
-	end = addr + length;
-	do {
-		p4d_t *p4d = p4d_offset(pgd, addr);
-		pud_t *pud = pud_offset(p4d, addr);
-		pmd_t *pmd = pmd_offset(pud, addr);
-		int i;
-
-		for (i = 0; i < 16; i++)
-			*pmd++ = __pmd(phys | type->prot_sect | PMD_SECT_SUPER |
-				       (ng ? PMD_SECT_nG : 0));
-
-		addr += SUPERSECTION_SIZE;
-		phys += SUPERSECTION_SIZE;
-		pgd += SUPERSECTION_SIZE >> PGDIR_SHIFT;
-	} while (addr != end);
-}
-#endif	/* !CONFIG_ARM_LPAE */
-
 static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
 				    void *(*alloc)(unsigned long sz),
 				    bool ng)
@@ -939,16 +864,6 @@ static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
 	pgd_t *pgd;
 
 	type = &mem_types[md->type];
-
-#ifndef CONFIG_ARM_LPAE
-	/*
-	 * Catch 36-bit addresses
-	 */
-	if (md->pfn >= 0x100000) {
-		create_36bit_mapping(mm, md, type, ng);
-		return;
-	}
-#endif
 
 	addr = md->virtual & PAGE_MASK;
 	phys = __pfn_to_phys(md->pfn);
@@ -976,8 +891,7 @@ static void __init __create_mapping(struct mm_struct *mm, struct map_desc *md,
  * Create the page directory entries and any necessary
  * page tables for the mapping specified by `md'.  We
  * are able to cope here with varying sizes and address
- * offsets, and we take full advantage of sections and
- * supersections.
+ * offsets, and we take full advantage of sections.
  */
 static void __init create_mapping(struct map_desc *md)
 {
@@ -1027,10 +941,7 @@ void __init iotable_init(struct map_desc *io_desc, int nr)
 	if (!nr)
 		return;
 
-	svm = memblock_alloc(sizeof(*svm) * nr, __alignof__(*svm));
-	if (!svm)
-		panic("%s: Failed to allocate %zu bytes align=0x%zx\n",
-		      __func__, sizeof(*svm) * nr, __alignof__(*svm));
+	svm = memblock_alloc_or_panic(sizeof(*svm) * nr, __alignof__(*svm));
 
 	for (md = io_desc; nr; md++, nr--) {
 		create_mapping(md);
@@ -1052,10 +963,7 @@ void __init vm_reserve_area_early(unsigned long addr, unsigned long size,
 	struct vm_struct *vm;
 	struct static_vm *svm;
 
-	svm = memblock_alloc(sizeof(*svm), __alignof__(*svm));
-	if (!svm)
-		panic("%s: Failed to allocate %zu bytes align=0x%zx\n",
-		      __func__, sizeof(*svm), __alignof__(*svm));
+	svm = memblock_alloc_or_panic(sizeof(*svm), __alignof__(*svm));
 
 	vm = &svm->vm;
 	vm->addr = (void *)addr;
@@ -1765,8 +1673,6 @@ static void __init early_fixmap_shutdown(void)
  */
 void __init paging_init(const struct machine_desc *mdesc)
 {
-	void *zero_page;
-
 #ifdef CONFIG_XIP_KERNEL
 	/* Store the kernel RW RAM region start/end in these variables */
 	kernel_sec_start = CONFIG_PHYS_OFFSET & SECTION_MASK;
@@ -1792,13 +1698,7 @@ void __init paging_init(const struct machine_desc *mdesc)
 
 	top_pmd = pmd_off_k(0xffff0000);
 
-	/* allocate the zero page. */
-	zero_page = early_alloc(PAGE_SIZE);
-
 	bootmem_init();
-
-	empty_zero_page = virt_to_page(zero_page);
-	__flush_dcache_folio(NULL, page_folio(empty_zero_page));
 }
 
 void __init early_mm_init(const struct machine_desc *mdesc)

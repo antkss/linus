@@ -523,7 +523,7 @@ static int rt1308_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int reg_val = 0, reg1_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		rt1308->master = 0;
 		break;
 	default:
@@ -715,9 +715,7 @@ static int rt1308_resume(struct snd_soc_component *component)
 	struct rt1308_priv *rt1308 = snd_soc_component_get_drvdata(component);
 
 	regcache_cache_only(rt1308->regmap, false);
-	regcache_sync(rt1308->regmap);
-
-	return 0;
+	return regcache_sync(rt1308->regmap);
 }
 #else
 #define rt1308_suspend NULL
@@ -729,9 +727,19 @@ static int rt1308_resume(struct snd_soc_component *component)
 			SNDRV_PCM_FMTBIT_S20_3LE | SNDRV_PCM_FMTBIT_S16_LE | \
 			SNDRV_PCM_FMTBIT_S24_LE)
 
+static const u64 rt1308_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt1308_aif_dai_ops = {
 	.hw_params = rt1308_hw_params,
 	.set_fmt = rt1308_set_dai_fmt,
+	.auto_selectable_formats	= &rt1308_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 };
 
 static struct snd_soc_dai_driver rt1308_dai[] = {
@@ -781,21 +789,21 @@ static const struct regmap_config rt1308_regmap = {
 #ifdef CONFIG_OF
 static const struct of_device_id rt1308_of_match[] = {
 	{ .compatible = "realtek,rt1308", },
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, rt1308_of_match);
 #endif
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id rt1308_acpi_match[] = {
-	{ "10EC1308", 0, },
-	{ },
+	{ "10EC1308" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, rt1308_acpi_match);
 #endif
 
 static const struct i2c_device_id rt1308_i2c_id[] = {
-	{ "rt1308" },
+	{ .name = "rt1308" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt1308_i2c_id);

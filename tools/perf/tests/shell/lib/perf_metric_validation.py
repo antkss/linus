@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
-import re
-import csv
-import json
 import argparse
+import json
 from pathlib import Path
 import subprocess
+import sys
+from typing import Any
 
 
 class TestError:
@@ -35,7 +35,8 @@ class TestError:
 
 
 class Validator:
-    def __init__(self, rulefname, reportfname='', t=5, debug=False, datafname='', fullrulefname='', workload='true', metrics=''):
+    def __init__(self, rulefname, reportfname='', t=5, debug=False, datafname='', fullrulefname='',
+                 workload='true', metrics='', cputype='cpu'):
         self.rulefname = rulefname
         self.reportfname = reportfname
         self.rules = None
@@ -43,6 +44,7 @@ class Validator:
         self.metrics = self.__set_metrics(metrics)
         self.skiplist = set()
         self.tolerance = t
+        self.cputype = cputype
 
         self.workloads = [x for x in workload.split(",") if x]
         self.wlidx = 0  # idx of current workloads
@@ -75,11 +77,11 @@ class Validator:
 
     def read_json(self, filename: str) -> dict:
         try:
-            with open(Path(filename).resolve(), "r") as f:
+            with open(Path(filename).resolve(), "r", encoding="utf-8") as f:
                 data = json.loads(f.read())
         except OSError as e:
             print(f"Error when reading file {e}")
-            sys.exit()
+            sys.exit(1)
 
         return data
 
@@ -88,16 +90,16 @@ class Validator:
         if not parent.exists():
             parent.mkdir(parents=True)
 
-        with open(output_file, "w+") as output_file:
+        with open(output_file, "w+", encoding="utf-8") as out_f:
             json.dump(data,
-                      output_file,
+                      out_f,
                       ensure_ascii=True,
                       indent=4)
 
     def get_results(self, idx: int = 0):
         return self.results.get(idx)
 
-    def get_bounds(self, lb, ub, error, alias={}, ridx: int = 0) -> list:
+    def get_bounds(self, lb, ub, error, alias=None, ridx: int = 0) -> tuple:
         """
         Get bounds and tolerance from lb, ub, and error.
         If missing lb, use 0.0; missing ub, use float('inf); missing error, use self.tolerance.
@@ -109,6 +111,9 @@ class Validator:
                   upper bound, return -1 if the upper bound is a metric value and is not collected
                   tolerance, denormalized base on upper bound value
         """
+        if alias is None:
+            alias = {}
+
         # init ubv and lbv to invalid values
         def get_bound_value(bound, initval, ridx):
             val = initval
@@ -118,7 +123,7 @@ class Validator:
                 if bound == '':
                     val = float("inf")
                 elif bound in alias:
-                    vall = self.get_value(alias[ub], ridx)
+                    vall = self.get_value(alias[bound], ridx)
                     if vall:
                         val = vall[0]
                 elif bound.replace('.', '1').isdigit():
@@ -211,7 +216,7 @@ class Validator:
         @param alias: the dict has alias to metric name mapping
         @returns: value of the formula is success; -1 if the one or more metric value not provided
         """
-        stack = []
+        stack: list[Any] = []
         b = 0
         errs = []
         sign = "+"
@@ -228,9 +233,9 @@ class Validator:
                 else:
                     f = f + "{0}(={1:.4f})".format(s, v[0])
                     if sign == "*":
-                        stack[-1] = stack[-1] * v
+                        stack[-1] = stack[-1] * v[0]
                     elif sign == "/":
-                        stack[-1] = stack[-1] / v
+                        stack[-1] = stack[-1] / v[0]
                     elif sign == '-':
                         stack.append(-v[0])
                     else:
@@ -261,7 +266,7 @@ class Validator:
             alias[m['Alias']] = m['Name']
         lbv, ubv, t = self.get_bounds(
             rule['RangeLower'], rule['RangeUpper'], rule['ErrorThreshold'], alias, ridx=rule['RuleIndex'])
-        val, f = self.evaluate_formula(
+        val, _ = self.evaluate_formula(
             rule['Formula'], alias, ridx=rule['RuleIndex'])
 
         lb = rule['RangeLower']
@@ -314,7 +319,7 @@ class Validator:
                 rerun.append(m['Name'])
 
         if len(rerun) > 0 and len(rerun) < 20:
-            second_results = dict()
+            second_results: dict[Any, Any] = dict()
             self.second_test(rerun, second_results)
             for name, val in second_results.items():
                 if name not in failures:
@@ -371,20 +376,23 @@ class Validator:
                     name = result["metric-unit"].split("  ")[1] if len(result["metric-unit"].split("  ")) > 1 \
                         else result["metric-unit"]
                     metricvalues[name.lower()] = float(result["metric-value"])
-            except ValueError as error:
+            except ValueError:
                 continue
         return
 
     def _run_perf(self, metric, workload: str):
         tool = 'perf'
-        command = [tool, 'stat', '-j', '-M', f"{metric}", "-a"]
+        command = [tool, 'stat', '--cputype', self.cputype, '-j', '-M', f"{metric}", "-a"]
         wl = workload.split()
         command.extend(wl)
         print(" ".join(command))
-        cmd = subprocess.run(command, stderr=subprocess.PIPE, encoding='utf-8')
-        data = [x+'}' for x in cmd.stderr.split('}\n') if x]
-        if data[0][0] != '{':
-            data[0] = data[0][data[0].find('{'):]
+        cmd = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', check=False)
+        lines = cmd.stderr.splitlines() + cmd.stdout.splitlines()
+        data = []
+        for line in lines:
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                data.append(line)
         return data
 
     def collect_perf(self, workload: str):
@@ -392,9 +400,9 @@ class Validator:
         Collect metric data with "perf stat -M" on given workload with -a and -j.
         """
         self.results = dict()
-        print(f"Starting perf collection")
+        print("Starting perf collection")
         print(f"Long workload: {workload}")
-        collectlist = dict()
+        collectlist: dict[int, Any] = dict()
         if self.collectlist != "":
             collectlist[0] = {x for x in self.collectlist.split(",")}
         else:
@@ -436,20 +444,22 @@ class Validator:
         """
         command = ['perf', 'list', '-j', '--details', 'metrics']
         cmd = subprocess.run(command, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, encoding='utf-8')
+                             stderr=subprocess.PIPE, encoding='utf-8', check=False)
         try:
             data = json.loads(cmd.stdout)
             for m in data:
                 if 'MetricName' not in m:
                     print("Warning: no metric name")
                     continue
+                if 'Unit' in m and m['Unit'] != self.cputype:
+                    continue
                 name = m['MetricName'].lower()
                 self.metrics.add(name)
                 if 'ScaleUnit' in m and (m['ScaleUnit'] == '1%' or m['ScaleUnit'] == '100%'):
                     self.pctgmetrics.add(name.lower())
-        except ValueError as error:
-            print(f"Error when parsing metric data")
-            sys.exit()
+        except ValueError:
+            print("Error when parsing metric data")
+            sys.exit(1)
 
         return
 
@@ -512,9 +522,6 @@ class Validator:
 
     # Initialize data structures before data validation of each workload
     def _init_data(self):
-
-        testtypes = ['PositiveValueTest',
-                     'RelationshipTest', 'SingleMetricTest']
         self.results = dict()
         self.ignoremetrics = set()
         self.errlist = list()
@@ -565,7 +572,7 @@ class Validator:
 # End of Class Validator
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Launch metric value validation")
 
@@ -578,6 +585,8 @@ def main() -> None:
     parser.add_argument(
         "-wl", help="Workload to run while data collection", default="true")
     parser.add_argument("-m", help="Metric list to validate", default="")
+    parser.add_argument("-cputype", help="Only test metrics for the given CPU/PMU type",
+                        default="cpu")
     args = parser.parse_args()
     outpath = Path(args.output_dir)
     reportf = Path.joinpath(outpath, 'perf_report.json')
@@ -586,12 +595,11 @@ def main() -> None:
 
     validator = Validator(args.rule, reportf, debug=args.debug,
                           datafname=datafile, fullrulefname=fullrule, workload=args.wl,
-                          metrics=args.m)
+                          metrics=args.m, cputype=args.cputype)
     ret = validator.test()
 
     return ret
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())

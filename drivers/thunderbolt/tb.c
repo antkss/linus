@@ -10,7 +10,7 @@
 #include <linux/errno.h>
 #include <linux/delay.h>
 #include <linux/pm_runtime.h>
-#include <linux/platform_data/x86/apple.h>
+#include <linux/stringify.h>
 
 #include "tb.h"
 #include "tb_regs.h"
@@ -18,6 +18,12 @@
 
 #define TB_TIMEOUT		100	/* ms */
 #define TB_RELEASE_BW_TIMEOUT	10000	/* ms */
+
+/*
+ * How many time bandwidth allocation request from graphics driver is
+ * retried if the DP tunnel is still activating.
+ */
+#define TB_BW_ALLOC_RETRIES	3
 
 /*
  * Minimum bandwidth (in Mb/s) that is needed in the single transmitter/receiver
@@ -41,7 +47,7 @@ static unsigned int asym_threshold = TB_ASYM_THRESHOLD;
 module_param_named(asym_threshold, asym_threshold, uint, 0444);
 MODULE_PARM_DESC(asym_threshold,
 		"threshold (Mb/s) when to Gen 4 switch link symmetry. 0 disables. (default: "
-		__MODULE_STRING(TB_ASYM_THRESHOLD) ")");
+		__stringify(TB_ASYM_THRESHOLD) ")");
 
 /**
  * struct tb_cm - Simple Thunderbolt connection manager
@@ -69,29 +75,36 @@ static inline struct tb *tcm_to_tb(struct tb_cm *tcm)
 }
 
 struct tb_hotplug_event {
-	struct work_struct work;
+	struct delayed_work work;
 	struct tb *tb;
 	u64 route;
 	u8 port;
 	bool unplug;
+	int retry;
 };
 
+static void tb_scan_port(struct tb_port *port);
 static void tb_handle_hotplug(struct work_struct *work);
+static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
+				       const char *reason);
+static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
+					  int retry, unsigned long delay);
+static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data);
 
 static void tb_queue_hotplug(struct tb *tb, u64 route, u8 port, bool unplug)
 {
 	struct tb_hotplug_event *ev;
 
-	ev = kmalloc(sizeof(*ev), GFP_KERNEL);
+	ev = kmalloc_obj(*ev);
 	if (!ev)
 		return;
 
-	ev->tb = tb;
+	ev->tb = tb_domain_get(tb);
 	ev->route = route;
 	ev->port = port;
 	ev->unplug = unplug;
-	INIT_WORK(&ev->work, tb_handle_hotplug);
-	queue_work(tb->wq, &ev->work);
+	INIT_DELAYED_WORK(&ev->work, tb_handle_hotplug);
+	queue_delayed_work(tb->wq, &ev->work, 0);
 }
 
 /* enumeration & hot plug handling */
@@ -213,14 +226,12 @@ static int tb_enable_clx(struct tb_switch *sw)
 	return ret == -EOPNOTSUPP ? 0 : ret;
 }
 
-/**
- * tb_disable_clx() - Disable CL states up to host router
- * @sw: Router to start
+/*
+ * Disables CL states from @sw up to the host router.
  *
- * Disables CL states from @sw up to the host router. Returns true if
- * any CL state were disabled. This can be used to figure out whether
- * the link was setup by us or the boot firmware so we don't
- * accidentally enable them if they were not enabled during discovery.
+ * This can be used to figure out whether the link was setup by us or the
+ * boot firmware so we don't accidentally enable them if they were not
+ * enabled during discovery.
  */
 static bool tb_disable_clx(struct tb_switch *sw)
 {
@@ -312,7 +323,7 @@ static int tb_enable_tmu(struct tb_switch *sw)
 
 	/*
 	 * If both routers at the end of the link are v2 we simply
-	 * enable the enhanched uni-directional mode. That covers all
+	 * enable the enhanced uni-directional mode. That covers all
 	 * the CL states. For v1 and before we need to use the normal
 	 * rate to allow CL1 (when supported). Otherwise we keep the TMU
 	 * running at the highest accuracy.
@@ -375,7 +386,8 @@ static void tb_switch_discover_tunnels(struct tb_switch *sw,
 
 		switch (port->config.type) {
 		case TB_TYPE_DP_HDMI_IN:
-			tunnel = tb_tunnel_discover_dp(tb, port, alloc_hopids);
+			tunnel = tb_tunnel_discover_dp(tb, port, alloc_hopids,
+						       tb_dp_tunnel_active, tb);
 			tb_increase_tmu_accuracy(tunnel);
 			break;
 
@@ -444,10 +456,8 @@ static void tb_scan_xdomain(struct tb_port *port)
 	}
 }
 
-/**
- * tb_find_unused_port() - return the first inactive port on @sw
- * @sw: Switch to find the port on
- * @type: Port type to look for
+/*
+ * Returns the first inactive port on @sw.
  */
 static struct tb_port *tb_find_unused_port(struct tb_switch *sw,
 					   enum tb_port_type type)
@@ -530,13 +540,15 @@ static struct tb_tunnel *tb_find_first_usb3_tunnel(struct tb *tb,
  * @src_port: Source protocol adapter
  * @dst_port: Destination protocol adapter
  * @port: USB4 port the consumed bandwidth is calculated
- * @consumed_up: Consumed upsream bandwidth (Mb/s)
+ * @consumed_up: Consumed upstream bandwidth (Mb/s)
  * @consumed_down: Consumed downstream bandwidth (Mb/s)
  *
  * Calculates consumed USB3 and PCIe bandwidth at @port between path
  * from @src_port to @dst_port. Does not take USB3 tunnel starting from
  * @src_port and ending on @src_port into account because that bandwidth is
  * already included in as part of the "first hop" USB3 tunnel.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_consumed_usb3_pcie_bandwidth(struct tb *tb,
 					   struct tb_port *src_port,
@@ -579,7 +591,7 @@ static int tb_consumed_usb3_pcie_bandwidth(struct tb *tb,
  * @src_port: Source protocol adapter
  * @dst_port: Destination protocol adapter
  * @port: USB4 port the consumed bandwidth is calculated
- * @consumed_up: Consumed upsream bandwidth (Mb/s)
+ * @consumed_up: Consumed upstream bandwidth (Mb/s)
  * @consumed_down: Consumed downstream bandwidth (Mb/s)
  *
  * Calculates consumed DP bandwidth at @port between path from @src_port
@@ -589,6 +601,8 @@ static int tb_consumed_usb3_pcie_bandwidth(struct tb *tb,
  * If there is bandwidth reserved for any of the groups between
  * @src_port and @dst_port (but not yet used) that is also taken into
  * account in the returned consumed bandwidth.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_consumed_dp_bandwidth(struct tb *tb,
 				    struct tb_port *src_port,
@@ -597,7 +611,7 @@ static int tb_consumed_dp_bandwidth(struct tb *tb,
 				    int *consumed_up,
 				    int *consumed_down)
 {
-	int group_reserved[MAX_GROUPS] = {};
+	int group_reserved[MAX_GROUPS + 1] = {};
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_tunnel *tunnel;
 	bool downstream;
@@ -689,6 +703,8 @@ static bool tb_asym_supported(struct tb_port *src_port, struct tb_port *dst_port
  * single link at @port. If @include_asym is set then includes the
  * additional banwdith if the links are transitioned into asymmetric to
  * direction from @src_port to @dst_port.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_maximum_bandwidth(struct tb *tb, struct tb_port *src_port,
 				struct tb_port *dst_port, struct tb_port *port,
@@ -795,6 +811,8 @@ static int tb_maximum_bandwidth(struct tb *tb, struct tb_port *src_port,
  * If @include_asym is true then includes also bandwidth that can be
  * added when the links are transitioned into asymmetric (but does not
  * transition the links).
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_available_bandwidth(struct tb *tb, struct tb_port *src_port,
 				 struct tb_port *dst_port, int *available_up,
@@ -940,6 +958,15 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
 	tb_port_dbg(up, "available bandwidth for new USB3 tunnel %d/%d Mb/s\n",
 		    available_up, available_down);
 
+	/*
+	 * If the available bandwidth is less than 1.5 Gb/s notify
+	 * userspace that the connected isochronous device may not work
+	 * properly.
+	 */
+	if (available_up < 1500 || available_down < 1500)
+		tb_tunnel_event(tb, TB_TUNNEL_LOW_BANDWIDTH, TB_TUNNEL_USB3,
+				down, up);
+
 	tunnel = tb_tunnel_alloc_usb3(tb, up, down, available_up,
 				      available_down);
 	if (!tunnel) {
@@ -961,7 +988,7 @@ static int tb_tunnel_usb3(struct tb *tb, struct tb_switch *sw)
 	return 0;
 
 err_free:
-	tb_tunnel_free(tunnel);
+	tb_tunnel_put(tunnel);
 err_reclaim:
 	if (tb_route(parent))
 		tb_reclaim_usb3_bandwidth(tb, down, up);
@@ -1008,6 +1035,8 @@ static int tb_create_usb3_tunnels(struct tb_switch *sw)
  * (requested + currently consumed) on that link exceed @asym_threshold.
  *
  * Must be called with available >= requested over all links.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
 			     struct tb_port *dst_port, int requested_up,
@@ -1088,7 +1117,7 @@ static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
 
 		/*
 		 * Here requested + consumed > threshold so we need to
-		 * transtion the link into asymmetric now.
+		 * transition the link into asymmetric now.
 		 */
 		ret = tb_switch_set_link_width(up->sw, width_up);
 		if (ret) {
@@ -1114,6 +1143,8 @@ static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
  * Goes over each link from @src_port to @dst_port and tries to
  * transition the link to symmetric if the currently consumed bandwidth
  * allows and link asymmetric preference is ignored (if @keep_asym is %false).
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 static int tb_configure_sym(struct tb *tb, struct tb_port *src_port,
 			    struct tb_port *dst_port, bool keep_asym)
@@ -1238,8 +1269,6 @@ static void tb_configure_link(struct tb_port *down, struct tb_port *up,
 	tb_switch_configure_link(sw);
 }
 
-static void tb_scan_port(struct tb_port *port);
-
 /*
  * tb_scan_switch() - scan for and initialize downstream switches
  */
@@ -1295,11 +1324,15 @@ static void tb_scan_port(struct tb_port *port)
 		goto out_rpm_put;
 	}
 
-	tb_retimer_scan(port, true);
-
 	sw = tb_switch_alloc(port->sw->tb, &port->sw->dev,
 			     tb_downstream_route(port));
 	if (IS_ERR(sw)) {
+		/*
+		 * Make the downstream retimers available even if there
+		 * is no router connected.
+		 */
+		tb_retimer_scan(port, true);
+
 		/*
 		 * If there is an error accessing the connected switch
 		 * it may be connected to another domain. Also we allow
@@ -1348,6 +1381,14 @@ static void tb_scan_port(struct tb_port *port)
 
 	upstream_port = tb_upstream_port(sw);
 	tb_configure_link(port, upstream_port, sw);
+
+	/*
+	 * Scan for downstream retimers. We only scan them after the
+	 * router has been enumerated to avoid issues with certain
+	 * Pluggable devices that expect the host to enumerate them
+	 * within certain timeout.
+	 */
+	tb_retimer_scan(port, true);
 
 	/*
 	 * CL0s and CL1 are enabled and supported together.
@@ -1727,7 +1768,7 @@ static void tb_deactivate_and_free_tunnel(struct tb_tunnel *tunnel)
 		break;
 	}
 
-	tb_tunnel_free(tunnel);
+	tb_tunnel_put(tunnel);
 }
 
 /*
@@ -1864,12 +1905,86 @@ static struct tb_port *tb_find_dp_out(struct tb *tb, struct tb_port *in)
 	return NULL;
 }
 
-static bool tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
+static void tb_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
+{
+	struct tb_port *in = tunnel->src_port;
+	struct tb_port *out = tunnel->dst_port;
+	struct tb *tb = data;
+
+	mutex_lock(&tb->lock);
+
+	/*
+	 * If the DPRX read was canceled the tunnel is already being torn
+	 * down by whoever canceled it. Do not touch the adapters here
+	 * because the routers may be gone by now.
+	 */
+	if (tunnel->dprx_canceled) {
+		tb_tunnel_dbg(tunnel, "DPRX read canceled, not activating\n");
+		mutex_unlock(&tb->lock);
+		return;
+	}
+
+	if (tb_tunnel_is_active(tunnel)) {
+		int consumed_up, consumed_down, ret;
+
+		tb_tunnel_dbg(tunnel, "DPRX capabilities read completed\n");
+
+		/* If fail reading tunnel's consumed bandwidth, tear it down */
+		ret = tb_tunnel_consumed_bandwidth(tunnel, &consumed_up,
+						   &consumed_down);
+		if (ret) {
+			tb_tunnel_warn(tunnel,
+				       "failed to read consumed bandwidth, tearing down\n");
+			tb_deactivate_and_free_tunnel(tunnel);
+		} else {
+			tb_reclaim_usb3_bandwidth(tb, in, out);
+			/*
+			 * Transition the links to asymmetric if the
+			 * consumption exceeds the threshold.
+			 */
+			tb_configure_asym(tb, in, out, consumed_up,
+					  consumed_down);
+			/*
+			 * Update the domain with the new bandwidth
+			 * estimation.
+			 */
+			tb_recalc_estimated_bandwidth(tb);
+			/*
+			 * In case DP tunnel exists, change host
+			 * router's 1st children TMU mode to HiFi for
+			 * CL0s to work.
+			 */
+			tb_increase_tmu_accuracy(tunnel);
+		}
+	} else {
+		struct tb_port *in = tunnel->src_port;
+
+		/*
+		 * This tunnel failed to establish. This means DPRX
+		 * negotiation most likely did not complete which
+		 * happens either because there is no graphics driver
+		 * loaded or not all DP cables where connected to the
+		 * discrete router.
+		 *
+		 * In both cases we remove the DP IN adapter from the
+		 * available resources as it is not usable. This will
+		 * also tear down the tunnel and try to re-use the
+		 * released DP OUT.
+		 *
+		 * It will be added back only if there is hotplug for
+		 * the DP IN again.
+		 */
+		tb_tunnel_warn(tunnel, "not active, tearing down\n");
+		tb_dp_resource_unavailable(tb, in, "DPRX negotiation failed");
+	}
+	mutex_unlock(&tb->lock);
+}
+
+static void tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 			     struct tb_port *out)
 {
 	int available_up, available_down, ret, link_nr;
 	struct tb_cm *tcm = tb_priv(tb);
-	int consumed_up, consumed_down;
 	struct tb_tunnel *tunnel;
 
 	/*
@@ -1914,52 +2029,34 @@ static bool tb_tunnel_one_dp(struct tb *tb, struct tb_port *in,
 
 	ret = tb_available_bandwidth(tb, in, out, &available_up, &available_down,
 				     true);
-	if (ret)
+	if (ret) {
+		tb_tunnel_event(tb, TB_TUNNEL_NO_BANDWIDTH, TB_TUNNEL_DP, in, out);
 		goto err_reclaim_usb;
+	}
 
 	tb_dbg(tb, "available bandwidth for new DP tunnel %u/%u Mb/s\n",
 	       available_up, available_down);
 
 	tunnel = tb_tunnel_alloc_dp(tb, in, out, link_nr, available_up,
-				    available_down);
+				    available_down, tb_dp_tunnel_active, tb);
 	if (!tunnel) {
 		tb_port_dbg(out, "could not allocate DP tunnel\n");
 		goto err_reclaim_usb;
 	}
 
-	if (tb_tunnel_activate(tunnel)) {
+	list_add_tail(&tunnel->list, &tcm->tunnel_list);
+
+	ret = tb_tunnel_activate(tunnel);
+	if (ret && ret != -EINPROGRESS) {
 		tb_port_info(out, "DP tunnel activation failed, aborting\n");
+		list_del(&tunnel->list);
 		goto err_free;
 	}
 
-	/* If fail reading tunnel's consumed bandwidth, tear it down */
-	ret = tb_tunnel_consumed_bandwidth(tunnel, &consumed_up, &consumed_down);
-	if (ret)
-		goto err_deactivate;
+	return;
 
-	list_add_tail(&tunnel->list, &tcm->tunnel_list);
-
-	tb_reclaim_usb3_bandwidth(tb, in, out);
-	/*
-	 * Transition the links to asymmetric if the consumption exceeds
-	 * the threshold.
-	 */
-	tb_configure_asym(tb, in, out, consumed_up, consumed_down);
-
-	/* Update the domain with the new bandwidth estimation */
-	tb_recalc_estimated_bandwidth(tb);
-
-	/*
-	 * In case of DP tunnel exists, change host router's 1st children
-	 * TMU mode to HiFi for CL0s to work.
-	 */
-	tb_increase_tmu_accuracy(tunnel);
-	return true;
-
-err_deactivate:
-	tb_tunnel_deactivate(tunnel);
 err_free:
-	tb_tunnel_free(tunnel);
+	tb_tunnel_put(tunnel);
 err_reclaim_usb:
 	tb_reclaim_usb3_bandwidth(tb, in, out);
 err_detach_group:
@@ -1971,8 +2068,6 @@ err_rpm_put:
 	pm_runtime_put_autosuspend(&out->sw->dev);
 	pm_runtime_mark_last_busy(&in->sw->dev);
 	pm_runtime_put_autosuspend(&in->sw->dev);
-
-	return false;
 }
 
 static void tb_tunnel_dp(struct tb *tb)
@@ -2090,17 +2185,18 @@ static void tb_switch_exit_redrive(struct tb_switch *sw)
 	}
 }
 
-static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port)
+static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
+				       const char *reason)
 {
 	struct tb_port *in, *out;
 	struct tb_tunnel *tunnel;
 
 	if (tb_port_is_dpin(port)) {
-		tb_port_dbg(port, "DP IN resource unavailable\n");
+		tb_port_dbg(port, "DP IN resource unavailable: %s\n", reason);
 		in = port;
 		out = NULL;
 	} else {
-		tb_port_dbg(port, "DP OUT resource unavailable\n");
+		tb_port_dbg(port, "DP OUT resource unavailable: %s\n", reason);
 		in = NULL;
 		out = port;
 	}
@@ -2182,7 +2278,7 @@ static int tb_disconnect_pci(struct tb *tb, struct tb_switch *sw)
 
 	tb_tunnel_deactivate(tunnel);
 	list_del(&tunnel->list);
-	tb_tunnel_free(tunnel);
+	tb_tunnel_put(tunnel);
 	return 0;
 }
 
@@ -2212,7 +2308,7 @@ static int tb_tunnel_pci(struct tb *tb, struct tb_switch *sw)
 	if (tb_tunnel_activate(tunnel)) {
 		tb_port_info(up,
 			     "PCIe tunnel activation failed, aborting\n");
-		tb_tunnel_free(tunnel);
+		tb_tunnel_put(tunnel);
 		return -EIO;
 	}
 
@@ -2271,7 +2367,7 @@ static int tb_approve_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
 	return 0;
 
 err_free:
-	tb_tunnel_free(tunnel);
+	tb_tunnel_put(tunnel);
 err_clx:
 	tb_enable_clx(sw);
 	mutex_unlock(&tb->lock);
@@ -2334,7 +2430,7 @@ static int tb_disconnect_xdomain_paths(struct tb *tb, struct tb_xdomain *xd,
  */
 static void tb_handle_hotplug(struct work_struct *work)
 {
-	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work);
+	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work.work);
 	struct tb *tb = ev->tb;
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_switch *sw;
@@ -2406,7 +2502,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 			tb_xdomain_put(xd);
 			tb_port_unconfigure_xdomain(port);
 		} else if (tb_port_is_dpout(port) || tb_port_is_dpin(port)) {
-			tb_dp_resource_unavailable(tb, port);
+			tb_dp_resource_unavailable(tb, port, "adapter unplug");
 		} else if (!port->port) {
 			tb_sw_dbg(sw, "xHCI disconnect request\n");
 			tb_switch_xhci_disconnect(sw);
@@ -2438,8 +2534,13 @@ put_sw:
 out:
 	mutex_unlock(&tb->lock);
 
+	tb_domain_unregister_unplugged_xdomains(tb);
+
 	pm_runtime_mark_last_busy(&tb->dev);
 	pm_runtime_put_autosuspend(&tb->dev);
+
+	/* Undo the refcount increased in tb_queue_hotplug() */
+	tb_domain_put(tb);
 
 	kfree(ev);
 }
@@ -2550,13 +2651,17 @@ static int tb_alloc_dp_bandwidth(struct tb_tunnel *tunnel, int *requested_up,
 				 * the 10s already expired and we should
 				 * give the reserved back to others).
 				 */
-				mod_delayed_work(system_wq, &group->release_work,
+				mod_delayed_work(system_percpu_wq, &group->release_work,
 					msecs_to_jiffies(TB_RELEASE_BW_TIMEOUT));
 			}
 		}
 
-		return tb_tunnel_alloc_bandwidth(tunnel, requested_up,
-						 requested_down);
+		ret = tb_tunnel_alloc_bandwidth(tunnel, requested_up,
+						requested_down);
+		if (ret)
+			goto fail;
+
+		return 0;
 	}
 
 	/*
@@ -2632,6 +2737,7 @@ fail:
 			      "failing the request by rewriting allocated %d/%d Mb/s\n",
 			      allocated_up, allocated_down);
 		tb_tunnel_alloc_bandwidth(tunnel, &allocated_up, &allocated_down);
+		tb_tunnel_event(tb, TB_TUNNEL_NO_BANDWIDTH, TB_TUNNEL_DP, in, out);
 	}
 
 	return ret;
@@ -2639,7 +2745,7 @@ fail:
 
 static void tb_handle_dp_bandwidth_request(struct work_struct *work)
 {
-	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work);
+	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work.work);
 	int requested_bw, requested_up, requested_down, ret;
 	struct tb_tunnel *tunnel;
 	struct tb *tb = ev->tb;
@@ -2666,7 +2772,7 @@ static void tb_handle_dp_bandwidth_request(struct work_struct *work)
 		goto put_sw;
 	}
 
-	tb_port_dbg(in, "handling bandwidth allocation request\n");
+	tb_port_dbg(in, "handling bandwidth allocation request, retry %d\n", ev->retry);
 
 	tunnel = tb_find_tunnel(tb, TB_TUNNEL_DP, in, NULL);
 	if (!tunnel) {
@@ -2695,8 +2801,8 @@ static void tb_handle_dp_bandwidth_request(struct work_struct *work)
 			 * There is no request active so this means the
 			 * BW allocation mode was enabled from graphics
 			 * side. At this point we know that the graphics
-			 * driver has read the DRPX capabilities so we
-			 * can offer an better bandwidth estimatation.
+			 * driver has read the DPRX capabilities so we
+			 * can offer better bandwidth estimation.
 			 */
 			tb_port_dbg(in, "DPTX enabled bandwidth allocation mode, updating estimated bandwidth\n");
 			tb_recalc_estimated_bandwidth(tb);
@@ -2719,12 +2825,33 @@ static void tb_handle_dp_bandwidth_request(struct work_struct *work)
 
 	ret = tb_alloc_dp_bandwidth(tunnel, &requested_up, &requested_down);
 	if (ret) {
-		if (ret == -ENOBUFS)
+		if (ret == -ENOBUFS) {
 			tb_tunnel_warn(tunnel,
 				       "not enough bandwidth available\n");
-		else
+		} else if (ret == -ENOTCONN) {
+			tb_tunnel_dbg(tunnel, "not active yet\n");
+			/*
+			 * We got bandwidth allocation request but the
+			 * tunnel is not yet active. This means that
+			 * tb_dp_tunnel_active() is not yet called for
+			 * this tunnel. Allow it some time and retry
+			 * this request a couple of times.
+			 */
+			if (ev->retry < TB_BW_ALLOC_RETRIES) {
+				tb_tunnel_dbg(tunnel,
+					      "retrying bandwidth allocation request\n");
+				tb_queue_dp_bandwidth_request(tb, ev->route,
+							      ev->port,
+							      ev->retry + 1,
+							      msecs_to_jiffies(50));
+			} else {
+				tb_tunnel_dbg(tunnel,
+					      "run out of retries, failing the request");
+			}
+		} else {
 			tb_tunnel_warn(tunnel,
 				       "failed to change bandwidth allocation\n");
+		}
 	} else {
 		tb_tunnel_dbg(tunnel,
 			      "bandwidth allocation changed to %d/%d Mb/s\n",
@@ -2732,6 +2859,9 @@ static void tb_handle_dp_bandwidth_request(struct work_struct *work)
 
 		/* Update other clients about the allocation change */
 		tb_recalc_estimated_bandwidth(tb);
+
+		tb_dbg(tb, "checking if more DP tunnels can be established now\n");
+		tb_tunnel_dp(tb);
 	}
 
 put_sw:
@@ -2745,19 +2875,21 @@ unlock:
 	kfree(ev);
 }
 
-static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port)
+static void tb_queue_dp_bandwidth_request(struct tb *tb, u64 route, u8 port,
+					  int retry, unsigned long delay)
 {
 	struct tb_hotplug_event *ev;
 
-	ev = kmalloc(sizeof(*ev), GFP_KERNEL);
+	ev = kmalloc_obj(*ev);
 	if (!ev)
 		return;
 
 	ev->tb = tb;
 	ev->route = route;
 	ev->port = port;
-	INIT_WORK(&ev->work, tb_handle_dp_bandwidth_request);
-	queue_work(tb->wq, &ev->work);
+	ev->retry = retry;
+	INIT_DELAYED_WORK(&ev->work, tb_handle_dp_bandwidth_request);
+	queue_delayed_work(tb->wq, &ev->work, delay);
 }
 
 static void tb_handle_notification(struct tb *tb, u64 route,
@@ -2777,7 +2909,7 @@ static void tb_handle_notification(struct tb *tb, u64 route,
 		if (tb_cfg_ack_notification(tb->ctl, route, error))
 			tb_warn(tb, "could not ack notification on %llx\n",
 				route);
-		tb_queue_dp_bandwidth_request(tb, route, error->port);
+		tb_queue_dp_bandwidth_request(tb, route, error->port, 0, 0);
 		break;
 
 	default:
@@ -2819,22 +2951,45 @@ static void tb_handle_event(struct tb *tb, enum tb_cfg_pkg_type type,
 static void tb_stop(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_nhi *nhi = tb->nhi;
 	struct tb_tunnel *tunnel;
+	struct tb_port *port;
 	struct tb_tunnel *n;
 
 	cancel_delayed_work(&tcm->remove_work);
 	/* tunnels are only present after everything has been initialized */
 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list) {
 		/*
-		 * DMA tunnels require the driver to be functional so we
-		 * tear them down. Other protocol tunnels can be left
-		 * intact.
+		 * DMA tunnels and DP tunnels which are not yet active require
+		 * the driver to be functional so we tear them down.
+		 * Other protocol tunnels can be left intact.
 		 */
-		if (tb_tunnel_is_dma(tunnel))
+		if (tb_tunnel_is_dma(tunnel) ||
+		    (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel)))
 			tb_tunnel_deactivate(tunnel);
-		tb_tunnel_free(tunnel);
+		tb_tunnel_put(tunnel);
+	}
+	/*
+	 * Signal disconnect to connected devices before the router tree is
+	 * removed below. A Thunderbolt 3 device directly connected to a USB4
+	 * host otherwise never receives a disconnect indication, leaving
+	 * firmware to poll the dead link for up to ~60 s which on some
+	 * platforms turns the shutdown into a warm reset. Asserting
+	 * PORT_CS_19.DPR drives SBTX low (USB4 spec section 6.9) so the device
+	 * detects SBRX low and goes to Uninitialized Unplugged immediately.
+	 */
+	if (nhi->host_reset) {
+		tb_switch_for_each_port(tb->root_switch, port) {
+			if (!tb_port_is_null(port) || !tb_port_has_remote(port))
+				continue;
+			if (tb_switch_is_usb4(port->remote->sw))
+				continue;
+			if (tb_port_reset(port))
+				tb_port_dbg(port, "downstream port reset failed, continuing\n");
+		}
 	}
 	tb_switch_remove(tb->root_switch);
+	tb->root_switch = NULL;
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
 }
 
@@ -2877,7 +3032,8 @@ static int tb_start(struct tb *tb, bool reset)
 
 	tb->root_switch = tb_switch_alloc(tb, &tb->dev, 0);
 	if (IS_ERR(tb->root_switch))
-		return PTR_ERR(tb->root_switch);
+		return dev_err_probe(tb->nhi->dev, PTR_ERR(tb->root_switch),
+				     "failed to allocate host router\n");
 
 	/*
 	 * ICM firmware upgrade needs running firmware and in native
@@ -2894,14 +3050,14 @@ static int tb_start(struct tb *tb, bool reset)
 	ret = tb_switch_configure(tb->root_switch);
 	if (ret) {
 		tb_switch_put(tb->root_switch);
-		return ret;
+		return dev_err_probe(tb->nhi->dev, ret, "failed to configure host router\n");
 	}
 
 	/* Announce the switch to the world */
 	ret = tb_switch_add(tb->root_switch);
 	if (ret) {
 		tb_switch_put(tb->root_switch);
-		return ret;
+		return dev_err_probe(tb->nhi->dev, ret, "failed to add host router\n");
 	}
 
 	/*
@@ -2996,6 +3152,24 @@ static void tb_restore_children(struct tb_switch *sw)
 	}
 }
 
+static void tb_free_unplugged_xdomains(struct tb_switch *sw)
+{
+	struct tb_port *port;
+
+	tb_switch_for_each_port(sw, port) {
+		if (tb_is_upstream_port(port))
+			continue;
+		if (port->xdomain && port->xdomain->is_unplugged) {
+			tb_retimer_remove_all(port);
+			tb_xdomain_remove(port->xdomain);
+			tb_port_unconfigure_xdomain(port);
+			port->xdomain = NULL;
+		} else if (port->remote) {
+			tb_free_unplugged_xdomains(port->remote->sw);
+		}
+	}
+}
+
 static int tb_resume_noirq(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
@@ -3015,6 +3189,7 @@ static int tb_resume_noirq(struct tb *tb)
 	tb_switch_resume(tb->root_switch, false);
 	tb_free_invalid_tunnels(tb);
 	tb_free_unplugged_children(tb->root_switch);
+	tb_free_unplugged_xdomains(tb->root_switch);
 	tb_restore_children(tb->root_switch);
 
 	/*
@@ -3028,7 +3203,7 @@ static int tb_resume_noirq(struct tb *tb)
 		if (tb_tunnel_is_usb3(tunnel))
 			usb3_delay = 500;
 		tb_tunnel_deactivate(tunnel);
-		tb_tunnel_free(tunnel);
+		tb_tunnel_put(tunnel);
 	}
 
 	/* Re-create our tunnels now */
@@ -3039,7 +3214,7 @@ static int tb_resume_noirq(struct tb *tb)
 			/* Only need to do it once */
 			usb3_delay = 0;
 		}
-		tb_tunnel_restart(tunnel);
+		tb_tunnel_activate(tunnel);
 	}
 	if (!list_empty(&tcm->tunnel_list)) {
 		/*
@@ -3055,28 +3230,6 @@ static int tb_resume_noirq(struct tb *tb)
 	tb_dbg(tb, "resume finished\n");
 
 	return 0;
-}
-
-static int tb_free_unplugged_xdomains(struct tb_switch *sw)
-{
-	struct tb_port *port;
-	int ret = 0;
-
-	tb_switch_for_each_port(sw, port) {
-		if (tb_is_upstream_port(port))
-			continue;
-		if (port->xdomain && port->xdomain->is_unplugged) {
-			tb_retimer_remove_all(port);
-			tb_xdomain_remove(port->xdomain);
-			tb_port_unconfigure_xdomain(port);
-			port->xdomain = NULL;
-			ret++;
-		} else if (port->remote) {
-			ret += tb_free_unplugged_xdomains(port->remote->sw);
-		}
-	}
-
-	return ret;
 }
 
 static int tb_freeze_noirq(struct tb *tb)
@@ -3098,14 +3251,14 @@ static int tb_thaw_noirq(struct tb *tb)
 static void tb_complete(struct tb *tb)
 {
 	/*
-	 * Release any unplugged XDomains and if there is a case where
+	 * Unregister unplugged XDomains and if there is a case where
 	 * another domain is swapped in place of unplugged XDomain we
 	 * need to run another rescan.
 	 */
-	mutex_lock(&tb->lock);
-	if (tb_free_unplugged_xdomains(tb->root_switch))
-		tb_scan_switch(tb->root_switch);
-	mutex_unlock(&tb->lock);
+	if (tb_domain_unregister_unplugged_xdomains(tb)) {
+		scoped_guard(mutex, &tb->lock)
+			tb_scan_switch(tb->root_switch);
+	}
 }
 
 static int tb_runtime_suspend(struct tb *tb)
@@ -3149,7 +3302,7 @@ static int tb_runtime_resume(struct tb *tb)
 	tb_free_invalid_tunnels(tb);
 	tb_restore_children(tb->root_switch);
 	list_for_each_entry_safe(tunnel, n, &tcm->tunnel_list, list)
-		tb_tunnel_restart(tunnel);
+		tb_tunnel_activate(tunnel);
 	tb_switch_enter_redrive(tb->root_switch);
 	tcm->hotplug_active = true;
 	mutex_unlock(&tb->lock);
@@ -3181,74 +3334,6 @@ static const struct tb_cm_ops tb_cm_ops = {
 	.disconnect_xdomain_paths = tb_disconnect_xdomain_paths,
 };
 
-/*
- * During suspend the Thunderbolt controller is reset and all PCIe
- * tunnels are lost. The NHI driver will try to reestablish all tunnels
- * during resume. This adds device links between the tunneled PCIe
- * downstream ports and the NHI so that the device core will make sure
- * NHI is resumed first before the rest.
- */
-static bool tb_apple_add_links(struct tb_nhi *nhi)
-{
-	struct pci_dev *upstream, *pdev;
-	bool ret;
-
-	if (!x86_apple_machine)
-		return false;
-
-	switch (nhi->pdev->device) {
-	case PCI_DEVICE_ID_INTEL_LIGHT_RIDGE:
-	case PCI_DEVICE_ID_INTEL_CACTUS_RIDGE_4C:
-	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_NHI:
-	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_4C_NHI:
-		break;
-	default:
-		return false;
-	}
-
-	upstream = pci_upstream_bridge(nhi->pdev);
-	while (upstream) {
-		if (!pci_is_pcie(upstream))
-			return false;
-		if (pci_pcie_type(upstream) == PCI_EXP_TYPE_UPSTREAM)
-			break;
-		upstream = pci_upstream_bridge(upstream);
-	}
-
-	if (!upstream)
-		return false;
-
-	/*
-	 * For each hotplug downstream port, create add device link
-	 * back to NHI so that PCIe tunnels can be re-established after
-	 * sleep.
-	 */
-	ret = false;
-	for_each_pci_bridge(pdev, upstream->subordinate) {
-		const struct device_link *link;
-
-		if (!pci_is_pcie(pdev))
-			continue;
-		if (pci_pcie_type(pdev) != PCI_EXP_TYPE_DOWNSTREAM ||
-		    !pdev->is_hotplug_bridge)
-			continue;
-
-		link = device_link_add(&pdev->dev, &nhi->pdev->dev,
-				       DL_FLAG_AUTOREMOVE_SUPPLIER |
-				       DL_FLAG_PM_RUNTIME);
-		if (link) {
-			dev_dbg(&nhi->pdev->dev, "created link from %s\n",
-				dev_name(&pdev->dev));
-			ret = true;
-		} else {
-			dev_warn(&nhi->pdev->dev, "device link creation from %s failed\n",
-				 dev_name(&pdev->dev));
-		}
-	}
-
-	return ret;
-}
-
 struct tb *tb_probe(struct tb_nhi *nhi)
 {
 	struct tb_cm *tcm;
@@ -3272,14 +3357,6 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	tb_init_bandwidth_groups(tcm);
 
 	tb_dbg(tb, "using software connection manager\n");
-
-	/*
-	 * Device links are needed to make sure we establish tunnels
-	 * before the PCIe/USB stack is resumed so complain here if we
-	 * found them missing.
-	 */
-	if (!tb_apple_add_links(nhi) && !tb_acpi_add_links(nhi))
-		tb_warn(tb, "device links to tunneled native ports are missing!\n");
 
 	return tb;
 }

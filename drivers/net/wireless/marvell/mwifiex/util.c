@@ -116,24 +116,6 @@ static struct mwifiex_debug_data items[] = {
 static int num_of_items = ARRAY_SIZE(items);
 
 /*
- * Firmware initialization complete callback handler.
- *
- * This function wakes up the function waiting on the init
- * wait queue for the firmware initialization to complete.
- */
-int mwifiex_init_fw_complete(struct mwifiex_adapter *adapter)
-{
-
-	if (adapter->hw_status == MWIFIEX_HW_STATUS_READY)
-		if (adapter->if_ops.init_fw_port)
-			adapter->if_ops.init_fw_port(adapter);
-
-	adapter->init_wait_q_woken = true;
-	wake_up_interruptible(&adapter->init_wait_q);
-	return 0;
-}
-
-/*
  * This function sends init/shutdown command
  * to firmware.
  */
@@ -335,10 +317,16 @@ mwifiex_parse_mgmt_packet(struct mwifiex_private *priv, u8 *payload, u16 len,
 
 	switch (stype) {
 	case IEEE80211_STYPE_ACTION:
-		category = *(payload + sizeof(struct ieee80211_hdr));
+		if (len < sizeof(*ieee_hdr) + 1)
+			return -1;
+
+		category = *(payload + sizeof(*ieee_hdr));
 		switch (category) {
 		case WLAN_CATEGORY_PUBLIC:
-			action_code = *(payload + sizeof(struct ieee80211_hdr)
+			if (len < sizeof(*ieee_hdr) + 2)
+				return -1;
+
+			action_code = *(payload + sizeof(*ieee_hdr)
 					+ 1);
 			if (action_code == WLAN_PUB_ACTION_TDLS_DISCOVER_RES) {
 				addr2 = ieee_hdr->addr2;
@@ -477,7 +465,9 @@ mwifiex_process_mgmt_packet(struct mwifiex_private *priv,
 				    "auth: receive authentication from %pM\n",
 				    ieee_hdr->addr3);
 		} else {
-			if (!priv->wdev.connected)
+			if (!priv->wdev.connected ||
+			    !ether_addr_equal(ieee_hdr->addr3,
+					      priv->curr_bss_params.bss_descriptor.mac_address))
 				return 0;
 
 			if (ieee80211_is_deauth(ieee_hdr->frame_control)) {
@@ -663,7 +653,7 @@ u8 mwifiex_is_tdls_chan_switching(struct mwifiex_private *priv)
 	return false;
 }
 
-u8 mwifiex_is_tdls_off_chan(struct mwifiex_private *priv)
+static u8 mwifiex_is_tdls_off_chan(struct mwifiex_private *priv)
 {
 	struct mwifiex_sta_node *sta_ptr;
 
@@ -710,7 +700,7 @@ mwifiex_add_sta_entry(struct mwifiex_private *priv, const u8 *mac)
 	if (node)
 		goto done;
 
-	node = kzalloc(sizeof(*node), GFP_ATOMIC);
+	node = kzalloc_obj(*node, GFP_ATOMIC);
 	if (!node)
 		goto done;
 

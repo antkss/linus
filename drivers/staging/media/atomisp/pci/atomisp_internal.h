@@ -37,7 +37,6 @@
 	(((isp)->media_dev.hw_revision & ATOMISP_HW_REVISION_MASK) == \
 	 ((rev) << ATOMISP_HW_REVISION_SHIFT))
 
-#define ATOMISP_PCI_DEVICE_SOC_BYT	0x0f38
 /* MRFLD with 0x1178: ISP freq can burst to 457MHz */
 #define ATOMISP_PCI_DEVICE_SOC_MRFLD	0x1178
 /* MRFLD with 0x1179: max ISP freq limited to 400MHz */
@@ -45,7 +44,6 @@
 /* MRFLD with 0x117a: max ISP freq is 400MHz and max freq at Vmin is 200MHz */
 #define ATOMISP_PCI_DEVICE_SOC_MRFLD_117A	0x117a
 #define ATOMISP_PCI_DEVICE_SOC_ANN	0x1478
-#define ATOMISP_PCI_DEVICE_SOC_CHT	0x22b8
 
 #define ATOMISP_PCI_REV_MRFLD_A0_MAX	0
 #define ATOMISP_PCI_REV_BYT_A0_MAX	4
@@ -109,14 +107,20 @@
 #define DIV_NEAREST_STEP(n, d, step) \
 	round_down((2 * (n) + (d) * (step)) / (2 * (d)), (step))
 
+#define SENSOR_ISP_PAD_SINK		0
+#define SENSOR_ISP_PAD_SOURCE		1
+#define SENSOR_ISP_PADS_NUM		2
+
 struct atomisp_input_subdev {
 	enum atomisp_camera_port port;
 	u32 code; /* MEDIA_BUS_FMT_* */
 	bool binning_support;
 	bool crop_support;
-	bool camera_on;
-	struct v4l2_subdev *camera;
+	bool sensor_on;
+	struct v4l2_subdev *sensor;
+	struct v4l2_subdev *sensor_isp;
 	struct v4l2_subdev *csi_port;
+	struct v4l2_subdev *csi_remote_source;
 	/* Sensor rects for sensors which support crop */
 	struct v4l2_rect native_rect;
 	struct v4l2_rect active_rect;

@@ -240,7 +240,7 @@ static void tegra_kbc_set_fifo_interrupt(struct tegra_kbc *kbc, bool enable)
 
 static void tegra_kbc_keypress_timer(struct timer_list *t)
 {
-	struct tegra_kbc *kbc = from_timer(kbc, t, timer);
+	struct tegra_kbc *kbc = timer_container_of(kbc, t, timer);
 	u32 val;
 	unsigned int i;
 
@@ -416,7 +416,7 @@ static void tegra_kbc_stop(struct tegra_kbc *kbc)
 	}
 
 	disable_irq(kbc->irq);
-	del_timer_sync(&kbc->timer);
+	timer_delete_sync(&kbc->timer);
 
 	clk_disable_unprepare(kbc->clk);
 }
@@ -641,7 +641,6 @@ static int tegra_kbc_probe(struct platform_device *pdev)
 
 	kbc->idev->name = pdev->name;
 	kbc->idev->id.bustype = BUS_HOST;
-	kbc->idev->dev.parent = &pdev->dev;
 	kbc->idev->open = tegra_kbc_open;
 	kbc->idev->close = tegra_kbc_close;
 
@@ -703,7 +702,7 @@ static int tegra_kbc_suspend(struct device *dev)
 
 	if (device_may_wakeup(&pdev->dev)) {
 		disable_irq(kbc->irq);
-		del_timer_sync(&kbc->timer);
+		timer_delete_sync(&kbc->timer);
 		tegra_kbc_set_fifo_interrupt(kbc, false);
 
 		/* Forcefully clear the interrupt status */

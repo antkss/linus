@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /*
  * Copyright (C) 2022 MediaTek Inc.
  */
@@ -25,8 +25,8 @@ struct mt7996_mcu_rxd {
 };
 
 struct mt7996_mcu_uni_event {
-	u8 cid;
-	u8 __rsv[3];
+	__le16 cid;
+	u8 __rsv[2];
 	__le32 status; /* 0: success, others: fail */
 } __packed;
 
@@ -52,12 +52,10 @@ struct mt7996_mcu_thermal_enable {
 	u8 rsv[2];
 } __packed;
 
-struct mt7996_mcu_csa_notify {
-	struct mt7996_mcu_rxd rxd;
-
+struct mt7996_mcu_countdown_notify {
 	u8 omac_idx;
-	u8 csa_count;
-	u8 band_idx;
+	u8 count;
+	u8 csa_failure_reason; /* 0: success, 1: beacon disabled */
 	u8 rsv;
 } __packed;
 
@@ -69,7 +67,7 @@ struct mt7996_mcu_rdd_report {
 	__le16 tag;
 	__le16 len;
 
-	u8 band_idx;
+	u8 rdd_idx;
 	u8 long_detected;
 	u8 constant_prf_detected;
 	u8 staggered_prf_detected;
@@ -147,7 +145,7 @@ struct mt7996_mcu_background_chain_ctrl {
 	u8 rsv[2];
 } __packed;
 
-struct mt7996_mcu_eeprom {
+struct mt7996_mcu_eeprom_update {
 	u8 _rsv[4];
 
 	__le16 tag;
@@ -155,6 +153,43 @@ struct mt7996_mcu_eeprom {
 	u8 buffer_mode;
 	u8 format;
 	__le16 buf_len;
+} __packed;
+
+union eeprom_data {
+	struct {
+		__le32 data_len;
+		DECLARE_FLEX_ARRAY(u8, data);
+	} ext_eeprom;
+	DECLARE_FLEX_ARRAY(u8, efuse);
+} __packed;
+
+struct mt7996_mcu_eeprom_info {
+	u8 _rsv[4];
+
+	__le16 tag;
+	__le16 len;
+	__le32 addr;
+	__le32 valid;
+} __packed;
+
+struct mt7996_mcu_eeprom_access {
+	struct mt7996_mcu_eeprom_info info;
+	union eeprom_data eeprom;
+} __packed;
+
+struct mt7996_mcu_eeprom_access_event {
+	u8 _rsv[4];
+
+	__le16 tag;
+	__le16 len;
+	__le32 version;
+	__le32 addr;
+	__le32 valid;
+	__le32 size;
+	__le32 magic_no;
+	__le32 type;
+	__le32 rsv[4];
+	union eeprom_data eeprom;
 } __packed;
 
 struct mt7996_mcu_phy_rx_info {
@@ -249,6 +284,9 @@ struct mt7996_mcu_wed_rro_ba_delete_event {
 	__le16 len;
 
 	__le16 session_id;
+	__le16 wlan_id;
+	u8 tid;
+	u8 __rsv1;
 	u8 __rsv2[2];
 } __packed;
 
@@ -256,6 +294,39 @@ enum  {
 	UNI_WED_RRO_BA_SESSION_STATUS,
 	UNI_WED_RRO_BA_SESSION_TBL,
 	UNI_WED_RRO_BA_SESSION_DELETE,
+};
+
+struct mt7996_mcu_ps_sync_event {
+	struct mt7996_mcu_rxd rxd;
+
+	u8 bss_idx;
+	u8 __rsv[3];
+} __packed;
+
+struct mt7996_mcu_ps_client_info {
+	__le16 tag;
+	__le16 len;
+	u8 ps_bit;
+	u8 __rsv;
+	__le16 wlan_idx;
+	u8 buffer_size;
+	u8 __rsv2[3];
+} __packed;
+
+struct mt7996_mcu_ps_multi_client_info {
+	__le16 tag;
+	__le16 len;
+	__le16 sta_cnt;
+	__le16 sta_ps_info[];
+} __packed;
+
+#define MT7996_PS_MULTI_WCID	GENMASK(10, 0)
+#define MT7996_PS_MULTI_PS_BIT	BIT(15)
+
+enum {
+	UNI_PS_CLIENT_INFO = 0,
+	UNI_PS_MULTI_CLIENT_INFO = 1,
+	UNI_PS_MULTI_CLIENT_INFO_BITMAP = 2,
 };
 
 struct mt7996_mcu_thermal_notify {
@@ -351,17 +422,6 @@ enum {
 	BP_HW_MODE,
 };
 
-struct mt7996_mcu_bcn_prot_tlv {
-	__le16 tag;
-	__le16 len;
-	u8 pn[6];
-	u8 enable;
-	u8 cipher_id;
-	u8 key[WLAN_MAX_KEY_LEN];
-	u8 key_id;
-	u8 __rsv[3];
-} __packed;
-
 struct bss_ra_tlv {
 	__le16 tag;
 	__le16 len;
@@ -425,7 +485,16 @@ struct bss_bcn_cntdwn_tlv {
 	__le16 tag;
 	__le16 len;
 	u8 cnt;
-	u8 rsv[3];
+	union {
+		struct {
+			bool static_pp;
+			bool abort;
+		} csa;
+		struct {
+			bool abort;
+		} cca;
+	};
+	u8 rsv;
 } __packed;
 
 struct bss_bcn_mbss_tlv {
@@ -481,7 +550,26 @@ struct bss_mld_tlv {
 	u8 own_mld_id;
 	u8 mac_addr[ETH_ALEN];
 	u8 remap_idx;
-	u8 __rsv[3];
+	u8 link_id;
+	u8 __rsv[2];
+} __packed;
+
+struct bss_prot_tlv {
+	__le16 tag;
+	__le16 len;
+	__le32 prot_mode;
+} __packed;
+
+struct bss_mld_link_op_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 group_mld_id;
+	u8 own_mld_id;
+	u8 mac_addr[ETH_ALEN];
+	u8 remap_idx;
+	u8 link_operation;
+	u8 link_id;
+	u8 rsv[2];
 } __packed;
 
 struct sta_rec_ht_uni {
@@ -530,6 +618,9 @@ struct sec_key_uni {
 	u8 key_len;
 	u8 need_resp;
 	u8 key[32];
+	u8 pn[6];
+	u8 bcn_mode;
+	u8 _rsv;
 } __packed;
 
 struct sta_rec_sec_uni {
@@ -624,6 +715,63 @@ struct sta_rec_hdr_trans {
 	u8 dis_rx_hdr_tran;
 	u8 mesh;
 } __packed;
+
+struct sta_rec_ps_leave {
+	__le16 tag;
+	__le16 len;
+	u8 __rsv[4];
+} __packed;
+
+struct sta_rec_mld_setup {
+	__le16 tag;
+	__le16 len;
+	u8 mld_addr[ETH_ALEN];
+	__le16 primary_id;
+	__le16 seconed_id;
+	__le16 setup_wcid;
+	u8 link_num;
+	u8 info;
+	u8 __rsv[2];
+	u8 link_info[];
+} __packed;
+
+struct sta_rec_eht_mld {
+	__le16 tag;
+	__le16 len;
+	u8 nsep;
+	u8 __rsv1[2];
+	u8 str_cap[__MT_MAX_BAND];
+	__le16 eml_cap;
+	u8 __rsv2[4];
+} __packed;
+
+struct mld_setup_link {
+	__le16 wcid;
+	u8 bss_idx;
+	u8 __rsv;
+} __packed;
+
+struct mld_req_hdr {
+	u8 ver;
+	u8 mld_addr[ETH_ALEN];
+	u8 mld_idx;
+	u8 flag;
+	u8 rsv[3];
+	u8 buf[];
+} __packed;
+
+struct mld_reconf_stop_link {
+	__le16 tag;
+	__le16 len;
+	__le16 link_bitmap;
+	u8 rsv[2];
+	u8 bss_idx[16];
+} __packed;
+
+enum {
+	UNI_CMD_MLD_RECONF_AP_REM_TIMER = 0x03,
+	UNI_CMD_MLD_RECONF_STOP_LINK = 0x04,
+};
 
 struct hdr_trans_en {
 	__le16 tag;
@@ -769,6 +917,11 @@ enum {
 	UNI_CHANNEL_RX_PATH,
 };
 
+enum {
+	UNI_CHIP_CONFIG_NIC_CAPA = 3,
+	UNI_CHIP_CONFIG_DUP_WTBL = 4,
+};
+
 #define MT7996_BSS_UPDATE_MAX_SIZE	(sizeof(struct bss_req_hdr) +		\
 					 sizeof(struct mt76_connac_bss_basic_tlv) +	\
 					 sizeof(struct bss_rlm_tlv) +		\
@@ -798,32 +951,25 @@ enum {
 					 sizeof(struct sta_rec_eht) +		\
 					 sizeof(struct sta_rec_hdrt) +		\
 					 sizeof(struct sta_rec_hdr_trans) +	\
+					 sizeof(struct sta_rec_mld_setup) +	\
+					 sizeof(struct mld_setup_link) * 3 +	\
+					 sizeof(struct sta_rec_eht_mld) +	\
 					 sizeof(struct tlv))
 
-#define MT7996_MAX_BEACON_SIZE		1338
 #define MT7996_BEACON_UPDATE_SIZE	(sizeof(struct bss_req_hdr) +		\
 					 sizeof(struct bss_bcn_content_tlv) +	\
 					 4 + MT_TXD_SIZE +			\
-					 sizeof(struct bss_bcn_cntdwn_tlv) +	\
+					 sizeof(struct bss_bcn_cntdwn_tlv) * 2 +	\
 					 sizeof(struct bss_bcn_mbss_tlv))
-#define MT7996_MAX_BSS_OFFLOAD_SIZE	(MT7996_MAX_BEACON_SIZE +		\
+#define MT7996_MAX_BSS_OFFLOAD_SIZE	2048
+#define MT7996_MAX_BEACON_SIZE		(MT7996_MAX_BSS_OFFLOAD_SIZE - \
 					 MT7996_BEACON_UPDATE_SIZE)
-
-static inline s8
-mt7996_get_power_bound(struct mt7996_phy *phy, s8 txpower)
-{
-	struct mt76_phy *mphy = phy->mt76;
-	int n_chains = hweight16(mphy->chainmask);
-
-	txpower = mt76_get_sar_power(mphy, mphy->chandef.chan, txpower * 2);
-	txpower -= mt76_tx_power_nss_delta(n_chains);
-
-	return txpower;
-}
 
 enum {
 	UNI_BAND_CONFIG_RADIO_ENABLE,
 	UNI_BAND_CONFIG_RTS_THRESHOLD = 0x08,
+	UNI_BAND_CONFIG_MAC_ENABLE_CTRL = 0x0c,
+	UNI_BAND_CONFIG_BSSID_MAPPING_ADDR = 0x12,
 };
 
 enum {
@@ -841,6 +987,10 @@ enum {
 	UNI_EFUSE_BUFFER_MODE,
 	UNI_EFUSE_FREE_BLOCK,
 	UNI_EFUSE_BUFFER_RD,
+};
+
+enum {
+	UNI_EXT_EEPROM_ACCESS = 1,
 };
 
 enum {
@@ -889,8 +1039,31 @@ enum {
 	UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG,
 };
 
+struct tx_power_ctrl {
+	u8 _rsv[4];
+
+	__le16 tag;
+	__le16 len;
+
+	u8 power_ctrl_id;
+	union {
+		bool sku_enable;
+		bool ate_mode_enable;
+		bool percentage_ctrl_enable;
+		bool bf_backoff_enable;
+		u8 power_drop_level;
+	};
+	u8 band_idx;
+	u8 rsv[1];
+} __packed;
+
 enum {
+	UNI_TXPOWER_SKU_POWER_LIMIT_CTRL = 0,
+	UNI_TXPOWER_PERCENTAGE_CTRL = 1,
+	UNI_TXPOWER_PERCENTAGE_DROP_CTRL = 2,
+	UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL = 3,
 	UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL = 4,
+	UNI_TXPOWER_ATE_MODE_CTRL = 6,
 };
 
 enum {
@@ -908,12 +1081,19 @@ enum {
 	UNI_CMD_SER_SET_RECOVER_L3_TX_DISABLE,
 	UNI_CMD_SER_SET_RECOVER_L3_BF,
 	UNI_CMD_SER_SET_RECOVER_L4_MDP,
-	UNI_CMD_SER_SET_RECOVER_FULL,
+	UNI_CMD_SER_SET_RECOVER_FROM_ETH,
+	UNI_CMD_SER_SET_RECOVER_FULL = 8,
 	UNI_CMD_SER_SET_SYSTEM_ASSERT,
 	/* action */
 	UNI_CMD_SER_ENABLE = 1,
 	UNI_CMD_SER_SET,
 	UNI_CMD_SER_TRIGGER
+};
+
+enum {
+	UNI_CMD_SDO_SET = 1,
+	UNI_CMD_SDO_QUERY,
+	UNI_CMD_SDO_CP_MODE = 6,
 };
 
 enum {

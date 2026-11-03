@@ -112,31 +112,6 @@ Returns 0 on success and an appropriate error value on failure.
 
 ::
 
-  int rpmsg_send_offchannel(struct rpmsg_endpoint *ept, u32 src, u32 dst,
-							void *data, int len);
-
-
-sends a message across to the remote processor, using the src and dst
-addresses provided by the user.
-
-The caller should specify the endpoint, the data it wants to send,
-its length (in bytes), and explicit source and destination addresses.
-The message will then be sent to the remote processor to which the
-endpoint's channel belongs, but the endpoint's src and channel dst
-addresses will be ignored (and the user-provided addresses will
-be used instead).
-
-In case there are no TX buffers available, the function will block until
-one becomes available (i.e. until the remote processor consumes
-a tx buffer and puts it back on virtio's used descriptor ring),
-or a timeout of 15 seconds elapses. When the latter happens,
--ERESTARTSYS is returned.
-
-The function can only be called from a process context (for now).
-Returns 0 on success and an appropriate error value on failure.
-
-::
-
   int rpmsg_trysend(struct rpmsg_endpoint *ept, void *data, int len);
 
 sends a message across to the remote processor from a given endpoint.
@@ -166,27 +141,6 @@ its length (in bytes), and an explicit destination address.
 The message will then be sent to the remote processor to which the
 channel belongs, using the channel's src address, and the user-provided
 dst address (thus the channel's dst address will be ignored).
-
-In case there are no TX buffers available, the function will immediately
-return -ENOMEM without waiting until one becomes available.
-
-The function can only be called from a process context (for now).
-Returns 0 on success and an appropriate error value on failure.
-
-::
-
-  int rpmsg_trysend_offchannel(struct rpmsg_endpoint *ept, u32 src, u32 dst,
-							void *data, int len);
-
-
-sends a message across to the remote processor, using source and
-destination addresses provided by the user.
-
-The user should specify the channel, the data it wants to send,
-its length (in bytes), and explicit source and destination addresses.
-The message will then be sent to the remote processor to which the
-channel belongs, but the channel's src and dst addresses will be
-ignored (and the user-provided addresses will be used instead).
 
 In case there are no TX buffers available, the function will immediately
 return -ENOMEM without waiting until one becomes available.
@@ -258,7 +212,6 @@ be probed with.
 
 unregisters an rpmsg driver from the rpmsg bus. user should provide
 a pointer to a previously-registered rpmsg_driver struct.
-Returns 0 on success, and an appropriate error value on failure.
 
 
 Typical usage
@@ -270,9 +223,12 @@ content to the console.
 
 ::
 
-  #include <linux/kernel.h>
+  #include <linux/dev_printk.h>
+  #include <linux/mod_devicetable.h>
   #include <linux/module.h>
+  #include <linux/printk.h>
   #include <linux/rpmsg.h>
+  #include <linux/types.h>
 
   static void rpmsg_sample_cb(struct rpmsg_channel *rpdev, void *data, int len,
 						void *priv, u32 src)
@@ -290,7 +246,7 @@ content to the console.
 	/* send a message on our channel */
 	err = rpmsg_send(rpdev->ept, "hello!", 6);
 	if (err) {
-		pr_err("rpmsg_send failed: %d\n", err);
+		dev_err(&rpdev->dev, "rpmsg_send failed: %d\n", err);
 		return err;
 	}
 
@@ -343,3 +299,20 @@ by the bus, and can then start sending messages to the remote service.
 
 The plan is also to add static creation of rpmsg channels via the virtio
 config space, but it's not implemented yet.
+
+Configurable buffer sizes
+=========================
+
+By default each rpmsg buffer is 512 bytes, and the same size is used for both
+the receive and transmit directions. Remote processors that need a different
+size (for example a larger MTU, or different RX and TX queue sizes) can
+advertise it through the virtio device config space by setting the
+VIRTIO_RPMSG_F_BUFSZ feature bit.
+
+When this feature is negotiated, the driver reads struct virtio_rpmsg_config
+from the config space. This structure provides the size of a single buffer for
+each direction (TX and RX). The device should advertise TX/RX buffer sizes
+that already satisfy the alignment constraints of its buffers.
+
+If the feature is not negotiated, the default 512-byte buffers are used for
+both directions.

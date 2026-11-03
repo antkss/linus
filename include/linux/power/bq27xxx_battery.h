@@ -33,7 +33,9 @@ enum bq27xxx_chip {
 	BQ27441,
 	BQ27621,
 	BQ27Z561,
+	BQ27Z746,
 	BQ28Z610,
+	BQ28Z620,
 	BQ34Z100,
 	BQ78Z100,
 };
@@ -61,6 +63,8 @@ struct bq27xxx_device_info {
 	struct bq27xxx_access_methods bus;
 	struct bq27xxx_reg_cache cache;
 	int charge_design_full;
+	int voltage_min_design;
+	int voltage_max_design;
 	bool removed;
 	unsigned long last_update;
 	union power_supply_propval last_status;

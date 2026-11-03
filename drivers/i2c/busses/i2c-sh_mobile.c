@@ -24,6 +24,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 /* Transmit operation:                                                      */
 /*                                                                          */
@@ -409,7 +410,7 @@ static irqreturn_t sh_mobile_i2c_isr(int irq, void *dev_id)
 	pd->sr |= sr; /* remember state */
 
 	dev_dbg(pd->dev, "i2c_isr 0x%02x 0x%02x %s %d %d!\n", sr, pd->sr,
-	       (pd->msg->flags & I2C_M_RD) ? "read" : "write",
+	       str_read_write(pd->msg->flags & I2C_M_RD),
 	       pd->pos, pd->msg->len);
 
 	/* Kick off TxDMA after preface was done */
@@ -739,8 +740,8 @@ static u32 sh_mobile_i2c_func(struct i2c_adapter *adapter)
 
 static const struct i2c_algorithm sh_mobile_i2c_algorithm = {
 	.functionality = sh_mobile_i2c_func,
-	.master_xfer = sh_mobile_i2c_xfer,
-	.master_xfer_atomic = sh_mobile_i2c_xfer_atomic,
+	.xfer = sh_mobile_i2c_xfer,
+	.xfer_atomic = sh_mobile_i2c_xfer_atomic,
 };
 
 static const struct i2c_adapter_quirks sh_mobile_i2c_quirks = {
@@ -879,16 +880,16 @@ static int sh_mobile_i2c_probe(struct platform_device *dev)
 		return PTR_ERR(pd->clk);
 	}
 
-	ret = sh_mobile_i2c_hook_irqs(dev, pd);
-	if (ret)
-		return ret;
-
 	pd->dev = &dev->dev;
 	platform_set_drvdata(dev, pd);
 
 	pd->reg = devm_platform_get_and_ioremap_resource(dev, 0, &pd->res);
 	if (IS_ERR(pd->reg))
 		return PTR_ERR(pd->reg);
+
+	ret = sh_mobile_i2c_hook_irqs(dev, pd);
+	if (ret)
+		return ret;
 
 	ret = of_property_read_u32(dev->dev.of_node, "clock-frequency", &bus_speed);
 	pd->bus_speed = (ret || !bus_speed) ? I2C_MAX_STANDARD_MODE_FREQ : bus_speed;

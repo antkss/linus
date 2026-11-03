@@ -1079,8 +1079,6 @@ void fib_alias_hw_flags_set(struct net *net, const struct fib_rt_info *fri)
 
 	err = fib_dump_info(skb, 0, 0, RTM_NEWROUTE, fri, 0);
 	if (err < 0) {
-		/* -EMSGSIZE implies BUG in fib_nlmsg_size() */
-		WARN_ON(err == -EMSGSIZE);
 		kfree_skb(skb);
 		goto errout;
 	}
@@ -1187,22 +1185,6 @@ static int fib_insert_alias(struct trie *t, struct key_vector *tp,
 	return 0;
 }
 
-static bool fib_valid_key_len(u32 key, u8 plen, struct netlink_ext_ack *extack)
-{
-	if (plen > KEYLENGTH) {
-		NL_SET_ERR_MSG(extack, "Invalid prefix length");
-		return false;
-	}
-
-	if ((plen < KEYLENGTH) && (key << plen)) {
-		NL_SET_ERR_MSG(extack,
-			       "Invalid prefix for given prefix length");
-		return false;
-	}
-
-	return true;
-}
-
 static void fib_remove_alias(struct trie *t, struct key_vector *tp,
 			     struct key_vector *l, struct fib_alias *old);
 
@@ -1222,9 +1204,6 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 	int err;
 
 	key = ntohl(cfg->fc_dst);
-
-	if (!fib_valid_key_len(key, plen, extack))
-		return -EINVAL;
 
 	pr_debug("Insert table=%u %08x/%d\n", tb->tb_id, key, plen);
 
@@ -1299,7 +1278,7 @@ int fib_table_insert(struct net *net, struct fib_table *tb,
 			new_fa->fa_dscp = fa->fa_dscp;
 			new_fa->fa_info = fi;
 			new_fa->fa_type = cfg->fc_type;
-			state = fa->fa_state;
+			state = READ_ONCE(fa->fa_state);
 			new_fa->fa_state = state & ~FA_S_ACCESSED;
 			new_fa->fa_slen = fa->fa_slen;
 			new_fa->tb_id = tb->tb_id;
@@ -1404,7 +1383,7 @@ succeeded:
 out_remove_new_fa:
 	fib_remove_alias(t, tp, l, new_fa);
 out_free_new_fa:
-	kmem_cache_free(fn_alias_kmem, new_fa);
+	alias_free_mem_rcu(new_fa);
 out:
 	fib_release_info(fi);
 err:
@@ -1454,7 +1433,8 @@ int fib_table_lookup(struct fib_table *tb, const struct flowi4 *flp,
 
 	n = get_child_rcu(pn, cindex);
 	if (!n) {
-		trace_fib_table_lookup(tb->tb_id, flp, NULL, -EAGAIN);
+		trace_fib_table_lookup(tb->tb_id, flp, NULL, -EAGAIN,
+				       tb->tb_net);
 		return -EAGAIN;
 	}
 
@@ -1541,7 +1521,8 @@ backtrace:
 				 */
 				if (IS_TRIE(pn)) {
 					trace_fib_table_lookup(tb->tb_id, flp,
-							       NULL, -EAGAIN);
+							       NULL, -EAGAIN,
+							       tb->tb_net);
 					return -EAGAIN;
 				}
 #ifdef CONFIG_IP_FIB_TRIE_STATS
@@ -1588,7 +1569,8 @@ out_reject:
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 			this_cpu_inc(stats->semantic_match_passed);
 #endif
-			trace_fib_table_lookup(tb->tb_id, flp, NULL, err);
+			trace_fib_table_lookup(tb->tb_id, flp, NULL, err,
+					       tb->tb_net);
 			return err;
 		}
 		if (fi->fib_flags & RTNH_F_DEAD)
@@ -1629,7 +1611,8 @@ set_result:
 #ifdef CONFIG_IP_FIB_TRIE_STATS
 			this_cpu_inc(stats->semantic_match_passed);
 #endif
-			trace_fib_table_lookup(tb->tb_id, flp, nhc, err);
+			trace_fib_table_lookup(tb->tb_id, flp, nhc, err,
+					       tb->tb_net);
 
 			return err;
 		}
@@ -1717,9 +1700,6 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 
 	key = ntohl(cfg->fc_dst);
 
-	if (!fib_valid_key_len(key, plen, extack))
-		return -EINVAL;
-
 	l = fib_find_node(t, &tp, key);
 	if (!l)
 		return -ESRCH;
@@ -1767,7 +1747,7 @@ int fib_table_delete(struct net *net, struct fib_table *tb,
 
 	fib_remove_alias(t, tp, l, fa_to_delete);
 
-	if (fa_to_delete->fa_state & FA_S_ACCESSED)
+	if (READ_ONCE(fa_to_delete->fa_state) & FA_S_ACCESSED)
 		rt_cache_flush(cfg->fc_nlinfo.nl_net);
 
 	fib_release_info(fa_to_delete->fa_info);
@@ -1903,7 +1883,7 @@ struct fib_table *fib_trie_unmerge(struct fib_table *oldtb)
 	if (oldtb->tb_data == oldtb->__data)
 		return oldtb;
 
-	local_tb = fib_trie_table(RT_TABLE_LOCAL, NULL);
+	local_tb = fib_trie_table(oldtb->tb_net, RT_TABLE_LOCAL, NULL);
 	if (!local_tb)
 		return NULL;
 
@@ -2068,17 +2048,12 @@ int fib_table_flush(struct net *net, struct fib_table *tb, bool flush_all)
 		hlist_for_each_entry_safe(fa, tmp, &n->leaf, fa_list) {
 			struct fib_info *fi = fa->fa_info;
 
-			if (!fi || tb->tb_id != fa->tb_id ||
-			    (!(fi->fib_flags & RTNH_F_DEAD) &&
-			     !fib_props[fa->fa_type].error)) {
+			if (!fi || tb->tb_id != fa->tb_id) {
 				slen = fa->fa_slen;
 				continue;
 			}
 
-			/* Do not flush error routes if network namespace is
-			 * not being dismantled
-			 */
-			if (!flush_all && fib_props[fa->fa_type].error) {
+			if (!flush_all && !(fi->fib_flags & RTNH_F_DEAD)) {
 				slen = fa->fa_slen;
 				continue;
 			}
@@ -2164,8 +2139,7 @@ void fib_info_notify_update(struct net *net, struct nl_info *info)
 		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
 		struct fib_table *tb;
 
-		hlist_for_each_entry_rcu(tb, head, tb_hlist,
-					 lockdep_rtnl_is_held())
+		hlist_for_each_entry_rcu(tb, head, tb_hlist, true)
 			__fib_info_notify_update(net, tb, info);
 	}
 }
@@ -2193,10 +2167,14 @@ static int fib_leaf_notify(struct key_vector *l, struct fib_table *tb,
 		if (fa->fa_slen == last_slen)
 			continue;
 
+		if (!fib_info_hold_safe(fa->fa_info))
+			continue;
+
 		last_slen = fa->fa_slen;
 		err = call_fib_entry_notifier(nb, FIB_EVENT_ENTRY_REPLACE,
 					      l->key, KEYLENGTH - fa->fa_slen,
 					      fa, extack);
+		fib_info_put(fa->fa_info);
 		if (err)
 			return err;
 	}
@@ -2402,7 +2380,8 @@ void __init fib_trie_init(void)
 					   0, SLAB_PANIC | SLAB_ACCOUNT, NULL);
 }
 
-struct fib_table *fib_trie_table(u32 id, struct fib_table *alias)
+struct fib_table *fib_trie_table(struct net *net, u32 id,
+				 struct fib_table *alias)
 {
 	struct fib_table *tb;
 	struct trie *t;
@@ -2415,6 +2394,7 @@ struct fib_table *fib_trie_table(u32 id, struct fib_table *alias)
 	if (!tb)
 		return NULL;
 
+	tb->tb_net = net;
 	tb->tb_id = id;
 	tb->tb_num_default = 0;
 	tb->tb_data = (alias ? alias->__data : tb->__data);
@@ -2999,7 +2979,7 @@ static int fib_route_seq_show(struct seq_file *seq, void *v)
 
 			seq_printf(seq,
 				   "%s\t%08X\t%08X\t%04X\t%d\t%u\t"
-				   "%d\t%08X\t%d\t%u\t%u",
+				   "%u\t%08X\t%d\t%u\t%u",
 				   nhc->nhc_dev ? nhc->nhc_dev->name : "*",
 				   prefix, gw, flags, 0, 0,
 				   fi->fib_priority,
@@ -3011,7 +2991,7 @@ static int fib_route_seq_show(struct seq_file *seq, void *v)
 		} else {
 			seq_printf(seq,
 				   "*\t%08X\t%08X\t%04X\t%d\t%u\t"
-				   "%d\t%08X\t%d\t%u\t%u",
+				   "%u\t%08X\t%d\t%u\t%u",
 				   prefix, 0, flags, 0, 0, 0,
 				   mask, 0, 0, 0);
 		}

@@ -7,6 +7,7 @@
 #ifndef _CORESIGHT_CORESIGHT_CONFIG_H
 #define _CORESIGHT_CORESIGHT_CONFIG_H
 
+#include <linux/cleanup.h>
 #include <linux/coresight.h>
 #include <linux/types.h>
 
@@ -206,7 +207,7 @@ struct cscfg_feature_csdev {
 	const struct cscfg_feature_desc *feat_desc;
 	struct coresight_device *csdev;
 	struct list_head node;
-	spinlock_t *drv_spinlock;
+	raw_spinlock_t *drv_spinlock;
 	int nr_params;
 	struct cscfg_parameter_csdev *params_csdev;
 	int nr_regs;
@@ -228,7 +229,7 @@ struct cscfg_feature_csdev {
  * @feats_csdev:references to the device features to enable.
  */
 struct cscfg_config_csdev {
-	const struct cscfg_config_desc *config_desc;
+	struct cscfg_config_desc *config_desc;
 	struct coresight_device *csdev;
 	bool enabled;
 	struct list_head node;
@@ -258,5 +259,26 @@ void cscfg_csdev_disable_config(struct cscfg_config_csdev *config_csdev);
 
 /* reset a feature to default values */
 void cscfg_reset_feat(struct cscfg_feature_csdev *feat_csdev);
+
+#define feat_csdev_lock(feat_csdev, flags)				\
+	do {								\
+		raw_spinlock_t *__lock = feat_csdev->drv_spinlock;	\
+		typecheck(unsigned long, flags);			\
+		if (__lock)						\
+			raw_spin_lock_irqsave(__lock, flags);		\
+	} while (0)
+
+#define feat_csdev_unlock(feat_csdev, flags)				\
+	do {								\
+		raw_spinlock_t *__lock = feat_csdev->drv_spinlock;	\
+		typecheck(unsigned long, flags);			\
+		if (__lock)						\
+			raw_spin_unlock_irqrestore(__lock, flags);	\
+	} while (0)
+
+DEFINE_LOCK_GUARD_1(feat_csdev_lock, struct cscfg_feature_csdev,
+		    feat_csdev_lock(_T->lock, _T->flags),
+		    feat_csdev_unlock(_T->lock, _T->flags),
+		    unsigned long flags)
 
 #endif /* _CORESIGHT_CORESIGHT_CONFIG_H */

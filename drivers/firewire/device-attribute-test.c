@@ -86,7 +86,7 @@ static void device_attr_simple_avc(struct kunit *test)
 			.type = &fw_device_type,
 		},
 		.config_rom = simple_avc_config_rom,
-		.config_rom_length = sizeof(simple_avc_config_rom),
+		.config_rom_length = ARRAY_SIZE(simple_avc_config_rom),
 	};
 	static const struct fw_unit unit0 = {
 		.device = {
@@ -99,6 +99,7 @@ static void device_attr_simple_avc(struct kunit *test)
 	struct device *unit0_dev = (struct device *)&unit0.device;
 	static const int unit0_expected_ids[] = {0x00ffffff, 0x00ffffff, 0x0000a02d, 0x00010001};
 	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, buf);
 	int ids[4] = {0, 0, 0, 0};
 
 	// Ensure associations for node and unit devices.
@@ -167,7 +168,7 @@ static void device_attr_legacy_avc(struct kunit *test)
 			.type = &fw_device_type,
 		},
 		.config_rom = legacy_avc_config_rom,
-		.config_rom_length = sizeof(legacy_avc_config_rom),
+		.config_rom_length = ARRAY_SIZE(legacy_avc_config_rom),
 	};
 	static const struct fw_unit unit0 = {
 		.device = {
@@ -180,6 +181,7 @@ static void device_attr_legacy_avc(struct kunit *test)
 	struct device *unit0_dev = (struct device *)&unit0.device;
 	static const int unit0_expected_ids[] = {0x00012345, 0x00fedcba, 0x00abcdef, 0x00543210};
 	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, buf);
 	int ids[4] = {0, 0, 0, 0};
 
 	// Ensure associations for node and unit devices.

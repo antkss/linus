@@ -3,7 +3,7 @@
  * Copyright (c) 2021-2024 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -121,7 +121,7 @@ xrep_tempfile_create(
 		 * remote target block, so the owner is irrelevant.
 		 */
 		error = xfs_symlink_write_target(tp, sc->tempip,
-				sc->tempip->i_ino, ".", 1, 0, 0);
+				I_INO(sc->tempip), ".", 1, 0, 0);
 		if (error)
 			goto out_trans_cancel;
 	}
@@ -174,6 +174,7 @@ out_release_inode:
 		xfs_iunlock(sc->tempip, XFS_ILOCK_EXCL);
 		xfs_finish_inode_setup(sc->tempip);
 		xchk_irele(sc, sc->tempip);
+		sc->tempip = NULL;
 	}
 out_release_dquots:
 	xfs_qm_dqrele(udqp);
@@ -606,6 +607,8 @@ STATIC int
 xrep_tempexch_prep_request(
 	struct xfs_scrub	*sc,
 	int			whichfork,
+	xfs_fileoff_t		off,
+	xfs_filblks_t		len,
 	struct xrep_tempexch	*tx)
 {
 	struct xfs_exchmaps_req	*req = &tx->req;
@@ -629,20 +632,34 @@ xrep_tempexch_prep_request(
 	/* Exchange all mappings in both forks. */
 	req->ip1 = sc->tempip;
 	req->ip2 = sc->ip;
-	req->startoff1 = 0;
-	req->startoff2 = 0;
+	req->startoff1 = off;
+	req->startoff2 = off;
 	switch (whichfork) {
 	case XFS_ATTR_FORK:
 		req->flags |= XFS_EXCHMAPS_ATTR_FORK;
 		break;
 	case XFS_DATA_FORK:
-		/* Always exchange sizes when exchanging data fork mappings. */
-		req->flags |= XFS_EXCHMAPS_SET_SIZES;
+		/* Exchange sizes when exchanging all data fork mappings. */
+		if (off == 0 && len == XFS_MAX_FILEOFF)
+			req->flags |= XFS_EXCHMAPS_SET_SIZES;
 		break;
 	}
-	req->blockcount = XFS_MAX_FILEOFF;
+	req->blockcount = len;
 
 	return 0;
+}
+
+static inline unsigned int
+xrep_tempexch_estimate_sf_resblks(
+	struct xfs_scrub	*sc,
+	int			whichfork)
+{
+	/* repairing a symlink target */
+	if (S_ISLNK(VFS_I(sc->ip)->i_mode) && whichfork == XFS_DATA_FORK)
+		return 1;
+
+	/* everything else is a directory or an xattr structure */
+	return xfs_dabuf_nfsb(sc->mp, whichfork);
 }
 
 /*
@@ -659,6 +676,8 @@ xrep_tempexch_estimate(
 	struct xfs_ifork	*ifp;
 	struct xfs_ifork	*tifp;
 	int			whichfork = xfs_exchmaps_reqfork(req);
+	unsigned int		sf_resblks =
+		xrep_tempexch_estimate_sf_resblks(sc, whichfork);
 	int			state = 0;
 
 	/*
@@ -689,9 +708,9 @@ xrep_tempexch_estimate(
 		 * plus the block we converted.
 		 */
 		req->ip1_bcount = sc->tempip->i_nblocks;
-		req->ip2_bcount = 1;
+		req->ip2_bcount = sf_resblks;
 		req->nr_exchanges = 1 + tifp->if_nextents;
-		req->resblks = 1;
+		req->resblks = sf_resblks;
 		break;
 	case 2:
 		/*
@@ -703,10 +722,10 @@ xrep_tempexch_estimate(
 		 * is (worst case) the extent count of the file being repaired
 		 * plus the block we converted.
 		 */
-		req->ip1_bcount = 1;
+		req->ip1_bcount = sf_resblks;
 		req->ip2_bcount = sc->ip->i_nblocks;
 		req->nr_exchanges = 1 + ifp->if_nextents;
-		req->resblks = 1;
+		req->resblks = sf_resblks;
 		break;
 	case 3:
 		/*
@@ -718,10 +737,10 @@ xrep_tempexch_estimate(
 		 * fileoff 0.  Presumably, the caller could not exchange the
 		 * two inode fork areas directly.
 		 */
-		req->ip1_bcount = 1;
-		req->ip2_bcount = 1;
+		req->ip1_bcount = sf_resblks;
+		req->ip2_bcount = sf_resblks;
 		req->nr_exchanges = 1;
-		req->resblks = 2;
+		req->resblks = 2 * sf_resblks;
 		break;
 	}
 
@@ -749,6 +768,7 @@ xrep_tempexch_reserve_quota(
 	 * or the two inodes have the same dquots.
 	 */
 	if (!XFS_IS_QUOTA_ON(tp->t_mountp) || req->ip1 == req->ip2 ||
+	    xfs_is_metadir_inode(req->ip1) ||
 	    (req->ip1->i_udquot == req->ip2->i_udquot &&
 	     req->ip1->i_gdquot == req->ip2->i_gdquot &&
 	     req->ip1->i_pdquot == req->ip2->i_pdquot))
@@ -795,6 +815,8 @@ int
 xrep_tempexch_trans_reserve(
 	struct xfs_scrub	*sc,
 	int			whichfork,
+	xfs_fileoff_t		off,
+	xfs_filblks_t		len,
 	struct xrep_tempexch	*tx)
 {
 	int			error;
@@ -803,7 +825,7 @@ xrep_tempexch_trans_reserve(
 	xfs_assert_ilocked(sc->ip, XFS_ILOCK_EXCL);
 	xfs_assert_ilocked(sc->tempip, XFS_ILOCK_EXCL);
 
-	error = xrep_tempexch_prep_request(sc, whichfork, tx);
+	error = xrep_tempexch_prep_request(sc, whichfork, off, len, tx);
 	if (error)
 		return error;
 
@@ -841,7 +863,8 @@ xrep_tempexch_trans_alloc(
 	ASSERT(sc->tp == NULL);
 	ASSERT(xfs_has_exchange_range(sc->mp));
 
-	error = xrep_tempexch_prep_request(sc, whichfork, tx);
+	error = xrep_tempexch_prep_request(sc, whichfork, 0, XFS_MAX_FILEOFF,
+			tx);
 	if (error)
 		return error;
 

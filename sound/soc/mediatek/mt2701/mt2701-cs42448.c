@@ -266,7 +266,7 @@ static struct snd_soc_dai_link mt2701_cs42448_dai_links[] = {
 	[DAI_LINK_BE_I2S0] = {
 		.name = "mt2701-cs42448-I2S0",
 		.no_pcm = 1,
-		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBS_CFS
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC
 			 | SND_SOC_DAIFMT_GATED,
 		.ops = &mt2701_cs42448_be_ops,
 		SND_SOC_DAILINK_REG(be_i2s0),
@@ -274,7 +274,7 @@ static struct snd_soc_dai_link mt2701_cs42448_dai_links[] = {
 	[DAI_LINK_BE_I2S1] = {
 		.name = "mt2701-cs42448-I2S1",
 		.no_pcm = 1,
-		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBS_CFS
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC
 			 | SND_SOC_DAIFMT_GATED,
 		.ops = &mt2701_cs42448_be_ops,
 		SND_SOC_DAILINK_REG(be_i2s1),
@@ -282,7 +282,7 @@ static struct snd_soc_dai_link mt2701_cs42448_dai_links[] = {
 	[DAI_LINK_BE_I2S2] = {
 		.name = "mt2701-cs42448-I2S2",
 		.no_pcm = 1,
-		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBS_CFS
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC
 			 | SND_SOC_DAIFMT_GATED,
 		.ops = &mt2701_cs42448_be_ops,
 		SND_SOC_DAILINK_REG(be_i2s2),
@@ -290,7 +290,7 @@ static struct snd_soc_dai_link mt2701_cs42448_dai_links[] = {
 	[DAI_LINK_BE_I2S3] = {
 		.name = "mt2701-cs42448-I2S3",
 		.no_pcm = 1,
-		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBS_CFS
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC
 			 | SND_SOC_DAIFMT_GATED,
 		.ops = &mt2701_cs42448_be_ops,
 		SND_SOC_DAILINK_REG(be_i2s3),
@@ -366,10 +366,8 @@ static int mt2701_cs42448_machine_probe(struct platform_device *pdev)
 							= codec_node_bt_mrg;
 
 	ret = snd_soc_of_parse_audio_routing(card, "audio-routing");
-	if (ret) {
-		dev_err(dev, "failed to parse audio-routing: %d\n", ret);
+	if (ret)
 		return ret;
-	}
 
 	priv->i2s1_in_mux_sel_1 = devm_gpiod_get_optional(dev, "i2s1-in-sel-gpio1",
 							  GPIOD_OUT_LOW);

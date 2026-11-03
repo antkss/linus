@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /*
  * Copyright (C) 2022 MediaTek Inc.
  */
@@ -64,6 +64,25 @@ enum offs_rev {
 	MIB_BSCR7,
 	MIB_BSCR17,
 	MIB_TRDR1,
+	MIB_TSCR0,
+	MIB_TSCR1,
+	MIB_TSCR2,
+	MIB_TSCR3,
+	MIB_TSCR4,
+	MIB_TSCR5,
+	MIB_TSCR6,
+	MIB_TSCR7,
+	HIF_REMAP_L1,
+	HIF_REMAP_BASE_L1,
+	HIF_REMAP_L2,
+	HIF_REMAP_BASE_L2,
+	CBTOP1_PHY_END,
+	INFRA_MCU_END,
+	WTBLON_WDUCR,
+	WTBL_UPDATE,
+	WTBL_ITCR,
+	WTBL_ITCR0,
+	WTBL_ITCR1,
 	__MT_OFFS_MAX,
 };
 
@@ -77,6 +96,8 @@ enum offs_rev {
 #define MT_RRO_BA_BITMAP_BASE1			MT_RRO_TOP(0xC)
 #define WF_RRO_AXI_MST_CFG			MT_RRO_TOP(0xB8)
 #define WF_RRO_AXI_MST_CFG_DIDX_OK		BIT(12)
+
+#define MT_RRO_ADDR_ARRAY_BASE0			MT_RRO_TOP(0x30)
 #define MT_RRO_ADDR_ARRAY_BASE1			MT_RRO_TOP(0x34)
 #define MT_RRO_ADDR_ARRAY_ELEM_ADDR_SEG_MODE	BIT(31)
 
@@ -96,6 +117,19 @@ enum offs_rev {
 #define MT_RRO_HOST_INT_ENA_HOST_RRO_DONE_ENA   BIT(0)
 
 #define MT_RRO_ADDR_ELEM_SEG_ADDR0		MT_RRO_TOP(0x400)
+
+#define MT_RRO_3_0_EMU_CONF			MT_RRO_TOP(0x600)
+#define MT_RRO_3_0_EMU_CONF_EN_MASK		BIT(11)
+
+#define MT_RRO_3_1_GLOBAL_CONFIG		MT_RRO_TOP(0x604)
+#define MT_RRO_3_1_GLOBAL_CONFIG_RXDMAD_SEL	BIT(6)
+#define MT_RRO_3_1_GLOBAL_CONFIG_RX_CIDX_RD_EN	BIT(3)
+#define MT_RRO_3_1_GLOBAL_CONFIG_RX_DIDX_WR_EN	BIT(2)
+#define MT_RRO_3_1_GLOBAL_CONFIG_INTERLEAVE_EN	BIT(0)
+
+#define MT_RRO_MSDU_PG_SEG_ADDR0		MT_RRO_TOP(0x620)
+#define MT_RRO_RX_RING_AP_CIDX_ADDR		MT_RRO_TOP(0x6f0)
+#define MT_RRO_RX_RING_AP_DIDX_ADDR		MT_RRO_TOP(0x6f4)
 
 #define MT_RRO_ACK_SN_CTRL			MT_RRO_TOP(0x50)
 #define MT_RRO_ACK_SN_CTRL_SN_MASK		GENMASK(27, 16)
@@ -121,17 +155,48 @@ enum offs_rev {
 #define MT_FL_Q2_CTRL				MT_PLE(0x3e8)
 #define MT_FL_Q3_CTRL				MT_PLE(0x3ec)
 
-#define MT_PLE_FREEPG_CNT			MT_PLE(0x380)
-#define MT_PLE_FREEPG_HEAD_TAIL			MT_PLE(0x384)
-#define MT_PLE_PG_HIF_GROUP			MT_PLE(0x00c)
-#define MT_PLE_HIF_PG_INFO			MT_PLE(0x388)
+#define MT_FL_Q0_CTRL_EXECUTE			BIT(31)
+#define MT_FL_Q0_CTRL_QID			GENMASK(30, 24)
+#define MT_FL_Q0_CTRL_TGID			GENMASK(21, 20)
+#define MT_FL_Q0_CTRL_PID			GENMASK(17, 16)
+#define MT_FL_Q0_CTRL_WLAN_IDX			GENMASK(11, 0)
+#define MT_FL_Q2_CTRL_TAIL_FID			GENMASK(28, 16)
+#define MT_FL_Q2_CTRL_HEAD_FID			GENMASK(12, 0)
+#define MT_FL_Q3_CTRL_PKT_NUM			GENMASK(12, 0)
 
-#define MT_PLE_AC_QEMPTY(ac, n)			MT_PLE(0x600 +	0x80 * (ac) + ((n) << 2))
+#define MT_PLE_FREEPG_CNT			MT_PLE(0x3a0)
+#define MT_PLE_FREEPG_HEAD_TAIL			MT_PLE(0x3a4)
+#define MT_PLE_PG_HIF_GROUP			MT_PLE(0x00c)
+#define MT_PLE_HIF_PG_INFO			MT_PLE(0x3a8)
+
+#define MT_PLE_AC_QEMPTY(ac, n)			MT_PLE(0x600 + 0x100 * (ac) + ((n) << 2))
 #define MT_PLE_AMSDU_PACK_MSDU_CNT(n)		MT_PLE(0x10e0 + ((n) << 2))
+
+#define MT_FREEPG_CNT_FFA			GENMASK(28, 16)
+#define MT_FREEPG_CNT_FREE			GENMASK(12, 0)
+#define MT_FREEPG_HEAD_TAIL_TAIL		GENMASK(28, 16)
+#define MT_FREEPG_HEAD_TAIL_HEAD		GENMASK(12, 0)
+#define MT_PG_GROUP_MAX_QUOTA			GENMASK(28, 16)
+#define MT_PG_GROUP_MIN_QUOTA			GENMASK(12, 0)
+#define MT_PG_INFO_SRC_CNT			GENMASK(28, 16)
+#define MT_PG_INFO_RSV_CNT			GENMASK(12, 0)
+
+/* PSE */
+#define MT_PSE_BASE				0x820c8000
+#define MT_PSE(ofs)				(MT_PSE_BASE + (ofs))
+
+#define MT_PSE_QUEUE_EMPTY			MT_PSE(0x0b0)
+#define MT_PSE_QUEUE_EMPTY_1			MT_PSE(0x0bc)
+#define MT_PSE_FL_Q0_CTRL			MT_PSE(0x1b0)
+#define MT_PSE_FL_Q2_CTRL			MT_PSE(0x1b8)
+#define MT_PSE_FL_Q3_CTRL			MT_PSE(0x1bc)
 
 /* WF MDP TOP */
 #define MT_MDP_BASE				0x820cc000
 #define MT_MDP(ofs)				(MT_MDP_BASE + (ofs))
+
+#define MT_MDP_DCR0				MT_MDP(0x800)
+#define MT_MDP_DCR0_RX_HDR_TRANS_EN		BIT(19)
 
 #define MT_MDP_DCR2				MT_MDP(0x8e8)
 #define MT_MDP_DCR2_RX_TRANS_SHORT		BIT(2)
@@ -174,6 +239,9 @@ enum offs_rev {
 #define MT_WTBLOFF_RSCR(_band)			MT_WTBLOFF(_band, 0x008)
 #define MT_WTBLOFF_RSCR_RCPI_MODE		GENMASK(31, 30)
 #define MT_WTBLOFF_RSCR_RCPI_PARAM		GENMASK(25, 24)
+
+#define MT_WTBLOFF_ACR(_band)			MT_WTBLOFF(_band, 0x010)
+#define MT_WTBLOFF_ADM_BACKOFFTIME		BIT(29)
 
 /* ETBF: band 0(0x820ea000), band 1(0x820fa000), band 2(0x830ea000) */
 #define MT_WF_ETBF_BASE(_band)			__BASE(WF_ETBF_BASE, (_band))
@@ -218,9 +286,9 @@ enum offs_rev {
 #define MT_MIB_BSCR7(_band)			MT_WF_MIB(_band, __OFFS(MIB_BSCR7))
 #define MT_MIB_BSCR17(_band)			MT_WF_MIB(_band, __OFFS(MIB_BSCR17))
 
-#define MT_MIB_TSCR5(_band)			MT_WF_MIB(_band, 0x6c4)
-#define MT_MIB_TSCR6(_band)			MT_WF_MIB(_band, 0x6c8)
-#define MT_MIB_TSCR7(_band)			MT_WF_MIB(_band, 0x6d0)
+#define MT_MIB_TSCR5(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR5))
+#define MT_MIB_TSCR6(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR6))
+#define MT_MIB_TSCR7(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR7))
 
 #define MT_MIB_RSCR1(_band)			MT_WF_MIB(_band, __OFFS(MIB_RSCR1))
 /* rx mpdu counter, full 32 bits */
@@ -236,14 +304,14 @@ enum offs_rev {
 #define MT_MIB_RSCR36(_band)			MT_WF_MIB(_band, __OFFS(MIB_RSCR36))
 
 /* tx ampdu cnt, full 32 bits */
-#define MT_MIB_TSCR0(_band)			MT_WF_MIB(_band, 0x6b0)
-#define MT_MIB_TSCR2(_band)			MT_WF_MIB(_band, 0x6b8)
+#define MT_MIB_TSCR0(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR0))
+#define MT_MIB_TSCR2(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR2))
 
 /* counts all mpdus in ampdu, regardless of success */
-#define MT_MIB_TSCR3(_band)			MT_WF_MIB(_band, 0x6bc)
+#define MT_MIB_TSCR3(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR3))
 
 /* counts all successfully tx'd mpdus in ampdu */
-#define MT_MIB_TSCR4(_band)			MT_WF_MIB(_band, 0x6c0)
+#define MT_MIB_TSCR4(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR4))
 
 /* rx ampdu count, 32-bit */
 #define MT_MIB_RSCR27(_band)			MT_WF_MIB(_band, __OFFS(MIB_RSCR27))
@@ -267,7 +335,7 @@ enum offs_rev {
 #define MT_MIB_RVSR1(_band)			MT_WF_MIB(_band, __OFFS(MIB_RVSR1))
 
 /* rx blockack count, 32 bits */
-#define MT_MIB_TSCR1(_band)			MT_WF_MIB(_band, 0x6b4)
+#define MT_MIB_TSCR1(_band)			MT_WF_MIB(_band, __OFFS(MIB_TSCR1))
 
 #define MT_MIB_BTSCR0(_band)			MT_WF_MIB(_band, 0x5e0)
 #define MT_MIB_BTSCR5(_band)			MT_WF_MIB(_band, __OFFS(MIB_BTSCR5))
@@ -288,19 +356,19 @@ enum offs_rev {
 /* WTBLON TOP */
 #define MT_WTBLON_TOP_BASE			0x820d4000
 #define MT_WTBLON_TOP(ofs)			(MT_WTBLON_TOP_BASE + (ofs))
-#define MT_WTBLON_TOP_WDUCR			MT_WTBLON_TOP(0x370)
+#define MT_WTBLON_TOP_WDUCR			MT_WTBLON_TOP(__OFFS(WTBLON_WDUCR))
 #define MT_WTBLON_TOP_WDUCR_GROUP		GENMASK(4, 0)
 
-#define MT_WTBL_UPDATE				MT_WTBLON_TOP(0x380)
+#define MT_WTBL_UPDATE				MT_WTBLON_TOP(__OFFS(WTBL_UPDATE))
 #define MT_WTBL_UPDATE_WLAN_IDX			GENMASK(11, 0)
 #define MT_WTBL_UPDATE_ADM_COUNT_CLEAR		BIT(14)
 #define MT_WTBL_UPDATE_BUSY			BIT(31)
 
-#define MT_WTBL_ITCR				MT_WTBLON_TOP(0x3b0)
+#define MT_WTBL_ITCR				MT_WTBLON_TOP(__OFFS(WTBL_ITCR))
 #define MT_WTBL_ITCR_WR				BIT(16)
 #define MT_WTBL_ITCR_EXEC			BIT(31)
-#define MT_WTBL_ITDR0				MT_WTBLON_TOP(0x3b8)
-#define MT_WTBL_ITDR1				MT_WTBLON_TOP(0x3bc)
+#define MT_WTBL_ITDR0				MT_WTBLON_TOP(__OFFS(WTBL_ITCR0))
+#define MT_WTBL_ITDR1				MT_WTBLON_TOP(__OFFS(WTBL_ITCR1))
 #define MT_WTBL_SPE_IDX_SEL			BIT(6)
 
 /* WTBL */
@@ -398,7 +466,9 @@ enum offs_rev {
 
 #define MT_WFDMA0_RX_INT_PCIE_SEL		MT_WFDMA0(0x154)
 #define MT_WFDMA0_RX_INT_SEL_RING3		BIT(3)
+#define MT_WFDMA0_RX_INT_SEL_RING5		BIT(5)
 #define MT_WFDMA0_RX_INT_SEL_RING6		BIT(6)
+#define MT_WFDMA0_RX_INT_SEL_RING9		BIT(9)
 
 #define MT_WFDMA0_MCU_HOST_INT_ENA		MT_WFDMA0(0x1f4)
 
@@ -416,6 +486,7 @@ enum offs_rev {
 #define MT_WFDMA0_PAUSE_RX_Q_RRO_TH		MT_WFDMA0(0x27c)
 
 #define WF_WFDMA0_GLO_CFG_EXT0			MT_WFDMA0(0x2b0)
+#define WF_WFDMA0_GLO_CFG_EXT0_OUTSTAND_MASK	GENMASK(27, 24)
 #define WF_WFDMA0_GLO_CFG_EXT0_RX_WB_RXD	BIT(18)
 #define WF_WFDMA0_GLO_CFG_EXT0_WED_MERGE_MODE	BIT(14)
 
@@ -437,6 +508,8 @@ enum offs_rev {
 
 #define MT_WFDMA_HOST_CONFIG			MT_WFDMA_EXT_CSR(0x30)
 #define MT_WFDMA_HOST_CONFIG_PDMA_BAND		BIT(0)
+#define MT_WFDMA_HOST_CONFIG_BAND0_PCIE1	BIT(20)
+#define MT_WFDMA_HOST_CONFIG_BAND1_PCIE1	BIT(21)
 #define MT_WFDMA_HOST_CONFIG_BAND2_PCIE1	BIT(22)
 
 #define MT_WFDMA_EXT_CSR_HIF_MISC		MT_WFDMA_EXT_CSR(0x44)
@@ -444,6 +517,9 @@ enum offs_rev {
 
 #define MT_WFDMA_AXI_R2A_CTRL			MT_WFDMA_EXT_CSR(0x500)
 #define MT_WFDMA_AXI_R2A_CTRL_OUTSTAND_MASK	GENMASK(4, 0)
+
+#define MT_WFDMA_AXI_R2A_CTRL2			MT_WFDMA_EXT_CSR(0x508)
+#define MT_WFDMA_AXI_R2A_CTRL2_OUTSTAND_MASK	GENMASK(31, 28)
 
 #define MT_PCIE_RECOG_ID			0xd7090
 #define MT_PCIE_RECOG_ID_MASK			GENMASK(30, 0)
@@ -478,9 +554,11 @@ enum offs_rev {
 #define MT_RXQ_RING_BASE(q)			(MT_Q_BASE(__RXQ(q)) + 0x500)
 #define MT_RXQ_RRO_IND_RING_BASE		MT_RRO_TOP(0x40)
 
+#define MT_RXQ_RRO_AP_RING_BASE			MT_RRO_TOP(0x650)
+
 #define MT_MCUQ_EXT_CTRL(q)			(MT_Q_BASE(q) +	0x600 +	\
 						 MT_MCUQ_ID(q) * 0x4)
-#define MT_RXQ_BAND1_CTRL(q)			(MT_Q_BASE(__RXQ(q)) + 0x680 +	\
+#define MT_RXQ_EXT_CTRL(q)			(MT_Q_BASE(__RXQ(q)) + 0x680 +	\
 						 MT_RXQ_ID(q) * 0x4)
 #define MT_TXQ_EXT_CTRL(q)			(MT_Q_BASE(__TXQ(q)) + 0x600 +	\
 						 MT_TXQ_ID(q) * 0x4)
@@ -500,15 +578,20 @@ enum offs_rev {
 #define MT_INT_RX_DONE_WA_EXT			BIT(3) /* for mt7992 */
 #define MT_INT_RX_DONE_WA_TRI			BIT(3)
 #define MT_INT_RX_TXFREE_MAIN			BIT(17)
+#define MT_INT_RX_TXFREE_BAND1			BIT(15)
 #define MT_INT_RX_TXFREE_TRI			BIT(15)
+#define MT_INT_RX_TXFREE_BAND1_EXT		BIT(19) /* for mt7992 two PCIE*/
+#define MT_INT_RX_TXFREE_BAND0_MT7990		BIT(14)
+#define MT_INT_RX_TXFREE_BAND1_MT7990		BIT(15)
 #define MT_INT_RX_DONE_BAND2_EXT		BIT(23)
 #define MT_INT_RX_TXFREE_EXT			BIT(26)
 #define MT_INT_MCU_CMD				BIT(29)
 
 #define MT_INT_RX_DONE_RRO_BAND0		BIT(16)
-#define MT_INT_RX_DONE_RRO_BAND1		BIT(16)
+#define MT_INT_RX_DONE_RRO_BAND1		BIT(17)
 #define MT_INT_RX_DONE_RRO_BAND2		BIT(14)
 #define MT_INT_RX_DONE_RRO_IND			BIT(11)
+#define MT_INT_RX_DONE_RRO_RXDMAD_C		BIT(11)
 #define MT_INT_RX_DONE_MSDU_PG_BAND0		BIT(18)
 #define MT_INT_RX_DONE_MSDU_PG_BAND1		BIT(19)
 #define MT_INT_RX_DONE_MSDU_PG_BAND2		BIT(23)
@@ -536,6 +619,8 @@ enum offs_rev {
 #define MT_INT_RRO_RX_DONE			(MT_INT_RX(MT_RXQ_RRO_BAND0) |		\
 						 MT_INT_RX(MT_RXQ_RRO_BAND1) |		\
 						 MT_INT_RX(MT_RXQ_RRO_BAND2) |		\
+						 MT_INT_RX(MT_RXQ_RRO_IND) |		\
+						 MT_INT_RX(MT_RXQ_RRO_RXDMAD_C) |	\
 						 MT_INT_RX(MT_RXQ_MSDU_PAGE_BAND0) |	\
 						 MT_INT_RX(MT_RXQ_MSDU_PAGE_BAND1) |	\
 						 MT_INT_RX(MT_RXQ_MSDU_PAGE_BAND2))
@@ -573,27 +658,39 @@ enum offs_rev {
 #define MT_MCU_CMD_WDT_MASK			GENMASK(31, 30)
 
 /* l1/l2 remap */
-#define MT_HIF_REMAP_L1				0x155024
-#define MT_HIF_REMAP_L1_MASK			GENMASK(31, 16)
+#define CONN_BUS_CR_VON_BASE			0x155000
+#define MT_HIF_REMAP_L1				(CONN_BUS_CR_VON_BASE + __OFFS(HIF_REMAP_L1))
+#define MT_HIF_REMAP_L1_MASK_7996		GENMASK(31, 16)
+#define MT_HIF_REMAP_L1_MASK			GENMASK(15, 0)
 #define MT_HIF_REMAP_L1_OFFSET			GENMASK(15, 0)
 #define MT_HIF_REMAP_L1_BASE			GENMASK(31, 16)
-#define MT_HIF_REMAP_BASE_L1			0x130000
+#define MT_HIF_REMAP_BASE_L1			__OFFS(HIF_REMAP_BASE_L1)
 
-#define MT_HIF_REMAP_L2				0x1b4
+#define MT_HIF_REMAP_L2				__OFFS(HIF_REMAP_L2)
 #define MT_HIF_REMAP_L2_MASK			GENMASK(19, 0)
 #define MT_HIF_REMAP_L2_OFFSET			GENMASK(11, 0)
 #define MT_HIF_REMAP_L2_BASE			GENMASK(31, 12)
-#define MT_HIF_REMAP_BASE_L2			0x1000
+#define MT_HIF_REMAP_L2_MASK_7990		GENMASK(15, 0)
+#define MT_HIF_REMAP_L2_OFFSET_7990		GENMASK(15, 0)
+#define MT_HIF_REMAP_L2_BASE_7990		GENMASK(31, 16)
+#define MT_HIF_REMAP_BASE_L2			__OFFS(HIF_REMAP_BASE_L2)
+
+/* for mt7990 only */
+#define MT_HIF_REMAP_CBTOP			0x1f6554
+#define MT_HIF_REMAP_CBTOP_MASK			GENMASK(15, 0)
+#define MT_HIF_REMAP_CBTOP_OFFSET		GENMASK(15, 0)
+#define MT_HIF_REMAP_CBTOP_BASE			GENMASK(31, 16)
+#define MT_HIF_REMAP_BASE_CBTOP			0x1c0000
 
 #define MT_INFRA_BASE				0x18000000
 #define MT_WFSYS0_PHY_START			0x18400000
 #define MT_WFSYS1_PHY_START			0x18800000
 #define MT_WFSYS1_PHY_END			0x18bfffff
 #define MT_CBTOP1_PHY_START			0x70000000
-#define MT_CBTOP1_PHY_END			0x77ffffff
+#define MT_CBTOP1_PHY_END			__OFFS(CBTOP1_PHY_END)
 #define MT_CBTOP2_PHY_START			0xf0000000
 #define MT_INFRA_MCU_START			0x7c000000
-#define MT_INFRA_MCU_END			0x7c3fffff
+#define MT_INFRA_MCU_END			__OFFS(INFRA_MCU_END)
 
 /* FW MODE SYNC */
 #define MT_FW_ASSERT_CNT			0x02208274
@@ -660,13 +757,30 @@ enum offs_rev {
 #define MT_TOP_MISC				MT_TOP(0xf0)
 #define MT_TOP_MISC_FW_STATE			GENMASK(2, 0)
 
+/* ADIE */
+#define MT_ADIE_CHIP_ID(_idx)			(0x0f00002c + ((_idx) << 28))
+#define MT_ADIE_VERSION_MASK			GENMASK(15, 0)
+#define MT_ADIE_CHIP_ID_MASK			GENMASK(31, 16)
+
 #define MT_PAD_GPIO				0x700056f0
 #define MT_PAD_GPIO_ADIE_COMB			GENMASK(16, 15)
+#define MT_PAD_GPIO_2ADIE_TBTC			BIT(19)
+/* for mt7992 */
+#define MT_PAD_GPIO_ADIE_COMB_7992		GENMASK(17, 16)
+#define MT_PAD_GPIO_ADIE_SINGLE			BIT(15)
 
 #define MT_HW_REV				0x70010204
 #define MT_HW_REV1				0x8a00
 
+#define MT_WF_L05_RST				0x70028550
+#define MT_WF_L05_RST_WF_RST_MASK		GENMASK(4, 0)
+
 #define MT_WF_SUBSYS_RST			0x70028600
+#define MT_WF_SUBSYS_RST_WHOLE_PATH_RST		BIT(0)
+#define MT_WF_SUBSYS_RST_WHOLE_PATH_RST_REVERT	BIT(5)
+#define MT_WF_SUBSYS_RST_BYPASS_WFDMA_SLP_PROT	BIT(6)
+#define MT_WF_SUBSYS_RST_BYPASS_WFDMA2_SLP_PROT	BIT(16)
+#define MT_WF_SUBSYS_RST_WHOLE_PATH_RST_REVERT_CYCLE	GENMASK(15, 8)
 
 /* PCIE MAC */
 #define MT_PCIE_MAC_BASE			0x74030000

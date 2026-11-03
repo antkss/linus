@@ -31,6 +31,8 @@
 #include "ta_ras_if.h"
 #include "ta_rap_if.h"
 #include "ta_secureDisplay_if.h"
+#include <linux/bitops.h>
+#include "amdgpu_ptl.h"
 
 #define PSP_FENCE_BUFFER_SIZE	0x1000
 #define PSP_CMD_BUFFER_SIZE	0x1000
@@ -38,6 +40,29 @@
 #define PSP_TMR_SIZE(adev)	((adev)->asic_type == CHIP_ALDEBARAN ? 0x800000 : 0x400000)
 #define PSP_TMR_ALIGNMENT	0x100000
 #define PSP_FW_NAME_LEN		0x24
+
+/* VBIOS gfl defines */
+#define MBOX_READY_MASK 0x80000000
+#define MBOX_STATUS_MASK 0x0000FFFF
+#define MBOX_COMMAND_MASK 0x00FF0000
+#define MBOX_READY_FLAG 0x80000000
+#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_LO 0x2
+#define C2PMSG_CMD_SPI_UPDATE_ROM_IMAGE_ADDR_HI 0x3
+#define C2PMSG_CMD_SPI_UPDATE_FLASH_IMAGE 0x4
+#define C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_LO 0xf
+#define C2PMSG_CMD_SPI_GET_ROM_IMAGE_ADDR_HI 0x10
+#define C2PMSG_CMD_SPI_GET_FLASH_IMAGE 0x11
+
+/* Command register bit 31 set to indicate readiness */
+#define MBOX_TOS_READY_FLAG (GFX_FLAG_RESPONSE)
+#define MBOX_TOS_READY_MASK (GFX_CMD_RESPONSE_MASK | GFX_CMD_STATUS_MASK)
+
+/* Values to check for a successful GFX_CMD response wait. Check against
+ * both status bits and response state - helps to detect a command failure
+ * or other unexpected cases like a device drop reading all 0xFFs
+ */
+#define MBOX_TOS_RESP_FLAG (GFX_FLAG_RESPONSE)
+#define MBOX_TOS_RESP_MASK (GFX_CMD_RESPONSE_MASK | GFX_CMD_STATUS_MASK)
 
 extern const struct attribute_group amdgpu_flash_attr_group;
 
@@ -80,6 +105,7 @@ enum psp_bootloader_cmd {
 	PSP_BL__DRAM_LONG_TRAIN		= 0x100000,
 	PSP_BL__DRAM_SHORT_TRAIN	= 0x200000,
 	PSP_BL__LOAD_TOS_SPL_TABLE	= 0x10000000,
+	PSP_BL__LOAD_SPDMDRV		= 0x20000000,
 };
 
 enum psp_ring_type {
@@ -106,8 +132,14 @@ enum psp_reg_prog_id {
 	PSP_REG_IH_RB_CNTL        = 0,  /* register IH_RB_CNTL */
 	PSP_REG_IH_RB_CNTL_RING1  = 1,  /* register IH_RB_CNTL_RING1 */
 	PSP_REG_IH_RB_CNTL_RING2  = 2,  /* register IH_RB_CNTL_RING2 */
+	PSP_REG_MMHUB_L1_TLB_CNTL = 25,
 	PSP_REG_LAST
 };
+
+#define PSP_WAITREG_CHANGED BIT(0) /* check if the value has changed */
+#define PSP_WAITREG_NOVERBOSE BIT(1) /* No error verbose */
+
+struct amdgpu_psp_irq_mgr;
 
 struct psp_funcs {
 	int (*init_microcode)(struct psp_context *psp);
@@ -120,6 +152,7 @@ struct psp_funcs {
 	int (*bootloader_load_dbg_drv)(struct psp_context *psp);
 	int (*bootloader_load_ras_drv)(struct psp_context *psp);
 	int (*bootloader_load_ipkeymgr_drv)(struct psp_context *psp);
+	int (*bootloader_load_spdm_drv)(struct psp_context *psp);
 	int (*bootloader_load_sos)(struct psp_context *psp);
 	int (*ring_create)(struct psp_context *psp,
 			   enum psp_ring_type ring_type);
@@ -135,11 +168,18 @@ struct psp_funcs {
 	int (*load_usbc_pd_fw)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
 	int (*read_usbc_pd_fw)(struct psp_context *psp, uint32_t *fw_ver);
 	int (*update_spirom)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
+	int (*dump_spirom)(struct psp_context *psp, uint64_t fw_pri_mc_addr);
 	int (*vbflash_stat)(struct psp_context *psp);
 	int (*fatal_error_recovery_quirk)(struct psp_context *psp);
 	bool (*get_ras_capability)(struct psp_context *psp);
 	bool (*is_aux_sos_load_required)(struct psp_context *psp);
 	bool (*is_reload_needed)(struct psp_context *psp);
+	int (*reg_program_no_ring)(struct psp_context *psp, uint32_t val,
+				   enum psp_reg_prog_id id);
+	int (*get_fw_type)(struct amdgpu_firmware_info *ucode,
+			enum psp_gfx_fw_type *type);
+	int (*register_irq_handler)(struct amdgpu_psp_irq_mgr *mgr,
+				    struct amdgpu_irq_src *irq_src);
 };
 
 struct ta_funcs {
@@ -196,6 +236,7 @@ struct psp_xgmi_context {
 	struct ta_context		context;
 	struct psp_xgmi_topology_info	top_info;
 	bool				supports_extended_data;
+	bool				supports_ext_link_info;
 	uint8_t				xgmi_ta_caps;
 };
 
@@ -243,7 +284,6 @@ struct psp_memory_training_context {
 
 	/*vram offset of the c2p training data*/
 	u64 c2p_train_data_offset;
-	struct amdgpu_bo *c2p_bo;
 
 	enum psp_memory_training_init_flag init;
 	u32 training_cnt;
@@ -256,6 +296,7 @@ struct psp_memory_training_context {
 #define PSP_RUNTIME_DB_COOKIE_ID		0x0ed5
 #define PSP_RUNTIME_DB_VER_1			0x0100
 #define PSP_RUNTIME_DB_DIAG_ENTRY_MAX_COUNT	0x40
+#define PSP_RUNTIME_DB_OFFSET_FROM_IP_DISCOVERY_TABLE 0x10000
 
 enum psp_runtime_entry_type {
 	PSP_RUNTIME_ENTRY_TYPE_INVALID		= 0x0,
@@ -317,6 +358,68 @@ struct psp_runtime_scpm_entry {
 	enum psp_runtime_scpm_authentication scpm_status;
 };
 
+#if defined(CONFIG_DEBUG_FS)
+struct spirom_bo {
+	struct amdgpu_bo *bo;
+	uint64_t mc_addr;
+	void *cpu_addr;
+};
+#endif
+
+enum psp_ptl_cmd {
+	PSP_PTL_PERF_MON_QUERY = 0xA0000000,
+	PSP_PTL_PERF_MON_SET = 0xA0000001,
+};
+
+enum psp_ptl_format_type {
+	GFX_FTYPE_I8          = 0x00000000,
+	GFX_FTYPE_F16         = 0x00000001,
+	GFX_FTYPE_BF16        = 0x00000002,
+	GFX_FTYPE_F32         = 0x00000003,
+	GFX_FTYPE_F64         = 0x00000004,
+	GFX_FTYPE_F8          = 0x00000005,
+	GFX_FTYPE_VECTOR      = 0x00000006,
+	GFX_FTYPE_INVALID     = 0xFFFFFFFF,
+};
+
+struct psp_ptl_perf_req {
+	enum psp_ptl_cmd req;
+	uint32_t ptl_state;
+	uint32_t pref_format1;
+	uint32_t pref_format2;
+};
+
+/**
+ * typedef amdgpu_psp_irq_handler_fn - callback for a registered PSP event id
+ * @mgr: IRQ manager
+ * @entry: copy of the IH entry that triggered this event
+ */
+typedef void (*amdgpu_psp_irq_handler_fn)(struct amdgpu_psp_irq_mgr *mgr,
+					  u32 event_id,
+					  struct amdgpu_iv_entry *entry);
+
+/**
+ * struct amdgpu_psp_irq_handler - statically allocated handler node
+ *
+ * Callers define these statically; a single instance can be shared across
+ * multiple devices.  Indexed in &amdgpu_psp_irq_mgr.irq_bh_handlers by @event_id.
+ */
+struct amdgpu_psp_irq_handler {
+	u32				event_id;
+	amdgpu_psp_irq_handler_fn	callback;
+};
+
+/**
+ * struct amdgpu_psp_irq_mgr - deferred dispatch for PSP-driven IH events
+ *
+ * The xarray's own lock serializes handler lookup against registration.
+ */
+struct amdgpu_psp_irq_mgr {
+	struct psp_context		*psp;
+	struct amdgpu_irq_src		irq_src;
+	struct xarray			irq_bh_handlers;
+};
+
 struct psp_context {
 	struct amdgpu_device		*adev;
 	struct psp_ring			km_ring;
@@ -343,6 +446,7 @@ struct psp_context {
 	struct psp_bin_desc		dbg_drv;
 	struct psp_bin_desc		ras_drv;
 	struct psp_bin_desc		ipkeymgr_drv;
+	struct psp_bin_desc		spdm_drv;
 
 	/* tmr buffer */
 	struct amdgpu_bo		*tmr_bo;
@@ -357,15 +461,20 @@ struct psp_context {
 	/* cap firmware */
 	const struct firmware		*cap_fw;
 
+	/* rl firmware */
+	const struct firmware		*rl_fw;
+
 	/* fence buffer */
 	struct amdgpu_bo		*fence_buf_bo;
 	uint64_t			fence_buf_mc_addr;
 	void				*fence_buf;
 
 	/* cmd buffer */
-	struct amdgpu_bo		*cmd_buf_bo;
-	uint64_t			cmd_buf_mc_addr;
-	struct psp_gfx_cmd_resp		*cmd_buf_mem;
+	struct amdgpu_bo		*cmd_resp_buf_bo;
+	uint64_t			cmd_resp_buf_mc_addr;
+	struct psp_gfx_cmd_resp		*cmd_resp_buf_mem;
+	uint64_t			cmd_ext_resp_mc_addr;
+	void				*cmd_ext_resp_mem;
 
 	/* fence value associated with cmd buffer */
 	atomic_t			fence_value;
@@ -380,9 +489,7 @@ struct psp_context {
 	const struct firmware		*ta_fw;
 	uint32_t			ta_fw_version;
 
-	uint32_t			cap_fw_version;
-	uint32_t			cap_feature_version;
-	uint32_t			cap_ucode_size;
+	struct psp_bin_desc		cap;
 
 	struct ta_context		asd_context;
 	struct psp_xgmi_context		xgmi_context;
@@ -403,6 +510,11 @@ struct psp_context {
 	char				*vbflash_tmp_buf;
 	size_t				vbflash_image_size;
 	bool				vbflash_done;
+	struct amdgpu_psp_irq_mgr	irq_mgr;
+#if defined(CONFIG_DEBUG_FS)
+	struct spirom_bo *spirom_dump_trip;
+#endif
+	struct amdgpu_ptl		ptl;
 };
 
 struct amdgpu_psp_funcs {
@@ -434,6 +546,9 @@ struct amdgpu_psp_funcs {
 #define psp_bootloader_load_ipkeymgr_drv(psp) \
 		((psp)->funcs->bootloader_load_ipkeymgr_drv ? \
 		 (psp)->funcs->bootloader_load_ipkeymgr_drv((psp)) : 0)
+#define psp_bootloader_load_spdm_drv(psp) \
+		((psp)->funcs->bootloader_load_spdm_drv ? \
+		 (psp)->funcs->bootloader_load_spdm_drv((psp)) : 0)
 #define psp_bootloader_load_sos(psp) \
 		((psp)->funcs->bootloader_load_sos ? (psp)->funcs->bootloader_load_sos((psp)) : 0)
 #define psp_smu_reload_quirk(psp) \
@@ -458,6 +573,10 @@ struct amdgpu_psp_funcs {
 	((psp)->funcs->update_spirom ? \
 	(psp)->funcs->update_spirom((psp), fw_pri_mc_addr) : -EINVAL)
 
+#define psp_dump_spirom(psp, fw_pri_mc_addr) \
+	((psp)->funcs->dump_spirom ? \
+	(psp)->funcs->dump_spirom((psp), fw_pri_mc_addr) : -EINVAL)
+
 #define psp_vbflash_status(psp) \
 	((psp)->funcs->vbflash_stat ? \
 	(psp)->funcs->vbflash_stat((psp)) : -EINVAL)
@@ -469,6 +588,14 @@ struct amdgpu_psp_funcs {
 #define psp_is_aux_sos_load_required(psp) \
 	((psp)->funcs->is_aux_sos_load_required ? (psp)->funcs->is_aux_sos_load_required((psp)) : 0)
 
+#define psp_reg_program_no_ring(psp, val, id) \
+	((psp)->funcs->reg_program_no_ring ? \
+	(psp)->funcs->reg_program_no_ring((psp), val, id) : -EINVAL)
+
+#define psp_get_fw_type(psp, ucode, type) \
+	((psp)->funcs->get_fw_type ? \
+	(psp)->funcs->get_fw_type(ucode, type):amdgpu_psp_get_fw_type(ucode, type))
+
 extern const struct amd_ip_funcs psp_ip_funcs;
 
 extern const struct amdgpu_ip_block_version psp_v3_1_ip_block;
@@ -479,9 +606,12 @@ extern const struct amdgpu_ip_block_version psp_v12_0_ip_block;
 extern const struct amdgpu_ip_block_version psp_v13_0_ip_block;
 extern const struct amdgpu_ip_block_version psp_v13_0_4_ip_block;
 extern const struct amdgpu_ip_block_version psp_v14_0_ip_block;
+extern const struct amdgpu_ip_block_version psp_v15_0_ip_block;
+extern const struct amdgpu_ip_block_version psp_v15_0_3_ip_block;
+extern const struct amdgpu_ip_block_version psp_v15_0_8_ip_block;
 
-extern int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
-			uint32_t field_val, uint32_t mask, bool check_changed);
+int psp_wait_for(struct psp_context *psp, uint32_t reg_index,
+		 uint32_t field_val, uint32_t mask, uint32_t flags);
 extern int psp_wait_for_spirom_update(struct psp_context *psp, uint32_t reg_index,
 			uint32_t field_val, uint32_t mask, uint32_t msec_timeout);
 
@@ -500,6 +630,7 @@ int psp_ta_invoke(struct psp_context *psp,
 			struct ta_context *context);
 
 int psp_xgmi_initialize(struct psp_context *psp, bool set_extended_data, bool load_ta);
+bool psp_is_xgmi_ta_supported(struct psp_context *psp);
 int psp_xgmi_terminate(struct psp_context *psp);
 int psp_xgmi_invoke(struct psp_context *psp, uint32_t ta_cmd_id);
 int psp_xgmi_get_hive_id(struct psp_context *psp, uint64_t *hive_id);
@@ -547,10 +678,10 @@ int psp_init_cap_microcode(struct psp_context *psp,
 			  const char *chip_name);
 int psp_get_fw_attestation_records_addr(struct psp_context *psp,
 					uint64_t *output_ptr);
-
+int psp_update_fw_reservation(struct psp_context *psp);
 int psp_load_fw_list(struct psp_context *psp,
 		     struct amdgpu_firmware_info **ucode_list, int ucode_count);
-void psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size);
+int psp_copy_fw(struct psp_context *psp, uint8_t *start_addr, uint32_t bin_size);
 
 int psp_spatial_partition(struct psp_context *psp, int mode);
 int psp_memory_partition(struct psp_context *psp, int mode);
@@ -563,5 +694,45 @@ bool amdgpu_psp_get_ras_capability(struct psp_context *psp);
 int psp_config_sq_perfmon(struct psp_context *psp, uint32_t xcp_id,
 	bool core_override_enable, bool reg_override_enable, bool perfmon_override_enable);
 bool amdgpu_psp_tos_reload_needed(struct amdgpu_device *adev);
+int amdgpu_psp_reg_program_no_ring(struct psp_context *psp, uint32_t val,
+				   enum psp_reg_prog_id id);
+void amdgpu_psp_debugfs_init(struct amdgpu_device *adev);
+int amdgpu_psp_get_fw_type(struct amdgpu_firmware_info *ucode,
+			   enum psp_gfx_fw_type *type);
+int psp_set_mmhub_eco_sec_level(struct amdgpu_device *adev);
+int psp_init_rl_microcode(struct psp_context *psp, const char *chip_name);
+
+void amdgpu_psp_irq_mgr_dispatch(struct amdgpu_psp_irq_mgr *mgr,
+				 struct amdgpu_iv_entry *entry);
+int amdgpu_psp_irq_mgr_register(
+	struct amdgpu_psp_irq_mgr *mgr,
+	const struct amdgpu_psp_irq_handler *handlers, int count,
+	const struct amdgpu_psp_irq_handler *default_handler);
+
+struct amdgpu_ualink_info;
+struct amdgpu_ualink_ppod_setup;
+struct amdgpu_ualink_vpod_config;
+struct amdgpu_ualink_station_config;
+
+int psp_ual_get_interface_version(struct psp_context *psp, uint32_t *intf_ver);
+
+int psp_ual_query_info(struct psp_context *psp, uint32_t intf_ver,
+		       struct amdgpu_ualink_info *info,
+		       enum psp_gfx_ual_config_state *cfg_state);
+
+int psp_ual_set_ppod_config(struct psp_context *psp, uint32_t intf_ver,
+			    const struct amdgpu_ualink_ppod_setup *setup);
+
+int psp_ual_set_vpod_config(struct psp_context *psp, uint32_t intf_ver,
+			    const struct amdgpu_ualink_vpod_config *config);
+
+int psp_ual_set_station_config(struct psp_context *psp, uint32_t intf_ver,
+			       const struct amdgpu_ualink_station_config *stations);
+
+int psp_ual_set_npa_config(struct psp_context *psp, uint32_t intf_ver,
+			   unsigned int vmid, bool enable);
+
+int psp_ual_send_completion(struct psp_context *psp, uint32_t intf_ver,
+			    uint32_t cmd_id, uint32_t status);
 
 #endif

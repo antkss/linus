@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Based on the same principle as kgdboe using the NETPOLL api, this
- * driver uses a console polling api to implement a gdb serial inteface
+ * driver uses a console polling api to implement a gdb serial interface
  * which is multiplexed on a console port.
  *
  * Maintainer: Jason Wessel <jason.wessel@windriver.com>
@@ -186,10 +186,13 @@ static void cleanup_kgdboc(void)
 	if (configured != 1)
 		return;
 
-	if (kgdb_unregister_nmi_console())
-		return;
 	kgdboc_unregister_kbd();
 	kgdb_unregister_io_module(&kgdboc_io_ops);
+
+	if (kgdb_tty_driver) {
+		tty_driver_kref_put(kgdb_tty_driver);
+		kgdb_tty_driver = NULL;
+	}
 }
 
 static int configure_kgdboc(void)
@@ -250,18 +253,16 @@ do_register:
 	if (err)
 		goto noconfig;
 
-	err = kgdb_register_nmi_console();
-	if (err)
-		goto nmi_con_failed;
-
 	configured = 1;
 
 	return 0;
 
-nmi_con_failed:
-	kgdb_unregister_io_module(&kgdboc_io_ops);
 noconfig:
 	kgdboc_unregister_kbd();
+	if (kgdb_tty_driver) {
+		tty_driver_kref_put(kgdb_tty_driver);
+		kgdb_tty_driver = NULL;
+	}
 	configured = 0;
 
 	return err;
@@ -371,7 +372,7 @@ static int param_set_kgdboc_var(const char *kmessage,
 
 	mutex_lock(&config_mutex);
 
-	strcpy(config, kmessage);
+	strscpy(config, kmessage);
 	/* Chop out \n char as a result of echo */
 	if (len && config[len - 1] == '\n')
 		config[len - 1] = '\0';
@@ -585,7 +586,6 @@ static int __init kgdboc_earlycon_init(char *opt)
 	console_list_lock();
 	for_each_console(con) {
 		if (con->write && con->read &&
-		    (con->flags & (CON_BOOT | CON_ENABLED)) &&
 		    (!opt || !opt[0] || strcmp(con->name, opt) == 0))
 			break;
 	}

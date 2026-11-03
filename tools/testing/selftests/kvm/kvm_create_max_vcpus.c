@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/resource.h>
 
 #include "test_util.h"
 
@@ -39,36 +38,17 @@ int main(int argc, char *argv[])
 {
 	int kvm_max_vcpu_id = kvm_check_cap(KVM_CAP_MAX_VCPU_ID);
 	int kvm_max_vcpus = kvm_check_cap(KVM_CAP_MAX_VCPUS);
+
 	/*
-	 * Number of file descriptors reqired, KVM_CAP_MAX_VCPUS for vCPU fds +
-	 * an arbitrary number for everything else.
+	 * PowerPC's PAPR L0 does not guarantee KVM_CAP_MAX_VCPUS when running
+	 * on pseries LPAR (nested kvm-on-powervm).
 	 */
-	int nr_fds_wanted = kvm_max_vcpus + 100;
-	struct rlimit rl;
+	TEST_REQUIRE(!kvm_is_ppc_pseries_lpar());
 
 	pr_info("KVM_CAP_MAX_VCPU_ID: %d\n", kvm_max_vcpu_id);
 	pr_info("KVM_CAP_MAX_VCPUS: %d\n", kvm_max_vcpus);
 
-	/*
-	 * Check that we're allowed to open nr_fds_wanted file descriptors and
-	 * try raising the limits if needed.
-	 */
-	TEST_ASSERT(!getrlimit(RLIMIT_NOFILE, &rl), "getrlimit() failed!");
-
-	if (rl.rlim_cur < nr_fds_wanted) {
-		rl.rlim_cur = nr_fds_wanted;
-		if (rl.rlim_max < nr_fds_wanted) {
-			int old_rlim_max = rl.rlim_max;
-			rl.rlim_max = nr_fds_wanted;
-
-			int r = setrlimit(RLIMIT_NOFILE, &rl);
-			__TEST_REQUIRE(r >= 0,
-				       "RLIMIT_NOFILE hard limit is too low (%d, wanted %d)",
-				       old_rlim_max, nr_fds_wanted);
-		} else {
-			TEST_ASSERT(!setrlimit(RLIMIT_NOFILE, &rl), "setrlimit() failed!");
-		}
-	}
+	kvm_set_files_rlimit(kvm_max_vcpus);
 
 	/*
 	 * Upstream KVM prior to 4.8 does not support KVM_CAP_MAX_VCPU_ID.
@@ -84,7 +64,13 @@ int main(int argc, char *argv[])
 
 	test_vcpu_creation(0, kvm_max_vcpus);
 
-	if (kvm_max_vcpu_id > kvm_max_vcpus)
+	/*
+	 * Skip the vCPU ID test when running on PowerPC with SMT support, in
+	 * which case system topology is encoded into the vCPU ID and so a VM
+	 * can't use the full advertised vCPU ID range without crafting a valid
+	 * platform specific topology.
+	 */
+	if (kvm_max_vcpu_id > kvm_max_vcpus && !kvm_check_cap(KVM_CAP_PPC_SMT))
 		test_vcpu_creation(
 			kvm_max_vcpu_id - kvm_max_vcpus, kvm_max_vcpus);
 

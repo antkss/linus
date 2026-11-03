@@ -2832,7 +2832,7 @@ netxen_sysfs_validate_crb(struct netxen_adapter *adapter,
 
 static ssize_t
 netxen_sysfs_read_crb(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *attr,
+		const struct bin_attribute *attr,
 		char *buf, loff_t offset, size_t size)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -2860,7 +2860,7 @@ netxen_sysfs_read_crb(struct file *filp, struct kobject *kobj,
 
 static ssize_t
 netxen_sysfs_write_crb(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *attr,
+		const struct bin_attribute *attr,
 		char *buf, loff_t offset, size_t size)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -2901,7 +2901,7 @@ netxen_sysfs_validate_mem(struct netxen_adapter *adapter,
 
 static ssize_t
 netxen_sysfs_read_mem(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *attr,
+		const struct bin_attribute *attr,
 		char *buf, loff_t offset, size_t size)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -2922,7 +2922,7 @@ netxen_sysfs_read_mem(struct file *filp, struct kobject *kobj,
 }
 
 static ssize_t netxen_sysfs_write_mem(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *attr, char *buf,
+		const struct bin_attribute *attr, char *buf,
 		loff_t offset, size_t size)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -2959,7 +2959,7 @@ static const struct bin_attribute bin_attr_mem = {
 
 static ssize_t
 netxen_sysfs_read_dimm(struct file *filp, struct kobject *kobj,
-		struct bin_attribute *attr,
+		const struct bin_attribute *attr,
 		char *buf, loff_t offset, size_t size)
 {
 	struct device *dev = kobj_to_dev(kobj);
@@ -3198,7 +3198,7 @@ netxen_list_config_ip(struct netxen_adapter *adapter,
 				goto out;
 		}
 
-		cur = kzalloc(sizeof(struct nx_ip_list), GFP_ATOMIC);
+		cur = kzalloc_obj(struct nx_ip_list, GFP_ATOMIC);
 		if (cur == NULL)
 			goto out;
 		if (is_vlan_dev(dev))
@@ -3447,13 +3447,24 @@ static struct pci_driver netxen_driver = {
 
 static int __init netxen_init_module(void)
 {
+	int ret;
+
 	printk(KERN_INFO "%s\n", netxen_nic_driver_string);
 
 #ifdef CONFIG_INET
 	register_netdevice_notifier(&netxen_netdev_cb);
 	register_inetaddr_notifier(&netxen_inetaddr_cb);
 #endif
-	return pci_register_driver(&netxen_driver);
+
+	ret = pci_register_driver(&netxen_driver);
+#ifdef CONFIG_INET
+	if (ret) {
+		unregister_inetaddr_notifier(&netxen_inetaddr_cb);
+		unregister_netdevice_notifier(&netxen_netdev_cb);
+	}
+#endif
+
+	return ret;
 }
 
 module_init(netxen_init_module);

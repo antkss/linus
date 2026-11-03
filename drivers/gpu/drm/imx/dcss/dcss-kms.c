@@ -3,16 +3,17 @@
  * Copyright 2019 NXP.
  */
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_bridge.h>
 #include <drm/drm_bridge_connector.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_dma.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_of.h>
+#include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -34,7 +35,6 @@ static const struct drm_driver dcss_kms_driver = {
 	.fops			= &dcss_cma_fops,
 	.name			= "imx-dcss",
 	.desc			= "i.MX8MQ Display Subsystem",
-	.date			= "20190917",
 	.major			= 1,
 	.minor			= 0,
 	.patchlevel		= 0,
@@ -78,6 +78,9 @@ static int dcss_kms_bridge_connector_init(struct dcss_kms_dev *kms)
 	if (ret)
 		return ret;
 
+	if (panel)
+		drm_panel_put(panel);
+
 	if (!bridge) {
 		dev_err(ddev->dev, "No bridge found %d.\n", ret);
 		return -ENODEV;
@@ -103,8 +106,6 @@ static int dcss_kms_bridge_connector_init(struct dcss_kms_dev *kms)
 		dev_err(ddev->dev, "Unable to create bridge connector.\n");
 		return PTR_ERR(kms->connector);
 	}
-
-	drm_connector_attach_encoder(kms->connector, encoder);
 
 	return 0;
 }

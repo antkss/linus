@@ -146,10 +146,33 @@ integrity:<bytes>:<type>
     integrity for the encrypted device. The additional space is then
     used for storing authentication tag (and persistent IV if needed).
 
+integrity_key_size:<bytes>
+    Optionally set the integrity key size if it differs from the digest size.
+    It allows the use of wrapped key algorithms where the key size is
+    independent of the cryptographic key size.
+
 sector_size:<bytes>
     Use <bytes> as the encryption unit instead of 512 bytes sectors.
-    This option can be in range 512 - 4096 bytes and must be power of two.
+    This option can be in range 512 - PAGE_SIZE bytes, further limited by
+    the block layer's maximum block size, and must be power of two.
     Virtual device will announce this size as a minimal IO and logical sector.
+
+    An encryption unit larger than 4096 bytes can only be used on a system
+    whose PAGE_SIZE is at least that large, so such a mapping is not
+    portable across architectures and is unsuitable for portable on-disk
+    formats such as LUKS.
+
+    An encryption sector larger than the unit the underlying device writes
+    atomically can be torn by a power failure, leaving part of the sector
+    written and part not. A device that advertises no atomic write unit
+    gives no such guarantee beyond a single logical block, so this is
+    already possible at 4096 bytes; a larger sector widens the window.
+    With XTS and ECB the torn sector decrypts to a mixture of old and new
+    data, as a torn write does on an unencrypted device. With chaining
+    modes the block at the tear also decrypts to garbage, with AEAD the
+    whole sector fails authentication, and with the wide-block diffusers
+    the whole sector decrypts to garbage. Use a large sector only where
+    losing a sector to a power failure is acceptable.
 
 iv_large_sectors
    IV generators will use sector number counted in <sector_size> units

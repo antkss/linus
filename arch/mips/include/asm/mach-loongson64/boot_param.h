@@ -24,7 +24,7 @@
 struct efi_memory_map_loongson {
 	u16 vers;	/* version of efi_memory_map */
 	u32 nr_map;	/* number of memory_maps */
-	u32 mem_freq;	/* memory frequence */
+	u32 mem_freq;	/* memory frequency */
 	struct mem_map {
 		u32 node_id;	/* node_id which memory attached to */
 		u32 mem_type;	/* system memory, pci memory, pci io, etc. */
@@ -128,10 +128,10 @@ struct irq_source_routing_table {
 } __packed;
 
 struct interface_info {
-	u16 vers; /* version of the specificition */
-	u16 size;
-	u8  flag;
-	char description[64];
+	u16 vers; /* version of the specification */
+	u16 size; /* size of this interface */
+	u8  flag; /* used or unused */
+	char description[64]; /* description for each change */
 } __packed;
 
 #define MAX_RESOURCE_NUMBER 128

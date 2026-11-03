@@ -30,6 +30,7 @@
 #include <linux/io.h>
 #include <linux/clk.h>
 #include <linux/err.h>
+#include <linux/stringify.h>
 #include <asm/watchdog.h>
 
 #define DRV_NAME "sh-wdt"
@@ -129,7 +130,7 @@ static int sh_wdt_stop(struct watchdog_device *wdt_dev)
 
 	spin_lock_irqsave(&wdt->lock, flags);
 
-	del_timer(&wdt->timer);
+	timer_delete(&wdt->timer);
 
 	csr = sh_wdt_read_csr();
 	csr &= ~WTCSR_TME;
@@ -173,7 +174,7 @@ static int sh_wdt_set_heartbeat(struct watchdog_device *wdt_dev, unsigned t)
 
 static void sh_wdt_ping(struct timer_list *t)
 {
-	struct sh_wdt *wdt = from_timer(wdt, t, timer);
+	struct sh_wdt *wdt = timer_container_of(wdt, t, timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&wdt->lock, flags);
@@ -329,14 +330,14 @@ MODULE_ALIAS("platform:" DRV_NAME);
 module_param(clock_division_ratio, int, 0);
 MODULE_PARM_DESC(clock_division_ratio,
 	"Clock division ratio. Valid ranges are from 0x5 (1.31ms) "
-	"to 0x7 (5.25ms). (default=" __MODULE_STRING(WTCSR_CKS_4096) ")");
+	"to 0x7 (5.25ms). (default=" __stringify(WTCSR_CKS_4096) ")");
 
 module_param(heartbeat, int, 0);
 MODULE_PARM_DESC(heartbeat,
 	"Watchdog heartbeat in seconds. (1 <= heartbeat <= 3600, default="
-				__MODULE_STRING(WATCHDOG_HEARTBEAT) ")");
+				__stringify(WATCHDOG_HEARTBEAT) ")");
 
 module_param(nowayout, bool, 0);
 MODULE_PARM_DESC(nowayout,
 	"Watchdog cannot be stopped once started (default="
-				__MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
+				__stringify(WATCHDOG_NOWAYOUT) ")");

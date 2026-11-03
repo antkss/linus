@@ -3,15 +3,9 @@
 #include <vmlinux.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-#include "../bpf_testmod/bpf_testmod.h"
+#include "../test_kmods/bpf_testmod.h"
 
 char _license[] SEC("license") = "GPL";
-
-#if defined(__TARGET_ARCH_x86)
-bool skip __attribute((__section__(".data"))) = false;
-#else
-bool skip = true;
-#endif
 
 void bpf_testmod_ops3_call_test_2(void) __ksym;
 

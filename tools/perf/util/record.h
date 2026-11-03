@@ -28,6 +28,7 @@ struct record_opts {
 	bool	      sample_time_set;
 	bool	      sample_cpu;
 	bool	      sample_identifier;
+	bool	      sample_data_src;
 	bool	      period;
 	bool	      period_set;
 	bool	      running_time;
@@ -39,6 +40,8 @@ struct record_opts {
 	bool	      record_cgroup;
 	bool	      record_switch_events;
 	bool	      record_switch_events_set;
+	bool	      record_data_mmap;
+	bool	      record_data_mmap_set;
 	bool	      all_kernel;
 	bool	      all_user;
 	bool	      kernel_callchains;
@@ -59,6 +62,13 @@ struct record_opts {
 	u64	      branch_stack;
 	u64	      sample_intr_regs;
 	u64	      sample_user_regs;
+	u16	      sample_simd_regs_enabled;
+	u16	      sample_vec_reg_qwords;
+	u16	      sample_pred_reg_qwords;
+	u32	      sample_intr_pred_regs;
+	u32	      sample_user_pred_regs;
+	u64	      sample_intr_vec_regs;
+	u64	      sample_user_vec_regs;
 	u64	      default_interval;
 	u64	      user_interval;
 	size_t	      auxtrace_snapshot_size;
@@ -79,6 +89,7 @@ struct record_opts {
 	int	      synth;
 	int	      threads_spec;
 	const char    *threads_user_spec;
+	u64	      off_cpu_thresh_ns;
 };
 
 extern const char * const *record_usage;

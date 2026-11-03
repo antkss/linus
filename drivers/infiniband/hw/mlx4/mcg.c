@@ -43,7 +43,7 @@
 
 #define MAX_VFS		80
 #define MAX_PEND_REQS_PER_FUNC 4
-#define MAD_TIMEOUT_MS	2000
+#define MAD_TIMEOUT_SEC	2
 
 #define mcg_warn(fmt, arg...)	pr_warn("MCG WARNING: " fmt, ##arg)
 #define mcg_error(fmt, arg...)	pr_err(fmt, ##arg)
@@ -270,7 +270,7 @@ static int send_join_to_wire(struct mcast_group *group, struct ib_sa_mad *sa_mad
 	if (!ret) {
 		/* calls mlx4_ib_mcg_timeout_handler */
 		queue_delayed_work(group->demux->mcg_wq, &group->timeout_work,
-				msecs_to_jiffies(MAD_TIMEOUT_MS));
+				   secs_to_jiffies(MAD_TIMEOUT_SEC));
 	}
 
 	return ret;
@@ -309,7 +309,7 @@ static int send_leave_to_wire(struct mcast_group *group, u8 join_state)
 	if (!ret) {
 		/* calls mlx4_ib_mcg_timeout_handler */
 		queue_delayed_work(group->demux->mcg_wq, &group->timeout_work,
-				msecs_to_jiffies(MAD_TIMEOUT_MS));
+				   secs_to_jiffies(MAD_TIMEOUT_SEC));
 	}
 
 	return ret;
@@ -433,7 +433,7 @@ static u16 cmp_rec(struct ib_sa_mcmember_data *src,
 }
 
 /* release group, return 1 if this was last release and group is destroyed
- * timout work is canceled sync */
+ * timeout work is canceled sync */
 static int release_group(struct mcast_group *group, int from_timeout_handler)
 {
 	struct mlx4_ib_demux_ctx *ctx = group->demux;
@@ -694,7 +694,7 @@ static void mlx4_ib_mcg_work_handler(struct work_struct *work)
 			cur_join_state = group->rec.scope_join_state & 0xf;
 
 			if (method == IB_MGMT_METHOD_GET_RESP) {
-				/* successfull join */
+				/* successful join */
 				if (!cur_join_state && resp_join_state)
 					--rc;
 			} else if (!resp_join_state)
@@ -824,7 +824,7 @@ static struct mcast_group *acquire_group(struct mlx4_ib_demux_ctx *ctx,
 	if (!create)
 		return ERR_PTR(-ENOENT);
 
-	group = kzalloc(sizeof(*group), GFP_KERNEL);
+	group = kzalloc_obj(*group);
 	if (!group)
 		return ERR_PTR(-ENOMEM);
 
@@ -946,7 +946,7 @@ int mlx4_ib_mcg_multiplex_handler(struct ib_device *ibdev, int port,
 		may_create = 1;
 		fallthrough;
 	case IB_SA_METHOD_DELETE:
-		req = kzalloc(sizeof *req, GFP_KERNEL);
+		req = kzalloc_obj(*req);
 		if (!req)
 			return -ENOMEM;
 
@@ -1091,7 +1091,7 @@ static void _mlx4_ib_mcg_port_cleanup(struct mlx4_ib_demux_ctx *ctx, int destroy
 	for (i = 0; i < MAX_VFS; ++i)
 		clean_vf_mcast(ctx, i);
 
-	end = jiffies + msecs_to_jiffies(MAD_TIMEOUT_MS + 3000);
+	end = jiffies + secs_to_jiffies(MAD_TIMEOUT_SEC + 3);
 	do {
 		count = 0;
 		mutex_lock(&ctx->mcg_table_lock);
@@ -1150,7 +1150,7 @@ void mlx4_ib_mcg_port_cleanup(struct mlx4_ib_demux_ctx *ctx, int destroy_wq)
 		return;
 	}
 
-	work = kmalloc(sizeof *work, GFP_KERNEL);
+	work = kmalloc_obj(*work);
 	if (!work) {
 		ctx->flushing = 0;
 		return;
@@ -1211,7 +1211,7 @@ static int push_deleteing_req(struct mcast_group *group, int slave)
 	if (!group->func[slave].join_state)
 		return 0;
 
-	req = kzalloc(sizeof *req, GFP_KERNEL);
+	req = kzalloc_obj(*req);
 	if (!req)
 		return -ENOMEM;
 

@@ -146,7 +146,7 @@ static int ingenic_battery_probe(struct platform_device *pdev)
 	desc->num_properties = ARRAY_SIZE(ingenic_battery_properties);
 	desc->get_property = ingenic_battery_get_property;
 	psy_cfg.drv_data = bat;
-	psy_cfg.of_node = dev->of_node;
+	psy_cfg.fwnode = dev_fwnode(dev);
 
 	bat->battery = devm_power_supply_register(dev, desc, &psy_cfg);
 	if (IS_ERR(bat->battery))
@@ -190,3 +190,4 @@ module_platform_driver(ingenic_battery_driver);
 MODULE_DESCRIPTION("Battery driver for Ingenic JZ47xx SoCs");
 MODULE_AUTHOR("Artur Rojek <contact@artur-rojek.eu>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("IIO_CONSUMER");

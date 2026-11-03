@@ -156,9 +156,9 @@ static void ser_state_run(struct rtw89_ser *ser, u8 evt)
 	rtw89_debug(rtwdev, RTW89_DBG_SER, "ser: %s receive %s\n",
 		    ser_st_name(ser), ser_ev_name(ser, evt));
 
-	mutex_lock(&rtwdev->mutex);
+	wiphy_lock(rtwdev->hw->wiphy);
 	rtw89_leave_lps(rtwdev);
-	mutex_unlock(&rtwdev->mutex);
+	wiphy_unlock(rtwdev->hw->wiphy);
 
 	ser->st_tbl[ser->state].st_func(ser, evt);
 }
@@ -205,13 +205,12 @@ static void rtw89_ser_hdl_work(struct work_struct *work)
 
 static int ser_send_msg(struct rtw89_ser *ser, u8 event)
 {
-	struct rtw89_dev *rtwdev = container_of(ser, struct rtw89_dev, ser);
 	struct ser_msg *msg = NULL;
 
 	if (test_bit(RTW89_SER_DRV_STOP_RUN, ser->flags))
 		return -EIO;
 
-	msg = kmalloc(sizeof(*msg), GFP_ATOMIC);
+	msg = kmalloc_obj(*msg, GFP_ATOMIC);
 	if (!msg)
 		return -ENOMEM;
 
@@ -221,7 +220,7 @@ static int ser_send_msg(struct rtw89_ser *ser, u8 event)
 	list_add(&msg->list, &ser->msg_q);
 	spin_unlock_irq(&ser->msg_q_lock);
 
-	ieee80211_queue_work(rtwdev->hw, &ser->ser_hdl_work);
+	schedule_work(&ser->ser_hdl_work);
 	return 0;
 }
 
@@ -309,6 +308,9 @@ static void ser_reset_vif(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 		rtw89_core_release_bit_map(rtwdev->hw_port, rtwvif_link->port);
 		rtwvif_link->net_type = RTW89_NET_TYPE_NO_LINK;
 		rtwvif_link->trigger = false;
+		rtwvif_link->rand_tsf_done = false;
+
+		rtw89_p2p_noa_once_deinit(rtwvif_link);
 	}
 }
 
@@ -325,6 +327,8 @@ static void ser_sta_deinit_cam_iter(void *data, struct ieee80211_sta *sta)
 	if (rtwvif != target_rtwvif)
 		return;
 
+	INIT_LIST_HEAD(&rtwsta->ba_cam_list);
+
 	rtw89_sta_for_each_link(rtwsta, rtwsta_link, link_id) {
 		rtwvif_link = rtwsta_link->rtwvif_link;
 
@@ -332,8 +336,6 @@ static void ser_sta_deinit_cam_iter(void *data, struct ieee80211_sta *sta)
 			rtw89_cam_deinit_addr_cam(rtwdev, &rtwsta_link->addr_cam);
 		if (sta->tdls)
 			rtw89_cam_deinit_bssid_cam(rtwdev, &rtwsta_link->bssid_cam);
-
-		INIT_LIST_HEAD(&rtwsta_link->ba_cam_list);
 	}
 }
 
@@ -352,6 +354,14 @@ static void ser_deinit_cam(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif)
 	bitmap_zero(rtwdev->cam_info.ba_cam_map, RTW89_MAX_BA_CAM_NUM);
 }
 
+static void ser_reset_assoc_links(struct rtw89_dev *rtwdev)
+{
+	for (int i = 0; i < RTW89_MAX_MAC_ID_NUM; i++)
+		rcu_assign_pointer(rtwdev->assoc_link_on_macid[i], NULL);
+
+	synchronize_rcu();
+}
+
 static void ser_reset_mac_binding(struct rtw89_dev *rtwdev)
 {
 	struct rtw89_vif *rtwvif;
@@ -360,11 +370,13 @@ static void ser_reset_mac_binding(struct rtw89_dev *rtwdev)
 	rtw89_for_each_rtwvif(rtwdev, rtwvif)
 		ser_deinit_cam(rtwdev, rtwvif);
 
+	ser_reset_assoc_links(rtwdev);
 	rtw89_core_release_all_bits_map(rtwdev->mac_id_map, RTW89_MAX_MAC_ID_NUM);
 	rtw89_for_each_rtwvif(rtwdev, rtwvif)
 		ser_reset_vif(rtwdev, rtwvif);
 
 	rtwdev->total_sta_assoc = 0;
+	refcount_set(&rtwdev->refcount_ap_info, 0);
 }
 
 /* hal function */
@@ -428,6 +440,14 @@ static void hal_send_m4_event(struct rtw89_ser *ser)
 	rtw89_mac_set_err_status(rtwdev, MAC_AX_ERR_L1_RCVY_EN);
 }
 
+static void hal_enable_err_imr(struct rtw89_ser *ser)
+{
+	struct rtw89_dev *rtwdev = container_of(ser, struct rtw89_dev, ser);
+	const struct rtw89_mac_gen_def *mac = rtwdev->chip->mac_def;
+
+	mac->err_imr_ctrl(rtwdev, true);
+}
+
 /* state handler */
 static void ser_idle_st_hdl(struct rtw89_ser *ser, u8 evt)
 {
@@ -482,10 +502,15 @@ static void ser_l1_reset_pre_st_hdl(struct rtw89_ser *ser, u8 evt)
 static void ser_reset_trx_st_hdl(struct rtw89_ser *ser, u8 evt)
 {
 	struct rtw89_dev *rtwdev = container_of(ser, struct rtw89_dev, ser);
+	struct wiphy *wiphy = rtwdev->hw->wiphy;
 
 	switch (evt) {
 	case SER_EV_STATE_IN:
-		cancel_delayed_work_sync(&rtwdev->track_work);
+		wiphy_lock(wiphy);
+		ser->sw_cnt.l1++;
+		wiphy_delayed_work_cancel(wiphy, &rtwdev->track_work);
+		wiphy_delayed_work_cancel(wiphy, &rtwdev->track_ps_work);
+		wiphy_unlock(wiphy);
 		drv_stop_tx(ser);
 
 		if (hal_stop_dma(ser)) {
@@ -494,7 +519,9 @@ static void ser_reset_trx_st_hdl(struct rtw89_ser *ser, u8 evt)
 		}
 
 		drv_stop_rx(ser);
+		wiphy_lock(wiphy);
 		drv_trx_reset(ser);
+		wiphy_unlock(wiphy);
 
 		/* wait m3 */
 		hal_send_m2_event(ser);
@@ -516,8 +543,10 @@ static void ser_reset_trx_st_hdl(struct rtw89_ser *ser, u8 evt)
 		hal_enable_dma(ser);
 		drv_resume_rx(ser);
 		drv_resume_tx(ser);
-		ieee80211_queue_delayed_work(rtwdev->hw, &rtwdev->track_work,
-					     RTW89_TRACK_WORK_PERIOD);
+		wiphy_delayed_work_queue(wiphy, &rtwdev->track_work,
+					 RTW89_TRACK_WORK_PERIOD);
+		wiphy_delayed_work_queue(wiphy, &rtwdev->track_ps_work,
+					 RTW89_TRACK_PS_WORK_PERIOD);
 		break;
 
 	default:
@@ -541,6 +570,8 @@ static void ser_do_hci_st_hdl(struct rtw89_ser *ser, u8 evt)
 		break;
 
 	case SER_EV_MAC_RESET_DONE:
+		hal_enable_err_imr(ser);
+
 		ser_state_goto(ser, SER_IDLE_ST);
 		break;
 
@@ -559,21 +590,22 @@ static void ser_mac_mem_dump(struct rtw89_dev *rtwdev, u8 *buf,
 	const struct rtw89_mac_gen_def *mac = rtwdev->chip->mac_def;
 	u32 filter_model_addr = mac->filter_model_addr;
 	u32 indir_access_addr = mac->indir_access_addr;
+	u32 mem_page_size = mac->mem_page_size;
 	u32 *ptr = (u32 *)buf;
 	u32 base_addr, start_page, residue;
 	u32 cnt = 0;
 	u32 i;
 
-	start_page = start_addr / MAC_MEM_DUMP_PAGE_SIZE;
-	residue = start_addr % MAC_MEM_DUMP_PAGE_SIZE;
-	base_addr = mac->mem_base_addrs[sel];
-	base_addr += start_page * MAC_MEM_DUMP_PAGE_SIZE;
+	start_page = start_addr / mem_page_size;
+	residue = start_addr % mem_page_size;
+	base_addr = rtw89_mac_mem_base_addrs(rtwdev, sel);
+	base_addr += start_page * mem_page_size;
 
 	while (cnt < len) {
 		rtw89_write32(rtwdev, filter_model_addr, base_addr);
 
 		for (i = indir_access_addr + residue;
-		     i < indir_access_addr + MAC_MEM_DUMP_PAGE_SIZE;
+		     i < indir_access_addr + mem_page_size;
 		     i += 4, ptr++) {
 			*ptr = rtw89_read32(rtwdev, i);
 			cnt += 4;
@@ -582,7 +614,7 @@ static void ser_mac_mem_dump(struct rtw89_dev *rtwdev, u8 *buf,
 		}
 
 		residue = 0;
-		base_addr += MAC_MEM_DUMP_PAGE_SIZE;
+		base_addr += mem_page_size;
 	}
 }
 
@@ -707,9 +739,10 @@ static void ser_l2_reset_st_hdl(struct rtw89_ser *ser, u8 evt)
 
 	switch (evt) {
 	case SER_EV_STATE_IN:
-		mutex_lock(&rtwdev->mutex);
+		wiphy_lock(rtwdev->hw->wiphy);
+		ser->sw_cnt.l2++;
 		ser_l2_reset_st_pre_hdl(ser);
-		mutex_unlock(&rtwdev->mutex);
+		wiphy_unlock(rtwdev->hw->wiphy);
 
 		ieee80211_restart_hw(rtwdev->hw);
 		ser_set_alarm(ser, SER_RECFG_TIMEOUT, SER_EV_L2_RECFG_TIMEOUT);

@@ -15,6 +15,9 @@ v1 is available under :ref:`Documentation/admin-guide/cgroup-v1/index.rst <cgrou
 
 .. CONTENTS
 
+   [Whenever any new section is added to this document, please also add
+    an entry here.]
+
    1. Introduction
      1-1. Terminology
      1-2. What is cgroup?
@@ -25,9 +28,10 @@ v1 is available under :ref:`Documentation/admin-guide/cgroup-v1/index.rst <cgrou
        2-2-2. Threads
      2-3. [Un]populated Notification
      2-4. Controlling Controllers
-       2-4-1. Enabling and Disabling
-       2-4-2. Top-down Constraint
-       2-4-3. No Internal Process Constraint
+       2-4-1. Availability
+       2-4-2. Enabling and Disabling
+       2-4-3. Top-down Constraint
+       2-4-4. No Internal Process Constraint
      2-5. Delegation
        2-5-1. Model of Delegation
        2-5-2. Delegation Containment
@@ -49,7 +53,8 @@ v1 is available under :ref:`Documentation/admin-guide/cgroup-v1/index.rst <cgrou
      5-2. Memory
        5-2-1. Memory Interface Files
        5-2-2. Usage Guidelines
-       5-2-3. Memory Ownership
+       5-2-3. Reclaim Protection
+       5-2-4. Memory Ownership
      5-3. IO
        5-3-1. IO Interface Files
        5-3-2. Writeback
@@ -61,16 +66,18 @@ v1 is available under :ref:`Documentation/admin-guide/cgroup-v1/index.rst <cgrou
        5-4-1. PID Interface Files
      5-5. Cpuset
        5.5-1. Cpuset Interface Files
-     5-6. Device
+     5-6. Device controller
      5-7. RDMA
        5-7-1. RDMA Interface Files
-     5-8. HugeTLB
-       5.8-1. HugeTLB Interface Files
-     5-9. Misc
-       5.9-1 Miscellaneous cgroup Interface Files
-       5.9-2 Migration and Ownership
-     5-10. Others
-       5-10-1. perf_event
+     5-8. DMEM
+       5-8-1. DMEM Interface Files
+     5-9. HugeTLB
+       5.9-1. HugeTLB Interface Files
+     5-10. Misc
+       5.10-1 Misc Interface Files
+       5.10-2 Migration and Ownership
+     5-11. Others
+       5-11-1. perf_event
      5-N. Non-normative information
        5-N-1. CPU controller root cgroup process behaviour
        5-N-2. IO controller root cgroup process behaviour
@@ -213,7 +220,7 @@ cgroup v2 currently supports the following mount options.
   memory_hugetlb_accounting
         Count HugeTLB memory usage towards the cgroup's overall
         memory usage for the memory controller (for the purpose of
-        statistics reporting and memory protetion). This is a new
+        statistics reporting and memory protection). This is a new
         behavior that could regress existing setups, so it must be
         explicitly opted in with this mount option.
 
@@ -433,6 +440,15 @@ both cgroups.
 
 Controlling Controllers
 -----------------------
+
+Availability
+~~~~~~~~~~~~
+
+A controller is available in a cgroup when it is supported by the kernel (i.e.,
+compiled in, not disabled and not attached to a v1 hierarchy) and listed in the
+"cgroup.controllers" file. Availability means the controller's interface files
+are exposed in the cgroup’s directory, allowing the distribution of the target
+resource to be observed or controlled within that cgroup.
 
 Enabling and Disabling
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -721,9 +737,6 @@ combinations are invalid and should be rejected.  Also, if the
 resource is mandatory for execution of processes, process migrations
 may be rejected.
 
-"cpu.rt.max" hard-allocates realtime slices and is an example of this
-type.
-
 
 Interface Files
 ===============
@@ -991,6 +1004,24 @@ All cgroup core files are prefixed with "cgroup."
 		Total number of dying cgroup subsystems (e.g. memory
 		cgroup) at and beneath the current cgroup.
 
+  cgroup.stat.local
+	A read-only flat-keyed file which exists in non-root cgroups.
+	The following entry is defined:
+
+	  frozen_usec
+		Cumulative time that this cgroup has spent between freezing and
+		thawing, regardless of whether by self or ancestor groups.
+		NB: (not) reaching "frozen" state is not accounted here.
+
+		Using the following ASCII representation of a cgroup's freezer
+		state, ::
+
+			       1    _____
+			frozen 0 __/     \__
+			          ab    cd
+
+		the duration being measured is the span between a and c.
+
   cgroup.freeze
 	A read-write single value file which exists on non-root cgroups.
 	Allowed values are "0" and "1". The default is "0".
@@ -1075,39 +1106,80 @@ cpufreq governor about the minimum desired frequency which should always be
 provided by a CPU, as well as the maximum desired frequency, which should not
 be exceeded by a CPU.
 
-WARNING: cgroup2 doesn't yet support control of realtime processes. For
-a kernel built with the CONFIG_RT_GROUP_SCHED option enabled for group
-scheduling of realtime processes, the cpu controller can only be enabled
-when all RT processes are in the root cgroup.  This limitation does
-not apply if CONFIG_RT_GROUP_SCHED is disabled.  Be aware that system
-management software may already have placed RT processes into nonroot
-cgroups during the system boot process, and these processes may need
-to be moved to the root cgroup before the cpu controller can be enabled
-with a CONFIG_RT_GROUP_SCHED enabled kernel.
+WARNING: cgroup2 cpu controller doesn't yet support the (bandwidth) control of
+realtime processes. For a kernel built with the CONFIG_RT_GROUP_SCHED option
+enabled for group scheduling of realtime processes, the cpu controller can only
+be enabled when all RT processes are in the root cgroup. Be aware that system
+management software may already have placed RT processes into non-root cgroups
+during the system boot process, and these processes may need to be moved to the
+root cgroup before the cpu controller can be enabled with a
+CONFIG_RT_GROUP_SCHED enabled kernel.
+
+With CONFIG_RT_GROUP_SCHED disabled, this limitation does not apply and some of
+the interface files either affect realtime processes or account for them. See
+the following section for details. Only the cpu controller is affected by
+CONFIG_RT_GROUP_SCHED. Other controllers can be used for the resource control of
+realtime processes irrespective of CONFIG_RT_GROUP_SCHED.
 
 
 CPU Interface Files
 ~~~~~~~~~~~~~~~~~~~
 
-All time durations are in microseconds.
+The interaction of a process with the cpu controller depends on its scheduling
+policy and the underlying scheduler. From the point of view of the cpu controller,
+processes can be categorized as follows:
+
+* Processes under the fair-class scheduler
+* Processes under a BPF scheduler with the corresponding ``cgroup_set_*`` callback
+* Everything else: ``SCHED_{FIFO,RR,DEADLINE}`` and processes under a BPF scheduler
+  without the corresponding ``cgroup_set_*`` callback
+
+For details on when a process is under the fair-class scheduler or a BPF scheduler,
+check out :ref:`Documentation/scheduler/sched-ext.rst <sched-ext>`.
+
+For each of the following interface files, the above categories
+will be referred to. All time durations are in microseconds.
 
   cpu.stat
 	A read-only flat-keyed file.
 	This file exists whether the controller is enabled or not.
 
-	It always reports the following three stats:
+	It always reports the following three stats, which account for all the
+	processes in the cgroup (including those in descendant cgroups):
 
 	- usage_usec
 	- user_usec
 	- system_usec
 
-	and the following five when the controller is enabled:
+	and the following five when the controller is enabled, which account for
+	only the processes under the fair-class scheduler:
 
 	- nr_periods
 	- nr_throttled
 	- throttled_usec
 	- nr_bursts
 	- burst_usec
+
+	Note that the above five CFS bandwidth stats are non-hierarchical;
+	they only account for throttling caused by this cgroup's own bandwidth
+	limit, not including throttling inherited from ancestor cgroups.
+
+  cpu.stat.local
+	A read-only flat-keyed file.
+	This file exists whether the controller is enabled or not.
+
+	It reports the following stat when the controller is enabled:
+
+	- throttled_usec
+
+	Unlike the ``throttled_usec`` reported by ``cpu.stat`` which
+	accounts for throttling caused by this cgroup's own CFS
+	bandwidth limit, ``cpu.stat.local`` reports the actual
+	throttling time incurred by this cgroup's own runqueues,
+	which may include throttling inherited from ancestor
+	cgroup bandwidth limits.
+
+	When the controller is not enabled, this stat is not reported.
 
   cpu.weight
 	A read-write single value file which exists on non-root
@@ -1118,6 +1190,10 @@ All time durations are in microseconds.
 
 	If the cgroup has been configured to be SCHED_IDLE (cpu.idle = 1),
 	then the weight will show as a 0.
+
+	This file affects only processes under the fair-class scheduler and a BPF
+	scheduler with the ``cgroup_set_weight`` callback depending on what the
+	callback actually does.
 
   cpu.weight.nice
 	A read-write single value file which exists on non-root
@@ -1131,6 +1207,10 @@ All time durations are in microseconds.
 	granularity is coarser for the nice values, the read value is
 	the closest approximation of the current weight.
 
+	This file affects only processes under the fair-class scheduler and a BPF
+	scheduler with the ``cgroup_set_weight`` callback depending on what the
+	callback actually does.
+
   cpu.max
 	A read-write two value file which exists on non-root cgroups.
 	The default is "max 100000".
@@ -1143,11 +1223,19 @@ All time durations are in microseconds.
 	$PERIOD duration.  "max" for $MAX indicates no limit.  If only
 	one number is written, $MAX is updated.
 
+	This file affects only processes under the fair-class scheduler and a BPF
+	scheduler with the ``cgroup_set_bandwidth`` callback depending on what
+	the callback actually does.
+
   cpu.max.burst
 	A read-write single value file which exists on non-root
 	cgroups.  The default is "0".
 
 	The burst in the range [0, $MAX].
+
+	This file affects only processes under the fair-class scheduler and a BPF
+	scheduler with the ``cgroup_set_bandwidth`` callback depending on what
+	the callback actually does.
 
   cpu.pressure
 	A read-write nested-keyed file.
@@ -1155,31 +1243,39 @@ All time durations are in microseconds.
 	Shows pressure stall information for CPU. See
 	:ref:`Documentation/accounting/psi.rst <psi>` for details.
 
+	This file accounts for all the processes in the cgroup.
+
   cpu.uclamp.min
-        A read-write single value file which exists on non-root cgroups.
-        The default is "0", i.e. no utilization boosting.
+	A read-write single value file which exists on non-root cgroups.
+	The default is "0", i.e. no utilization boosting.
 
-        The requested minimum utilization (protection) as a percentage
-        rational number, e.g. 12.34 for 12.34%.
+	The requested minimum utilization (protection) as a percentage
+	rational number, e.g. 12.34 for 12.34%.
 
-        This interface allows reading and setting minimum utilization clamp
-        values similar to the sched_setattr(2). This minimum utilization
-        value is used to clamp the task specific minimum utilization clamp.
+	This interface allows reading and setting minimum utilization clamp
+	values similar to the sched_setattr(2). This minimum utilization
+	value is used to clamp the task specific minimum utilization clamp,
+	including those of realtime processes.
 
-        The requested minimum utilization (protection) is always capped by
-        the current value for the maximum utilization (limit), i.e.
-        `cpu.uclamp.max`.
+	The requested minimum utilization (protection) is always capped by
+	the current value for the maximum utilization (limit), i.e.
+	`cpu.uclamp.max`.
+
+	This file affects all the processes in the cgroup.
 
   cpu.uclamp.max
-        A read-write single value file which exists on non-root cgroups.
-        The default is "max". i.e. no utilization capping
+	A read-write single value file which exists on non-root cgroups.
+	The default is "max". i.e. no utilization capping
 
-        The requested maximum utilization (limit) as a percentage rational
-        number, e.g. 98.76 for 98.76%.
+	The requested maximum utilization (limit) as a percentage rational
+	number, e.g. 98.76 for 98.76%.
 
-        This interface allows reading and setting maximum utilization clamp
-        values similar to the sched_setattr(2). This maximum utilization
-        value is used to clamp the task specific maximum utilization clamp.
+	This interface allows reading and setting maximum utilization clamp
+	values similar to the sched_setattr(2). This maximum utilization
+	value is used to clamp the task specific maximum utilization clamp,
+	including those of realtime processes.
+
+	This file affects all the processes in the cgroup.
 
   cpu.idle
 	A read-write single value file which exists on non-root cgroups.
@@ -1191,7 +1287,9 @@ All time durations are in microseconds.
 	own relative priorities, but the cgroup itself will be treated as
 	very low priority relative to its peers.
 
-
+	This file affects only processes under the fair-class scheduler and a BPF
+	scheduler with the ``cgroup_set_idle`` callback depending on what the
+	callback actually does.
 
 Memory
 ------
@@ -1223,6 +1321,10 @@ All memory amounts are in bytes.  If a value which is not aligned to
 PAGE_SIZE is written, the value may be rounded up to the closest
 PAGE_SIZE multiple when read back.
 
+For the limit files described below, an empty or all-whitespace
+write is accepted and sets the limit to 0.  To disable a limit,
+write "max"; to set it to zero explicitly, write "0".
+
   memory.current
 	A read-only single value file which exists on non-root
 	cgroups.
@@ -1244,7 +1346,7 @@ PAGE_SIZE multiple when read back.
 	smaller overages.
 
 	Effective min boundary is limited by memory.min values of
-	all ancestor cgroups. If there is memory.min overcommitment
+	ancestor cgroups. If there is memory.min overcommitment
 	(child cgroup or cgroups are requiring more protected memory
 	than parent will allow), then each child cgroup will get
 	the part of parent's protection proportional to its
@@ -1252,9 +1354,6 @@ PAGE_SIZE multiple when read back.
 
 	Putting more memory than generally available under this
 	protection is discouraged and may lead to constant OOMs.
-
-	If a memory cgroup is not populated with processes,
-	its memory.min is ignored.
 
   memory.low
 	A read-write single value file which exists on non-root
@@ -1270,7 +1369,7 @@ PAGE_SIZE multiple when read back.
 	smaller overages.
 
 	Effective low boundary is limited by memory.low values of
-	all ancestor cgroups. If there is memory.low overcommitment
+	ancestor cgroups. If there is memory.low overcommitment
 	(child cgroup or cgroups are requiring more protected memory
 	than parent will allow), then each child cgroup will get
 	the part of parent's protection proportional to its
@@ -1293,6 +1392,18 @@ PAGE_SIZE multiple when read back.
 	monitors the limited cgroup to alleviate heavy reclaim
 	pressure.
 
+	If memory.high is opened with O_NONBLOCK then the synchronous
+	reclaim is bypassed. This is useful for admin processes that
+	need to dynamically adjust the job's memory limits without
+	expending their own CPU resources on memory reclamation. The
+	job will trigger the reclaim and/or get throttled on its
+	next charge request.
+
+	Please note that with O_NONBLOCK, there is a chance that the
+	target memory cgroup may take indefinite amount of time to
+	reduce usage below the limit due to delayed charge request or
+	busy-hitting its memory to slow down reclaim.
+
   memory.max
 	A read-write single value file which exists on non-root
 	cgroups.  The default is "max".
@@ -1309,6 +1420,18 @@ PAGE_SIZE multiple when read back.
 	Some kinds of allocations don't invoke the OOM killer.
 	Caller could retry them differently, return into userspace
 	as -ENOMEM or silently ignore in cases like disk readahead.
+
+	If memory.max is opened with O_NONBLOCK, then the synchronous
+	reclaim and oom-kill are bypassed. This is useful for admin
+	processes that need to dynamically adjust the job's memory limits
+	without expending their own CPU resources on memory reclamation.
+	The job will trigger the reclaim and/or oom-kill on its next
+	charge request.
+
+	Please note that with O_NONBLOCK, there is a chance that the
+	target memory cgroup may take indefinite amount of time to
+	reduce usage below the limit due to delayed charge request or
+	busy-hitting its memory to slow down reclaim.
 
   memory.reclaim
 	A write-only nested-keyed file which exists for all cgroups.
@@ -1341,6 +1464,9 @@ The following nested keys are defined.
 	the reclaim with that swappiness value. Note that this has the
 	same semantics as vm.swappiness applied to memcg reclaim with
 	all the existing limitations and potential future extensions.
+
+	The valid range for swappiness is [0-200, max], setting
+	swappiness=max exclusively reclaims anonymous memory.
 
   memory.peak
 	A read-write single value file which exists on non-root cgroups.
@@ -1415,6 +1541,10 @@ The following nested keys are defined.
           oom_group_kill
                 The number of times a group OOM has occurred.
 
+          sock_throttled
+                The number of times network sockets associated with
+                this cgroup are throttled.
+
   memory.events.local
 	Similar to memory.events but the fields in the file are local
 	to the cgroup i.e. not hierarchical. The file modified event
@@ -1439,7 +1569,10 @@ The following nested keys are defined.
 
 	  anon
 		Amount of memory used in anonymous mappings such as
-		brk(), sbrk(), and mmap(MAP_ANONYMOUS)
+		brk(), sbrk(), and mmap(MAP_ANONYMOUS). Note that
+		some kernel configurations might account complete larger
+		allocations (e.g., THP) if only some, but not all the
+		memory of such an allocation is mapped anymore.
 
 	  file
 		Amount of memory used to cache filesystem data,
@@ -1468,7 +1601,7 @@ The following nested keys are defined.
 	  sock (npn)
 		Amount of memory used in network transmission buffers
 
-	  vmalloc (npn)
+	  vmalloc
 		Amount of memory used for vmap backed memory.
 
 	  shmem
@@ -1482,7 +1615,10 @@ The following nested keys are defined.
 		Amount of application memory swapped out to zswap.
 
 	  file_mapped
-		Amount of cached filesystem data mapped with mmap()
+		Amount of cached filesystem data mapped with mmap(). Note
+		that some kernel configurations might account complete
+		larger allocations (e.g., THP) if only some, but not
+		not all the memory of such an allocation is mapped.
 
 	  file_dirty
 		Amount of cached filesystem data that was modified but
@@ -1554,6 +1690,12 @@ The following nested keys are defined.
 	  workingset_nodereclaim
 		Number of times a shadow node has been reclaimed
 
+	  pswpin (npn)
+		Number of pages swapped into memory
+
+	  pswpout (npn)
+		Number of pages swapped out of memory
+
 	  pgscan (npn)
 		Amount of scanned pages (in an inactive LRU list)
 
@@ -1569,6 +1711,9 @@ The following nested keys are defined.
 	  pgscan_khugepaged (npn)
 		Amount of scanned pages by khugepaged  (in an inactive LRU list)
 
+	  pgscan_proactive (npn)
+		Amount of scanned pages proactively (in an inactive LRU list)
+
 	  pgsteal_kswapd (npn)
 		Amount of reclaimed pages by kswapd
 
@@ -1577,6 +1722,9 @@ The following nested keys are defined.
 
 	  pgsteal_khugepaged (npn)
 		Amount of reclaimed pages by khugepaged
+
+	  pgsteal_proactive (npn)
+		Amount of reclaimed pages proactively
 
 	  pgfault (npn)
 		Total number of page faults incurred
@@ -1617,6 +1765,11 @@ The following nested keys are defined.
 	  zswpwb
 		Number of pages written from zswap to swap.
 
+	  zswap_incomp
+		Amount of memory used by incompressible pages currently stored in zswap
+		without compression. These pages could not be compressed to
+		a size smaller than PAGE_SIZE, so they are stored as-is.
+
 	  thp_fault_alloc (npn)
 		Number of transparent hugepages which were allocated to satisfy
 		a page fault. This counter is not present when CONFIG_TRANSPARENT_HUGEPAGE
@@ -1654,6 +1807,9 @@ The following nested keys are defined.
 
 	  pgdemote_khugepaged
 		Number of pages demoted by khugepaged.
+
+	  pgdemote_proactive
+		Number of pages demoted by proactively.
 
 	  hugetlb
 		Amount of memory used by hugetlb pages. This metric only shows
@@ -1784,7 +1940,7 @@ The following nested keys are defined.
 	is allowed unless memory.swap.max is set to 0.
 
   memory.pressure
-	A read-only nested-keyed file.
+	A read-write nested-keyed file.
 
 	Shows pressure stall information for memory. See
 	:ref:`Documentation/accounting/psi.rst <psi>` for details.
@@ -1813,6 +1969,27 @@ memory - is necessary to determine whether a workload needs more
 memory; unfortunately, memory pressure monitoring mechanism isn't
 implemented yet.
 
+Reclaim Protection
+~~~~~~~~~~~~~~~~~~
+
+The protection configured with "memory.low" or "memory.min" applies relatively
+to the target of the reclaim (i.e. any of memory cgroup limits, proactive
+memory.reclaim or global reclaim apparently located in the root cgroup).
+The protection value configured for B applies unchanged to the reclaim
+targeting A (i.e. caused by competition with the sibling E)::
+
+		root - ... - A - B - C
+		              \    ` D
+		               ` E
+
+When the reclaim targets ancestors of A, the effective protection of B is
+capped by the protection value configured for A (and any other intermediate
+ancestors between A and the target).
+
+To express indifference about relative sibling protection, it is suggested to
+use memory_recursiveprot. Configuring all descendants of a parent with finite
+protection to "max" works but it may unnecessarily skew memory.events:low
+field.
 
 Memory Ownership
 ~~~~~~~~~~~~~~~~
@@ -1838,9 +2015,13 @@ IO
 
 The "io" controller regulates the distribution of IO resources.  This
 controller implements both weight based and absolute bandwidth or IOPS
-limit distribution; however, weight based distribution is available
-only if cfq-iosched is in use and neither scheme is available for
-blk-mq devices.
+limit distribution.  Absolute BPS and IOPS limits are enforced by
+blk-throttle and apply to all devices, while weight based proportional
+distribution is provided by the iocost cost model controller
+(CONFIG_BLK_CGROUP_IOCOST) and, when the BFQ I/O scheduler is in use
+for a device, by BFQ's own cgroup support.  Latency-based protection
+(CONFIG_BLK_CGROUP_IOLATENCY) and I/O priority assignment
+(CONFIG_BLK_CGROUP_IOPRIO) are also available.
 
 
 IO Interface Files
@@ -1950,12 +2131,19 @@ IO Interface Files
 	  [r|w]bps	The maximum sequential IO throughput
 	  [r|w]seqiops	The maximum 4k sequential IOs per second
 	  [r|w]randiops	The maximum 4k random IOs per second
+	  flushiops	The maximum flushes per second
 	  =============	========================================
 
 	From the above, the builtin linear model determines the base
 	costs of a sequential and random IO and the cost coefficient
 	for the IO size.  While simple, this model can cover most
 	common device classes acceptably.
+
+	"flushiops" determines the cost of a cache flush: a write with
+	a preceding cache flush is charged one flush on top of its data
+	cost, and a FUA write one more flush on devices without native
+	FUA support.  It is zero in the builtin profiles, so flushes
+	stay free until it is configured.
 
 	The IO cost model isn't expected to be accurate in absolute
 	sense and is scaled to the device behavior dynamically.
@@ -2023,7 +2211,7 @@ IO Interface Files
 	  8:16 rbps=2097152 wbps=max riops=max wiops=max
 
   io.pressure
-	A read-only nested-keyed file.
+	A read-write nested-keyed file.
 
 	Shows pressure stall information for IO. See
 	:ref:`Documentation/accounting/psi.rst <psi>` for details.
@@ -2093,9 +2281,12 @@ IO Latency
 ~~~~~~~~~~
 
 This is a cgroup v2 controller for IO workload protection.  You provide a group
-with a latency target, and if the average latency exceeds that target the
-controller will throttle any peers that have a lower latency target than the
-protected workload.
+with a latency target, and if the group misses its target the controller will
+throttle any peers that have a lower latency target than the protected
+workload.  How a miss is detected depends on the device: on rotational devices
+the average latency over the window must exceed the target, while on
+non-rotational devices a miss is counted once enough of the IOs in the window
+individually exceed the target.
 
 The limits are only applied at the peer level in the hierarchy.  This means that
 in the diagram below, only groups A, B, and C will influence each other, and
@@ -2111,10 +2302,13 @@ groups D and F will influence each other.  Group G will influence nobody::
 So the ideal way to configure this is to set io.latency in groups A, B, and C.
 Generally you do not want to set a value lower than the latency your device
 supports.  Experiment to find the value that works best for your workload.
-Start at higher than the expected latency for your device and watch the
-avg_lat value in io.stat for your workload group to get an idea of the
-latency you see during normal operation.  Use the avg_lat value as a basis for
-your real setting, setting at 10-15% higher than the value in io.stat.
+Start at higher than the expected latency for your device and, with
+blkcg_debug_stats enabled, observe io.stat for your workload group to get an
+idea of the latency you see during normal operation.  On rotational devices,
+use the avg_lat value as a basis for your real setting, setting it 10-15%
+higher.  On non-rotational devices io.stat reports no average latency; set
+the target based on your device and use the missed/total fields to verify it
+is being met.
 
 How IO Latency Throttling Works
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2132,9 +2326,9 @@ This throttling takes 2 forms:
   throttled without possibly adversely affecting higher priority groups.  This
   includes swapping and metadata IO.  These types of IO are allowed to occur
   normally, however they are "charged" to the originating group.  If the
-  originating group is being throttled you will see the use_delay and delay
-  fields in io.stat increase.  The delay value is how many microseconds that are
-  being added to any process that runs in this group.  Because this number can
+  originating group is being throttled you will see the use_delay and delay_nsec
+  fields in io.stat increase.  The delay_nsec value is how many nanoseconds that
+  are being added to any process that runs in this group.  Because this number can
   grow quite large if there is a lot of swapping or metadata IO occurring we
   limit the individual delay events to 1 second at a time.
 
@@ -2152,21 +2346,40 @@ IO Latency Interface Files
 
   io.stat
 	If the controller is enabled you will see extra stats in io.stat in
-	addition to the normal ones.
+	addition to the normal ones.  These debug stats are only emitted when
+	the blkcg_debug_stats module parameter is enabled (it is disabled by
+	default).
+
+	The reported latency fields depend on the device.  Rotational devices
+	report avg_lat and win; non-rotational devices report missed and total
+	instead.  missed and total are live counters for the current window and
+	may change between reads.
 
 	  depth
 		This is the current queue depth for the group.
 
 	  avg_lat
-		This is an exponential moving average with a decay rate of 1/exp
-		bound by the sampling interval.  The decay rate interval can be
-		calculated by multiplying the win value in io.stat by the
-		corresponding number of samples based on the win value.
+		(Rotational devices only.)  This is an exponential moving
+		average with a decay rate of 1/exp bound by the sampling
+		interval.  The decay rate interval can be calculated by
+		multiplying the win value in io.stat by the corresponding number
+		of samples based on the win value.
 
 	  win
-		The sampling window size in milliseconds.  This is the minimum
-		duration of time between evaluation events.  Windows only elapse
-		with IO activity.  Idle periods extend the most recent window.
+		(Rotational devices only.)  The sampling window size in
+		milliseconds.  This is the minimum duration of time between
+		evaluation events.  Windows only elapse with IO activity.  Idle
+		periods extend the most recent window.
+
+	  missed
+		(Non-rotational devices only.)  The number of IOs in the
+		current window whose latency exceeded the target.  A group is
+		considered to be missing its target once missed reaches a
+		certain ratio of total.
+
+	  total
+		(Non-rotational devices only.)  The total number of IOs
+		accounted in the current window.
 
 IO Priority
 ~~~~~~~~~~~
@@ -2334,16 +2547,55 @@ Cpuset Interface Files
 	A read-only multiple values file which exists on all
 	cpuset-enabled cgroups.
 
-	It lists the onlined CPUs that are actually granted to this
-	cgroup by its parent.  These CPUs are allowed to be used by
-	tasks within the current cgroup.
+	It lists the active CPUs available to tasks in this cgroup.
 
-	If "cpuset.cpus" is empty, the "cpuset.cpus.effective" file shows
-	all the CPUs from the parent cgroup that can be available to
-	be used by this cgroup.  Otherwise, it should be a subset of
-	"cpuset.cpus" unless none of the CPUs listed in "cpuset.cpus"
-	can be granted.  In this case, it will be treated just like an
-	empty "cpuset.cpus".
+	For a cgroup that is not a valid partition root, an empty
+	"cpuset.cpus" makes "cpuset.cpus.effective" show all CPUs
+	available from the parent cgroup. Otherwise, it is a subset
+	of "cpuset.cpus" unless none of the requested CPUs can be
+	granted. In that case, it is treated like an empty
+	"cpuset.cpus".
+
+	For example::
+
+	  P (cpuset.cpus.effective=0-3)
+	  |
+	  +-- C0 (member):       cpuset.cpus=1-2
+	  |                      cpuset.cpus.effective=1-2
+	  +-- C1 (invalid root): cpuset.cpus=4-5
+	  |                      cpuset.cpus.effective=0-3
+	  \-- C2 (member):       cpuset.cpus=<empty>
+	                         cpuset.cpus.effective=0-3
+
+	C0 gets CPUs 1-2 because they are available from P.
+	None of C1's requested CPUs 4-5 are available from P, so C1 uses P's
+	effective CPUs 0-3 instead.
+	C2 has an empty "cpuset.cpus" and therefore also uses P's effective
+	CPUs 0-3.
+
+	For a valid non-root partition root, "cpuset.cpus.effective" contains
+	the active CPUs from "cpuset.cpus.exclusive.effective" except
+	those granted to valid child partition roots. If
+	"cpuset.cpus.exclusive" is set to a value different from
+	"cpuset.cpus", the effective CPUs need not be a subset of
+	"cpuset.cpus".
+
+	For example, if CPUs 2-5 are allocated to P for exclusive use,
+	CPUs 2-4 are active, CPU 5 is offline, and none of CPUs 2-5 are
+	assigned to a valid child partition root::
+
+	  top (root)
+	  |
+	  \-- P (valid partition root)
+	      cpuset.cpus=0-3
+	      cpuset.cpus.exclusive=2-5
+	      cpuset.cpus.exclusive.effective=2-5
+	      cpuset.cpus.effective=2-4
+
+	P has 2-5 in "cpuset.cpus.exclusive.effective", including the
+	offline CPU 5. CPU 5 is excluded from "cpuset.cpus.effective",
+	leaving 2-4. The result also shows that "cpuset.cpus.effective"
+	need not be a subset of "cpuset.cpus", which is 0-3.
 
 	Its value will be affected by CPU hotplug events.
 
@@ -2381,6 +2633,13 @@ Cpuset Interface Files
 	a need to change "cpuset.mems" with active tasks, it shouldn't
 	be done frequently.
 
+	For a multithreaded process, the threadgroup leader is
+	considered the owner of the group's memory. Memory policy
+	rebinding and migration will only happen with respect to the
+	threadgroup leader. To avoid unexpected results, non-leading
+	threads shouldn't be put into another cgroup whose "cpuset.mems"
+	doesn't fully overlap that of the threadgroup leader.
+
   cpuset.mems.effective
 	A read-only multiple values file which exists on all
 	cpuset-enabled cgroups.
@@ -2417,10 +2676,10 @@ Cpuset Interface Files
 	Users can manually set it to a value that is different from
 	"cpuset.cpus".	One constraint in setting it is that the list of
 	CPUs must be exclusive with respect to "cpuset.cpus.exclusive"
-	of its sibling.  If "cpuset.cpus.exclusive" of a sibling cgroup
-	isn't set, its "cpuset.cpus" value, if set, cannot be a subset
-	of it to leave at least one CPU available when the exclusive
-	CPUs are taken away.
+	and "cpuset.cpus.exclusive.effective" of its siblings.	Another
+	constraint is that it cannot be a superset of "cpuset.cpus"
+	of its sibling in order to leave at least one CPU available to
+	that sibling when the exclusive CPUs are taken away.
 
 	For a parent cgroup, any one of its exclusive CPUs can only
 	be distributed to at most one of its child cgroups.  Having an
@@ -2440,16 +2699,17 @@ Cpuset Interface Files
 	of this file will always be a subset of its parent's
 	"cpuset.cpus.exclusive.effective" if its parent is not the root
 	cgroup.  It will also be a subset of "cpuset.cpus.exclusive"
-	if it is set.  If "cpuset.cpus.exclusive" is not set, it is
-	treated to have an implicit value of "cpuset.cpus" in the
-	formation of local partition.
+	if it is set.  This file should only be non-empty if either
+	"cpuset.cpus.exclusive" is set or when the current cpuset is
+	a valid partition root.
 
   cpuset.cpus.isolated
 	A read-only and root cgroup only multiple values file.
 
 	This file shows the set of all isolated CPUs used in existing
-	isolated partitions. It will be empty if no isolated partition
-	is created.
+	isolated partitions or isolated at boot time via the "domain"
+	flag of "isolcpus". The latter remain listed even after any
+	partition using them is released.
 
   cpuset.cpus.partition
 	A read-write single value file which exists on non-root
@@ -2474,13 +2734,22 @@ Cpuset Interface Files
 	There are two types of partitions - local and remote.  A local
 	partition is one whose parent cgroup is also a valid partition
 	root.  A remote partition is one whose parent cgroup is not a
-	valid partition root itself.  Writing to "cpuset.cpus.exclusive"
-	is optional for the creation of a local partition as its
-	"cpuset.cpus.exclusive" file will assume an implicit value that
-	is the same as "cpuset.cpus" if it is not set.	Writing the
-	proper "cpuset.cpus.exclusive" values down the cgroup hierarchy
-	before the target partition root is mandatory for the creation
-	of a remote partition.
+	valid partition root itself.
+
+	Writing to "cpuset.cpus.exclusive" is optional for the creation
+	of a local partition as its "cpuset.cpus.exclusive" file will
+	assume an implicit value that is the same as "cpuset.cpus" if it
+	is not set.  Writing the proper "cpuset.cpus.exclusive" values
+	down the cgroup hierarchy before the target partition root is
+	mandatory for the creation of a remote partition.
+
+	Not all the CPUs requested in "cpuset.cpus.exclusive" can be
+	used to form a new partition.  Only those that were present
+	in its parent's "cpuset.cpus.exclusive.effective" control
+	file can be used.  For partitions created without setting
+	"cpuset.cpus.exclusive", exclusive CPUs specified in sibling's
+	"cpuset.cpus.exclusive" or "cpuset.cpus.exclusive.effective"
+	also cannot be used.
 
 	Currently, a remote partition cannot be created under a local
 	partition.  All the ancestors of a remote partition root except
@@ -2488,6 +2757,10 @@ Cpuset Interface Files
 
 	The root cgroup is always a partition root and its state cannot
 	be changed.  All other non-root cgroups start out as "member".
+	Even though the "cpuset.cpus.exclusive*" and "cpuset.cpus"
+	control files are not present in the root cgroup, they are
+	implicitly the same as the "/sys/devices/system/cpu/possible"
+	sysfs file.
 
 	When set to "root", the current cgroup is the root of a new
 	partition or scheduling domain.  The set of exclusive CPUs is
@@ -2505,7 +2778,9 @@ Cpuset Interface Files
 	be retained, but behaves more like a "member".
 
 	All possible state transitions among "member", "root" and
-	"isolated" are allowed.
+	"isolated" are allowed with the exception that a local child
+	"root" partition is not allowed to be created under an "isolated"
+	parent partition.
 
 	On read, the "cpuset.cpus.partition" file can show the following
 	values.
@@ -2593,6 +2868,11 @@ RDMA
 The "rdma" controller regulates the distribution and accounting of
 RDMA resources.
 
+RDMA devices from all network namespaces are listed. Each line starts with
+the device name. If more than one device has the same name, ``index=N``
+follows the name, where ``N`` is the system-wide RDMA device index, unique
+among registered devices.
+
 RDMA Interface Files
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -2601,7 +2881,11 @@ RDMA Interface Files
 	except root that describes current configured resource limit
 	for a RDMA/IB device.
 
-	Lines are keyed by device name and are not ordered.
+	Lines are keyed by device name and are not ordered. A write may
+	include ``index=N`` after the device name. The index is optional
+	when the name is globally unique. If multiple devices have that
+	name, the index is required and a write without it fails with
+	``-ENOTUNIQ``.
 	Each line contains space separated resource name and its configured
 	limit that can be distributed.
 
@@ -2617,6 +2901,10 @@ RDMA Interface Files
 	  mlx4_0 hca_handle=2 hca_object=2000
 	  ocrdma1 hca_handle=3 hca_object=max
 
+	For devices with duplicate names, select the device by index::
+
+	  echo "rxe0 index=5 hca_handle=2" > rdma.max
+
   rdma.current
 	A read-only file that describes current resource usage.
 	It exists for all the cgroup except root.
@@ -2626,10 +2914,112 @@ RDMA Interface Files
 	  mlx4_0 hca_handle=1 hca_object=20
 	  ocrdma1 hca_handle=1 hca_object=23
 
+  rdma.peak
+	A read-only nested-keyed file that exists for all the cgroups
+	except root.  It shows the historical high watermark of
+	resource usage per device since the cgroup was created.
+
+	An example for mlx4 and ocrdma device follows::
+
+	  mlx4_0 hca_handle=1 hca_object=20
+	  ocrdma1 hca_handle=0 hca_object=23
+
+  rdma.events
+	A read-only nested-keyed file which exists on non-root
+	cgroups.  The following nested keys are defined.
+
+	  max
+		The number of times a process in this cgroup or its
+		descendants attempted an RDMA resource allocation that
+		was rejected because a rdma.max limit in the subtree
+		was reached.  This is a hierarchical counter: the event
+		is propagated upward to all ancestor cgroups.  A value
+		change in this file generates a file modified event.
+
+	  alloc_fail
+		The number of RDMA resource allocation attempts that
+		originated in this cgroup or its descendants and failed
+		due to a rdma.max limit being reached.  This is a
+		hierarchical counter propagated upward.
+
+	An example for mlx4 device follows::
+
+	  mlx4_0 hca_handle.max=5 hca_handle.alloc_fail=3 hca_object.max=0 hca_object.alloc_fail=0
+
+  rdma.events.local
+	Similar to rdma.events but the fields in the file are local
+	to the cgroup i.e. not hierarchical.  The file modified event
+	generated on this file reflects only the local events.
+
+	The following nested keys are defined.
+
+	  max
+		The number of times a process in this cgroup or its
+		descendants attempted an RDMA resource allocation that
+		was rejected because this cgroup's own rdma.max limit
+		was reached.
+	  alloc_fail
+		The number of RDMA resource allocation attempts
+		originating from this cgroup that failed due to this
+		cgroup's or an ancestor's rdma.max limit.
+
+	An example for mlx4 device follows::
+
+	  mlx4_0 hca_handle.max=5 hca_handle.alloc_fail=0 hca_object.max=0 hca_object.alloc_fail=0
+
+DMEM
+----
+
+The "dmem" controller regulates the distribution and accounting of
+device memory regions. Because each memory region may have its own page size,
+which does not have to be equal to the system page size, the units are always bytes.
+
+DMEM Interface Files
+~~~~~~~~~~~~~~~~~~~~
+
+  dmem.max, dmem.min, dmem.low
+	A readwrite nested-keyed file that exists for all the cgroups
+	except root that describes current configured resource limit
+	for a region.
+
+	An example for xe follows::
+
+	  drm/0000:03:00.0/vram0 1073741824
+	  drm/0000:03:00.0/stolen max
+
+	The semantics are the same as for the memory cgroup controller, and are
+	calculated in the same way.
+
+  dmem.peak
+	A read-only nested-keyed file that exists on non-root cgroups.
+
+	The max device memory usage recorded for the cgroup and its
+	descendants since the creation of the cgroup for each region.
+
+  dmem.capacity
+	A read-only file that describes maximum region capacity.
+	It only exists on the root cgroup. Not all memory can be
+	allocated by cgroups, as the kernel reserves some for
+	internal use.
+
+	An example for xe follows::
+
+	  drm/0000:03:00.0/vram0 8514437120
+	  drm/0000:03:00.0/stolen 67108864
+
+  dmem.current
+	A read-only file that describes current resource usage.
+	It exists for all the cgroup except root.
+
+	An example for xe follows::
+
+	  drm/0000:03:00.0/vram0 12550144
+	  drm/0000:03:00.0/stolen 8650752
+
 HugeTLB
 -------
 
-The HugeTLB controller allows to limit the HugeTLB usage per control group and
+The HugeTLB controller allows limiting the HugeTLB usage per control group and
 enforces the controller limit during page fault.
 
 HugeTLB Interface Files
@@ -2679,7 +3069,8 @@ include/linux/misc_cgroup.h.
 Misc Interface Files
 ~~~~~~~~~~~~~~~~~~~~
 
-Miscellaneous controller provides 3 interface files. If two misc resources (res_a and res_b) are registered then:
+Miscellaneous controller provides the following interface files. If two misc
+resources (res_a and res_b) are registered then:
 
   misc.capacity
         A read-only flat-keyed file shown only in the root cgroup.  It shows
@@ -2732,7 +3123,7 @@ Miscellaneous controller provides 3 interface files. If two misc resources (res_
 	change in this file generates a file modified event. All fields in
 	this file are hierarchical.
 
-	  max
+	  <res>.max
 		The number of times the cgroup's resource usage was
 		about to go over the max boundary.
 
@@ -2949,7 +3340,7 @@ Filesystem Support for Writeback
 --------------------------------
 
 A filesystem can support cgroup writeback by updating
-address_space_operations->writepage[s]() to annotate bio's using the
+address_space_operations->writepages() to annotate bio's using the
 following two functions.
 
   wbc_init_bio(@wbc, @bio)

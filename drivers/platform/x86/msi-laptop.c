@@ -117,7 +117,7 @@ struct quirk_entry {
 	 * Wlan/Bluetooth/3G, those netbook will load the SCM (windows app) to
 	 * disable the original Wlan/Bluetooth control by BIOS when user press
 	 * fn key, then control Wlan/Bluetooth/3G by SCM (software control by
-	 * OS). Without SCM, user cann't on/off 3G module on those 3G netbook.
+	 * OS). Without SCM, user can't on/off 3G module on those 3G netbook.
 	 * On Linux, msi-laptop driver will do the same thing to disable the
 	 * original BIOS control, then might need use HAL or other userland
 	 * application to do the software control that simulate with SCM.
@@ -806,8 +806,8 @@ static void msi_send_touchpad_key(struct work_struct *ignored)
 }
 static DECLARE_DELAYED_WORK(msi_touchpad_dwork, msi_send_touchpad_key);
 
-static bool msi_laptop_i8042_filter(unsigned char data, unsigned char str,
-				struct serio *port)
+static bool msi_laptop_i8042_filter(unsigned char data, unsigned char str, struct serio *port,
+				    void *context)
 {
 	static bool extended;
 
@@ -996,7 +996,7 @@ static int __init load_scm_model_init(struct platform_device *sdev)
 	if (result)
 		goto fail_input;
 
-	result = i8042_install_filter(msi_laptop_i8042_filter);
+	result = i8042_install_filter(msi_laptop_i8042_filter, NULL);
 	if (result) {
 		pr_err("Unable to install key filter\n");
 		goto fail_filter;
@@ -1130,6 +1130,9 @@ static void __exit msi_cleanup(void)
 	sysfs_remove_group(&msipf_device->dev.kobj, &msipf_attribute_group);
 	if (!quirks->old_ec_model && threeg_exists)
 		device_remove_file(&msipf_device->dev, &dev_attr_threeg);
+	if (quirks->old_ec_model)
+		sysfs_remove_group(&msipf_device->dev.kobj,
+				   &msipf_old_attribute_group);
 	platform_device_unregister(msipf_device);
 	platform_driver_unregister(&msipf_driver);
 	backlight_device_unregister(msibl_device);

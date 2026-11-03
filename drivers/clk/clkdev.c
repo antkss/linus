@@ -88,7 +88,7 @@ static struct clk *__clk_get_sys(struct device *dev, const char *dev_id,
 {
 	struct clk_hw *hw = clk_find_hw(dev_id, con_id);
 
-	return clk_hw_create_clk(dev, hw, dev_id, con_id);
+	return clk_hw_create_clk(dev, hw, dev_id, con_id, NULL);
 }
 
 struct clk *clk_get_sys(const char *dev_id, const char *con_id)
@@ -105,7 +105,7 @@ struct clk *clk_get(struct device *dev, const char *con_id)
 	if (dev && dev->of_node) {
 		hw = of_clk_get_hw(dev->of_node, 0, con_id);
 		if (!IS_ERR(hw) || PTR_ERR(hw) == -EPROBE_DEFER)
-			return clk_hw_create_clk(dev, hw, dev_id, con_id);
+			return clk_hw_create_clk(dev, hw, dev_id, con_id, NULL);
 	}
 
 	return __clk_get_sys(dev, dev_id, con_id);
@@ -153,7 +153,7 @@ struct clk_lookup_alloc {
 	char	con_id[MAX_CON_ID];
 };
 
-static struct clk_lookup * __ref
+static __printf(3, 0) struct clk_lookup * __ref
 vclkdev_alloc(struct clk_hw *hw, const char *con_id, const char *dev_fmt,
 	va_list ap)
 {
@@ -164,7 +164,7 @@ vclkdev_alloc(struct clk_hw *hw, const char *con_id, const char *dev_fmt,
 	size_t max_size;
 	ssize_t res;
 
-	cla = kzalloc(sizeof(*cla), GFP_KERNEL);
+	cla = kzalloc_obj(*cla);
 	if (!cla)
 		return NULL;
 
@@ -215,7 +215,7 @@ fail:
 	return &cla->cl;
 }
 
-static struct clk_lookup *
+static __printf(3, 0) struct clk_lookup *
 vclkdev_create(struct clk_hw *hw, const char *con_id, const char *dev_fmt,
 	va_list ap)
 {
@@ -303,9 +303,8 @@ void clkdev_drop(struct clk_lookup *cl)
 }
 EXPORT_SYMBOL(clkdev_drop);
 
-static struct clk_lookup *__clk_register_clkdev(struct clk_hw *hw,
-						const char *con_id,
-						const char *dev_id, ...)
+static __printf(3, 4) struct clk_lookup *
+__clk_register_clkdev(struct clk_hw *hw, const char *con_id, const char *dev_id, ...)
 {
 	struct clk_lookup *cl;
 	va_list ap;

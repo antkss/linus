@@ -6,6 +6,8 @@
 #include <linux/kvm_host.h>
 #include <asm/kvm_host.h>
 
+#include "mmu.h"
+
 #ifdef CONFIG_KVM_PROVE_MMU
 #define KVM_MMU_WARN_ON(x) WARN_ON_ONCE(x)
 #else
@@ -36,16 +38,6 @@
  */
 #define INVALID_PAE_ROOT	0
 #define IS_VALID_PAE_ROOT(x)	(!!(x))
-
-static inline hpa_t kvm_mmu_get_dummy_root(void)
-{
-	return my_zero_pfn(0) << PAGE_SHIFT;
-}
-
-static inline bool kvm_mmu_is_dummy_root(hpa_t shadow_page)
-{
-	return is_zero_pfn(shadow_page >> PAGE_SHIFT);
-}
 
 typedef u64 __rcu *tdp_ptep_t;
 
@@ -101,7 +93,25 @@ struct kvm_mmu_page {
 		int root_count;
 		refcount_t tdp_mmu_root_count;
 	};
-	unsigned int unsync_children;
+
+	bool has_mapped_host_mmio;
+
+	union {
+		/* These two members aren't used for TDP MMU */
+		struct {
+			unsigned int unsync_children;
+			/*
+			 * Number of writes since the last time traversal
+			 * visited this page.
+			 */
+			atomic_t write_flooding_count;
+		};
+		/*
+		 * Page table page of external PT.
+		 * Passed to TDX module, not accessed by KVM.
+		 */
+		void *external_spt;
+	};
 	union {
 		struct kvm_rmap_head parent_ptes; /* rmap pointers to parent sptes */
 		tdp_ptep_t ptep;
@@ -124,9 +134,6 @@ struct kvm_mmu_page {
 	int clear_spte_count;
 #endif
 
-	/* Number of writes since the last time traversal visited this page.  */
-	atomic_t write_flooding_count;
-
 #ifdef CONFIG_X86_64
 	/* Used for freeing the page asynchronously if it is a TDP MMU page. */
 	struct rcu_head rcu_head;
@@ -145,7 +152,36 @@ static inline int kvm_mmu_page_as_id(struct kvm_mmu_page *sp)
 	return kvm_mmu_role_as_id(sp->role);
 }
 
-static inline bool kvm_mmu_page_ad_need_write_protect(struct kvm_mmu_page *sp)
+static inline bool is_mirror_sp(const struct kvm_mmu_page *sp)
+{
+	return sp->role.is_mirror;
+}
+
+static inline void kvm_mmu_alloc_external_spt(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+{
+	/*
+	 * external_spt is allocated for TDX module to hold private EPT mappings,
+	 * TDX module will initialize the page by itself.
+	 * Therefore, KVM does not need to initialize or access external_spt.
+	 * KVM only interacts with sp->spt for private EPT operations.
+	 */
+	sp->external_spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_external_spt_cache);
+}
+
+static inline gfn_t kvm_gfn_root_bits(const struct kvm *kvm, const struct kvm_mmu_page *root)
+{
+	/*
+	 * Since mirror SPs are used only for TDX, which maps private memory
+	 * at its "natural" GFN, no mask needs to be applied to them - and, dually,
+	 * we expect that the bits is only used for the shared PT.
+	 */
+	if (is_mirror_sp(root))
+		return 0;
+	return kvm_gfn_direct_bits(kvm);
+}
+
+static inline bool kvm_mmu_page_ad_need_write_protect(struct kvm *kvm,
+						      struct kvm_mmu_page *sp)
 {
 	/*
 	 * When using the EPT page-modification log, the GPAs in the CPU dirty
@@ -155,7 +191,7 @@ static inline bool kvm_mmu_page_ad_need_write_protect(struct kvm_mmu_page *sp)
 	 * being enabled is mandatory as the bits used to denote WP-only SPTEs
 	 * are reserved for PAE paging (32-bit KVM).
 	 */
-	return kvm_x86_ops.cpu_dirty_log_size && sp->role.guest_mode;
+	return kvm->arch.cpu_dirty_log_size && sp->role.guest_mode;
 }
 
 static inline gfn_t gfn_round_for_level(gfn_t gfn, int level)
@@ -229,7 +265,12 @@ struct kvm_page_fault {
 	 */
 	u8 goal_level;
 
-	/* Shifted addr, or result of guest page table walk if addr is a gva.  */
+	/*
+	 * Shifted addr, or result of guest page table walk if addr is a gva. In
+	 * the case of VM where memslot's can be mapped at multiple GPA aliases
+	 * (i.e. TDX), the gfn field does not contain the bit that selects between
+	 * the aliases (i.e. the shared bit for TDX).
+	 */
 	gfn_t gfn;
 
 	/* The memslot containing gfn. May be NULL. */
@@ -249,8 +290,6 @@ struct kvm_page_fault {
 	bool write_fault_to_shadow_pgtable;
 };
 
-int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
-
 /*
  * Return values of handle_mmio_page_fault(), mmu.page_fault(), fast_page_fault(),
  * and of course kvm_mmu_do_page_fault().
@@ -268,9 +307,7 @@ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
  * tracepoints via TRACE_DEFINE_ENUM() in mmutrace.h
  *
  * Note, all values must be greater than or equal to zero so as not to encroach
- * on -errno return values.  Somewhat arbitrarily use '0' for CONTINUE, which
- * will allow for efficient machine code when checking for CONTINUE, e.g.
- * "TEST %rax, %rax, JNZ", as all "stop!" values are non-zero.
+ * on -errno return values.
  */
 enum {
 	RET_PF_CONTINUE = 0,
@@ -282,6 +319,14 @@ enum {
 	RET_PF_SPURIOUS,
 };
 
+/*
+ * Define RET_PF_CONTINUE as 0 to allow for
+ * - efficient machine code when checking for CONTINUE, e.g.
+ *   "TEST %rax, %rax, JNZ", as all "stop!" values are non-zero,
+ * - kvm_mmu_do_page_fault() to return other RET_PF_* as a positive value.
+ */
+static_assert(RET_PF_CONTINUE == 0);
+
 static inline void kvm_mmu_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
 						     struct kvm_page_fault *fault)
 {
@@ -290,67 +335,14 @@ static inline void kvm_mmu_prepare_memory_fault_exit(struct kvm_vcpu *vcpu,
 				      fault->is_private);
 }
 
-static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
-					u64 err, bool prefetch,
-					int *emulation_type, u8 *level)
-{
-	struct kvm_page_fault fault = {
-		.addr = cr2_or_gpa,
-		.error_code = err,
-		.exec = err & PFERR_FETCH_MASK,
-		.write = err & PFERR_WRITE_MASK,
-		.present = err & PFERR_PRESENT_MASK,
-		.rsvd = err & PFERR_RSVD_MASK,
-		.user = err & PFERR_USER_MASK,
-		.prefetch = prefetch,
-		.is_tdp = likely(vcpu->arch.mmu->page_fault == kvm_tdp_page_fault),
-		.nx_huge_page_workaround_enabled =
-			is_nx_huge_page_enabled(vcpu->kvm),
-
-		.max_level = KVM_MAX_HUGEPAGE_LEVEL,
-		.req_level = PG_LEVEL_4K,
-		.goal_level = PG_LEVEL_4K,
-		.is_private = err & PFERR_PRIVATE_ACCESS,
-
-		.pfn = KVM_PFN_ERR_FAULT,
-	};
-	int r;
-
-	if (vcpu->arch.mmu->root_role.direct) {
-		fault.gfn = fault.addr >> PAGE_SHIFT;
-		fault.slot = kvm_vcpu_gfn_to_memslot(vcpu, fault.gfn);
-	}
-
-	if (IS_ENABLED(CONFIG_MITIGATION_RETPOLINE) && fault.is_tdp)
-		r = kvm_tdp_page_fault(vcpu, &fault);
-	else
-		r = vcpu->arch.mmu->page_fault(vcpu, &fault);
-
-	/*
-	 * Not sure what's happening, but punt to userspace and hope that
-	 * they can fix it by changing memory to shared, or they can
-	 * provide a better error.
-	 */
-	if (r == RET_PF_EMULATE && fault.is_private) {
-		pr_warn_ratelimited("kvm: unexpected emulation request on private memory\n");
-		kvm_mmu_prepare_memory_fault_exit(vcpu, &fault);
-		return -EFAULT;
-	}
-
-	if (fault.write_fault_to_shadow_pgtable && emulation_type)
-		*emulation_type |= EMULTYPE_WRITE_PF_TO_SP;
-	if (level)
-		*level = fault.goal_level;
-
-	return r;
-}
-
-int kvm_mmu_max_mapping_level(struct kvm *kvm,
+int kvm_mmu_max_mapping_level(struct kvm *kvm, struct kvm_page_fault *fault,
 			      const struct kvm_memory_slot *slot, gfn_t gfn);
 void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
 void disallowed_hugepage_adjust(struct kvm_page_fault *fault, u64 spte, int cur_level);
 
-void track_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp);
-void untrack_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp);
+void track_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp,
+				 enum kvm_mmu_type mmu_type);
+void untrack_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp,
+				   enum kvm_mmu_type mmu_type);
 
 #endif /* __KVM_X86_MMU_INTERNAL_H */

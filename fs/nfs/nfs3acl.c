@@ -104,7 +104,7 @@ struct posix_acl *nfs3_get_acl(struct inode *inode, int type, bool rcu)
 
 	switch (status) {
 		case 0:
-			status = nfs_refresh_inode(inode, res.fattr);
+			nfs_refresh_inode(inode, res.fattr);
 			break;
 		case -EPFNOSUPPORT:
 		case -EPROTONOSUPPORT:
@@ -254,7 +254,7 @@ int nfs3_proc_setacls(struct inode *inode, struct posix_acl *acl,
 
 }
 
-int nfs3_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+int nfs3_set_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type)
 {
 	struct posix_acl *orig = acl, *dfacl = NULL, *alloc;

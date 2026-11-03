@@ -9,6 +9,7 @@
 
 #include <linux/kstrtox.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/sysfs.h>
 #include <linux/pm_qos.h>
 #include <linux/component.h>
@@ -20,12 +21,26 @@ static int usb_port_block_power_off;
 
 static const struct attribute_group *port_dev_group[];
 
+static bool usb_port_allow_power_off(struct usb_device *hdev,
+				     struct usb_hub *hub,
+				     struct usb_port *port_dev)
+{
+	if (hub_is_port_power_switchable(hub))
+		return true;
+
+	if (!IS_ENABLED(CONFIG_ACPI))
+		return false;
+
+	return port_dev->connect_type == USB_PORT_CONNECT_TYPE_HARD_WIRED &&
+	       usb_acpi_power_manageable(hdev, port_dev->portnum - 1);
+}
+
 static ssize_t early_stop_show(struct device *dev,
 			    struct device_attribute *attr, char *buf)
 {
 	struct usb_port *port_dev = to_usb_port(dev);
 
-	return sysfs_emit(buf, "%s\n", port_dev->early_stop ? "yes" : "no");
+	return sysfs_emit(buf, "%s\n", str_yes_no(port_dev->early_stop));
 }
 
 static ssize_t early_stop_store(struct device *dev, struct device_attribute *attr,
@@ -140,6 +155,7 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 		usb_disconnect(&port_dev->child);
 
 	rc = usb_hub_set_port_power(hdev, hub, port1, !disabled);
+	msleep(2 * hub_power_on_good_delay(hub));
 
 	if (disabled) {
 		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
@@ -453,10 +469,11 @@ static int usb_port_runtime_suspend(struct device *dev)
 static void usb_port_shutdown(struct device *dev)
 {
 	struct usb_port *port_dev = to_usb_port(dev);
+	struct usb_device *udev = port_dev->child;
 
-	if (port_dev->child) {
-		usb_disable_usb2_hardware_lpm(port_dev->child);
-		usb_unlocked_disable_lpm(port_dev->child);
+	if (udev && !udev->port_is_suspended) {
+		usb_disable_usb2_hardware_lpm(udev);
+		usb_unlocked_disable_lpm(udev);
 	}
 }
 
@@ -723,6 +740,8 @@ static void connector_unbind(struct device *dev, struct device *connector, void 
 
 	sysfs_remove_link(&connector->kobj, dev_name(dev));
 	sysfs_remove_link(&dev->kobj, "connector");
+	if (port_dev->child)
+		typec_deattach(port_dev->connector, &port_dev->child->dev);
 	port_dev->connector = NULL;
 }
 
@@ -737,11 +756,11 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
 	struct usb_device *hdev = hub->hdev;
 	int retval;
 
-	port_dev = kzalloc(sizeof(*port_dev), GFP_KERNEL);
+	port_dev = kzalloc_obj(*port_dev);
 	if (!port_dev)
 		return -ENOMEM;
 
-	port_dev->req = kzalloc(sizeof(*(port_dev->req)), GFP_KERNEL);
+	port_dev->req = kzalloc_obj(*(port_dev->req));
 	if (!port_dev->req) {
 		kfree(port_dev);
 		return -ENOMEM;
@@ -803,10 +822,10 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
 	device_enable_async_suspend(&port_dev->dev);
 
 	/*
-	 * Keep hidden the ability to enable port-poweroff if the hub
-	 * does not support power switching.
+	 * Keep hidden the ability to enable port-poweroff if neither the
+	 * USB hub nor platform firmware can manage downstream port power.
 	 */
-	if (!hub_is_port_power_switchable(hub))
+	if (!usb_port_allow_power_off(hdev, hub, port_dev))
 		return 0;
 
 	/* Attempt to let userspace take over the policy. */

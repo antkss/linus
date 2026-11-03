@@ -3,7 +3,6 @@
 #include <adf_accel_devices.h>
 #include <adf_common_drv.h>
 #include <adf_gen2_config.h>
-#include <adf_gen2_dc.h>
 #include <adf_gen2_hw_csr_data.h>
 #include <adf_gen2_hw_data.h>
 #include <adf_gen2_pfvf.h>
@@ -13,7 +12,6 @@
 static struct adf_hw_device_class c62xiov_class = {
 	.name = ADF_C62XVF_DEVICE_NAME,
 	.type = DEV_C62XVF,
-	.instances = 0
 };
 
 static u32 get_accel_mask(struct adf_hw_device_data *self)
@@ -24,11 +22,6 @@ static u32 get_accel_mask(struct adf_hw_device_data *self)
 static u32 get_ae_mask(struct adf_hw_device_data *self)
 {
 	return ADF_C62XIOV_ACCELENGINES_MASK;
-}
-
-static u32 get_num_accels(struct adf_hw_device_data *self)
-{
-	return ADF_C62XIOV_MAX_ACCELERATORS;
 }
 
 static u32 get_num_aes(struct adf_hw_device_data *self)
@@ -82,7 +75,6 @@ void adf_init_hw_data_c62xiov(struct adf_hw_device_data *hw_data)
 	hw_data->disable_iov = adf_vf2pf_notify_shutdown;
 	hw_data->get_accel_mask = get_accel_mask;
 	hw_data->get_ae_mask = get_ae_mask;
-	hw_data->get_num_accels = get_num_accels;
 	hw_data->get_num_aes = get_num_aes;
 	hw_data->get_etr_bar_id = get_etr_bar_id;
 	hw_data->get_misc_bar_id = get_misc_bar_id;

@@ -529,15 +529,6 @@ void __init jump_label_init(void)
 	struct static_key *key = NULL;
 	struct jump_entry *iter;
 
-	/*
-	 * Since we are initializing the static_key.enabled field with
-	 * with the 'raw' int values (to avoid pulling in atomic.h) in
-	 * jump_label.h, let's make sure that is safe. There are only two
-	 * cases to check since we initialize to 0 or 1.
-	 */
-	BUILD_BUG_ON((int)ATOMIC_INIT(0) != 0);
-	BUILD_BUG_ON((int)ATOMIC_INIT(1) != 1);
-
 	if (static_key_initialized)
 		return;
 
@@ -653,13 +644,12 @@ static int __jump_label_mod_text_reserved(void *start, void *end)
 	struct module *mod;
 	int ret;
 
-	preempt_disable();
-	mod = __module_text_address((unsigned long)start);
-	WARN_ON_ONCE(__module_text_address((unsigned long)end) != mod);
-	if (!try_module_get(mod))
-		mod = NULL;
-	preempt_enable();
-
+	scoped_guard(rcu) {
+		mod = __module_text_address((unsigned long)start);
+		WARN_ON_ONCE(__module_text_address((unsigned long)end) != mod);
+		if (!try_module_get(mod))
+			mod = NULL;
+	}
 	if (!mod)
 		return 0;
 
@@ -736,19 +726,18 @@ static int jump_label_add_module(struct module *mod)
 		if (static_key_sealed(key))
 			goto do_poke;
 
-		jlm = kzalloc(sizeof(struct static_key_mod), GFP_KERNEL);
+		jlm = kzalloc_obj(struct static_key_mod);
 		if (!jlm)
 			return -ENOMEM;
 		if (!static_key_linked(key)) {
-			jlm2 = kzalloc(sizeof(struct static_key_mod),
-				       GFP_KERNEL);
+			jlm2 = kzalloc_obj(struct static_key_mod);
 			if (!jlm2) {
 				kfree(jlm);
 				return -ENOMEM;
 			}
-			preempt_disable();
-			jlm2->mod = __module_address((unsigned long)key);
-			preempt_enable();
+			scoped_guard(rcu)
+				jlm2->mod = __module_address((unsigned long)key);
+
 			jlm2->entries = static_key_entries(key);
 			jlm2->next = NULL;
 			static_key_set_mod(key, jlm2);
@@ -906,13 +895,13 @@ static void jump_label_update(struct static_key *key)
 		return;
 	}
 
-	preempt_disable();
-	mod = __module_address((unsigned long)key);
-	if (mod) {
-		stop = mod->jump_entries + mod->num_jump_entries;
-		init = mod->state == MODULE_STATE_COMING;
+	scoped_guard(rcu) {
+		mod = __module_address((unsigned long)key);
+		if (mod) {
+			stop = mod->jump_entries + mod->num_jump_entries;
+			init = mod->state == MODULE_STATE_COMING;
+		}
 	}
-	preempt_enable();
 #endif
 	entry = static_key_entries(key);
 	/* if there are no users, entry can be NULL */

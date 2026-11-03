@@ -231,8 +231,8 @@ static u32 atl1c_wait_until_idle(struct atl1c_hw *hw, u32 modu_ctrl)
  */
 static void atl1c_phy_config(struct timer_list *t)
 {
-	struct atl1c_adapter *adapter = from_timer(adapter, t,
-						   phy_config_timer);
+	struct atl1c_adapter *adapter = timer_container_of(adapter, t,
+							   phy_config_timer);
 	struct atl1c_hw *hw = &adapter->hw;
 	unsigned long flags;
 
@@ -357,7 +357,7 @@ static void atl1c_common_task(struct work_struct *work)
 
 static void atl1c_del_timer(struct atl1c_adapter *adapter)
 {
-	del_timer_sync(&adapter->phy_config_timer);
+	timer_delete_sync(&adapter->phy_config_timer);
 }
 
 
@@ -1602,6 +1602,9 @@ static int atl1c_clean_tx(struct napi_struct *napi, int budget)
 	AT_READ_REGW(&adapter->hw, atl1c_qregs[tpd_ring->num].tpd_cons,
 		     &hw_next_to_clean);
 
+	if (unlikely(hw_next_to_clean >= tpd_ring->count))
+		hw_next_to_clean = next_to_clean;
+
 	while (next_to_clean != hw_next_to_clean) {
 		buffer_info = &tpd_ring->buffer_info[next_to_clean];
 		if (buffer_info->skb) {
@@ -2688,7 +2691,7 @@ static int atl1c_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	adapter->mii.mdio_write = atl1c_mdio_write;
 	adapter->mii.phy_id_mask = 0x1f;
 	adapter->mii.reg_num_mask = MDIO_CTRL_REG_MASK;
-	dev_set_threaded(netdev, true);
+	netif_threaded_enable(netdev);
 	for (i = 0; i < adapter->rx_queue_count; ++i)
 		netif_napi_add(netdev, &adapter->rrd_ring[i].napi,
 			       atl1c_clean_rx);

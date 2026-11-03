@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/moduleparam.h>
 #include <linux/atomic.h>
+#include <linux/slab.h>
 #include "net_driver.h"
 #include "nic.h"
 #include "io.h"
@@ -63,7 +64,7 @@ int efx_mcdi_init(struct efx_nic *efx)
 	bool already_attached;
 	int rc = -ENOMEM;
 
-	efx->mcdi = kzalloc(sizeof(*efx->mcdi), GFP_KERNEL);
+	efx->mcdi = kzalloc_obj(*efx->mcdi);
 	if (!efx->mcdi)
 		goto fail;
 
@@ -71,7 +72,7 @@ int efx_mcdi_init(struct efx_nic *efx)
 	mcdi->efx = efx;
 #ifdef CONFIG_SFC_MCDI_LOGGING
 	/* consuming code assumes buffer is page-sized */
-	mcdi->logging_buffer = (char *)__get_free_page(GFP_KERNEL);
+	mcdi->logging_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!mcdi->logging_buffer)
 		goto fail1;
 	mcdi->logging_enabled = mcdi_logging_default;
@@ -112,7 +113,7 @@ int efx_mcdi_init(struct efx_nic *efx)
 	return 0;
 fail2:
 #ifdef CONFIG_SFC_MCDI_LOGGING
-	free_page((unsigned long)mcdi->logging_buffer);
+	kfree(mcdi->logging_buffer);
 fail1:
 #endif
 	kfree(efx->mcdi);
@@ -138,7 +139,7 @@ void efx_mcdi_fini(struct efx_nic *efx)
 		return;
 
 #ifdef CONFIG_SFC_MCDI_LOGGING
-	free_page((unsigned long)efx->mcdi->iface.logging_buffer);
+	kfree(efx->mcdi->iface.logging_buffer);
 #endif
 
 	kfree(efx->mcdi);
@@ -530,7 +531,7 @@ static bool efx_mcdi_complete_async(struct efx_mcdi_iface *mcdi, bool timeout)
 	 * of it aborting the next request.
 	 */
 	if (!timeout)
-		del_timer_sync(&mcdi->async_timer);
+		timer_delete_sync(&mcdi->async_timer);
 
 	spin_lock(&mcdi->async_lock);
 	async = list_first_entry(&mcdi->async_list,
@@ -605,7 +606,7 @@ static void efx_mcdi_ev_cpl(struct efx_nic *efx, unsigned int seqno,
 
 static void efx_mcdi_timeout_async(struct timer_list *t)
 {
-	struct efx_mcdi_iface *mcdi = from_timer(mcdi, t, async_timer);
+	struct efx_mcdi_iface *mcdi = timer_container_of(mcdi, t, async_timer);
 
 	efx_mcdi_complete_async(mcdi, true);
 }
@@ -1122,7 +1123,7 @@ void efx_mcdi_flush_async(struct efx_nic *efx)
 	/* We must be in poll or fail mode so no more requests can be queued */
 	BUG_ON(mcdi->mode == MCDI_MODE_EVENTS);
 
-	del_timer_sync(&mcdi->async_timer);
+	timer_delete_sync(&mcdi->async_timer);
 
 	/* If a request is still running, make sure we give the MC
 	 * time to complete it so that the response won't overwrite our
@@ -1625,12 +1626,15 @@ fail:
 	return rc;
 }
 
+#define EFX_MCDI_NVRAM_DEFAULT_WRITE_LEN 128
+
 int efx_mcdi_nvram_info(struct efx_nic *efx, unsigned int type,
 			size_t *size_out, size_t *erase_size_out,
-			bool *protected_out)
+			size_t *write_size_out, bool *protected_out)
 {
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_NVRAM_INFO_IN_LEN);
-	MCDI_DECLARE_BUF(outbuf, MC_CMD_NVRAM_INFO_OUT_LEN);
+	MCDI_DECLARE_BUF(outbuf, MC_CMD_NVRAM_INFO_V2_OUT_LEN);
+	size_t write_size = 0;
 	size_t outlen;
 	int rc;
 
@@ -1645,6 +1649,12 @@ int efx_mcdi_nvram_info(struct efx_nic *efx, unsigned int type,
 		goto fail;
 	}
 
+	if (outlen >= MC_CMD_NVRAM_INFO_V2_OUT_LEN)
+		write_size = MCDI_DWORD(outbuf, NVRAM_INFO_V2_OUT_WRITESIZE);
+	else
+		write_size = EFX_MCDI_NVRAM_DEFAULT_WRITE_LEN;
+
+	*write_size_out = write_size;
 	*size_out = MCDI_DWORD(outbuf, NVRAM_INFO_OUT_SIZE);
 	*erase_size_out = MCDI_DWORD(outbuf, NVRAM_INFO_OUT_ERASESIZE);
 	*protected_out = !!(MCDI_DWORD(outbuf, NVRAM_INFO_OUT_FLAGS) &
@@ -2163,11 +2173,9 @@ out_free:
 	return rc;
 }
 
-#ifdef CONFIG_SFC_MTD
-
 #define EFX_MCDI_NVRAM_LEN_MAX 128
 
-static int efx_mcdi_nvram_update_start(struct efx_nic *efx, unsigned int type)
+int efx_mcdi_nvram_update_start(struct efx_nic *efx, unsigned int type)
 {
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_NVRAM_UPDATE_START_V2_IN_LEN);
 	int rc;
@@ -2184,6 +2192,8 @@ static int efx_mcdi_nvram_update_start(struct efx_nic *efx, unsigned int type)
 
 	return rc;
 }
+
+#ifdef CONFIG_SFC_MTD
 
 static int efx_mcdi_nvram_read(struct efx_nic *efx, unsigned int type,
 			       loff_t offset, u8 *buffer, size_t length)
@@ -2209,12 +2219,19 @@ static int efx_mcdi_nvram_read(struct efx_nic *efx, unsigned int type,
 	return 0;
 }
 
-static int efx_mcdi_nvram_write(struct efx_nic *efx, unsigned int type,
-				loff_t offset, const u8 *buffer, size_t length)
+#endif /* CONFIG_SFC_MTD */
+
+int efx_mcdi_nvram_write(struct efx_nic *efx, unsigned int type,
+			 loff_t offset, const u8 *buffer, size_t length)
 {
-	MCDI_DECLARE_BUF(inbuf,
-			 MC_CMD_NVRAM_WRITE_IN_LEN(EFX_MCDI_NVRAM_LEN_MAX));
+	efx_dword_t *inbuf;
+	size_t inlen;
 	int rc;
+
+	inlen = ALIGN(MC_CMD_NVRAM_WRITE_IN_LEN(length), 4);
+	inbuf = kzalloc(inlen, GFP_KERNEL);
+	if (!inbuf)
+		return -ENOMEM;
 
 	MCDI_SET_DWORD(inbuf, NVRAM_WRITE_IN_TYPE, type);
 	MCDI_SET_DWORD(inbuf, NVRAM_WRITE_IN_OFFSET, offset);
@@ -2223,14 +2240,14 @@ static int efx_mcdi_nvram_write(struct efx_nic *efx, unsigned int type,
 
 	BUILD_BUG_ON(MC_CMD_NVRAM_WRITE_OUT_LEN != 0);
 
-	rc = efx_mcdi_rpc(efx, MC_CMD_NVRAM_WRITE, inbuf,
-			  ALIGN(MC_CMD_NVRAM_WRITE_IN_LEN(length), 4),
-			  NULL, 0, NULL);
+	rc = efx_mcdi_rpc(efx, MC_CMD_NVRAM_WRITE, inbuf, inlen, NULL, 0, NULL);
+	kfree(inbuf);
+
 	return rc;
 }
 
-static int efx_mcdi_nvram_erase(struct efx_nic *efx, unsigned int type,
-				loff_t offset, size_t length)
+int efx_mcdi_nvram_erase(struct efx_nic *efx, unsigned int type, loff_t offset,
+			 size_t length)
 {
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_NVRAM_ERASE_IN_LEN);
 	int rc;
@@ -2246,7 +2263,8 @@ static int efx_mcdi_nvram_erase(struct efx_nic *efx, unsigned int type,
 	return rc;
 }
 
-static int efx_mcdi_nvram_update_finish(struct efx_nic *efx, unsigned int type)
+int efx_mcdi_nvram_update_finish(struct efx_nic *efx, unsigned int type,
+				 enum efx_update_finish_mode mode)
 {
 	MCDI_DECLARE_BUF(inbuf, MC_CMD_NVRAM_UPDATE_FINISH_V2_IN_LEN);
 	MCDI_DECLARE_BUF(outbuf, MC_CMD_NVRAM_UPDATE_FINISH_V2_OUT_LEN);
@@ -2254,21 +2272,40 @@ static int efx_mcdi_nvram_update_finish(struct efx_nic *efx, unsigned int type)
 	int rc, rc2;
 
 	MCDI_SET_DWORD(inbuf, NVRAM_UPDATE_FINISH_IN_TYPE, type);
-	/* Always set this flag. Old firmware ignores it */
-	MCDI_POPULATE_DWORD_1(inbuf, NVRAM_UPDATE_FINISH_V2_IN_FLAGS,
+
+	/* Old firmware doesn't support background update finish and abort
+	 * operations. Fallback to waiting if the requested mode is not
+	 * supported.
+	 */
+	if (!efx_has_cap(efx, NVRAM_UPDATE_POLL_VERIFY_RESULT) ||
+	    (!efx_has_cap(efx, NVRAM_UPDATE_ABORT_SUPPORTED) &&
+	     mode == EFX_UPDATE_FINISH_ABORT))
+		mode = EFX_UPDATE_FINISH_WAIT;
+
+	MCDI_POPULATE_DWORD_4(inbuf, NVRAM_UPDATE_FINISH_V2_IN_FLAGS,
 			      NVRAM_UPDATE_FINISH_V2_IN_FLAG_REPORT_VERIFY_RESULT,
-			      1);
+			      (mode != EFX_UPDATE_FINISH_ABORT),
+			      NVRAM_UPDATE_FINISH_V2_IN_FLAG_RUN_IN_BACKGROUND,
+			      (mode == EFX_UPDATE_FINISH_BACKGROUND),
+			      NVRAM_UPDATE_FINISH_V2_IN_FLAG_POLL_VERIFY_RESULT,
+			      (mode == EFX_UPDATE_FINISH_POLL),
+			      NVRAM_UPDATE_FINISH_V2_IN_FLAG_ABORT,
+			      (mode == EFX_UPDATE_FINISH_ABORT));
 
 	rc = efx_mcdi_rpc(efx, MC_CMD_NVRAM_UPDATE_FINISH, inbuf, sizeof(inbuf),
 			  outbuf, sizeof(outbuf), &outlen);
 	if (!rc && outlen >= MC_CMD_NVRAM_UPDATE_FINISH_V2_OUT_LEN) {
 		rc2 = MCDI_DWORD(outbuf, NVRAM_UPDATE_FINISH_V2_OUT_RESULT_CODE);
-		if (rc2 != MC_CMD_NVRAM_VERIFY_RC_SUCCESS)
+		if (rc2 != MC_CMD_NVRAM_VERIFY_RC_SUCCESS &&
+		    rc2 != MC_CMD_NVRAM_VERIFY_RC_PENDING)
 			netif_err(efx, drv, efx->net_dev,
 				  "NVRAM update failed verification with code 0x%x\n",
 				  rc2);
 		switch (rc2) {
 		case MC_CMD_NVRAM_VERIFY_RC_SUCCESS:
+			break;
+		case MC_CMD_NVRAM_VERIFY_RC_PENDING:
+			rc = -EAGAIN;
 			break;
 		case MC_CMD_NVRAM_VERIFY_RC_CMS_CHECK_FAILED:
 		case MC_CMD_NVRAM_VERIFY_RC_MESSAGE_DIGEST_CHECK_FAILED:
@@ -2284,6 +2321,8 @@ static int efx_mcdi_nvram_update_finish(struct efx_nic *efx, unsigned int type)
 		case MC_CMD_NVRAM_VERIFY_RC_NO_VALID_SIGNATURES:
 		case MC_CMD_NVRAM_VERIFY_RC_NO_TRUSTED_APPROVERS:
 		case MC_CMD_NVRAM_VERIFY_RC_NO_SIGNATURE_MATCH:
+		case MC_CMD_NVRAM_VERIFY_RC_REJECT_TEST_SIGNED:
+		case MC_CMD_NVRAM_VERIFY_RC_SECURITY_LEVEL_DOWNGRADE:
 			rc = -EPERM;
 			break;
 		default:
@@ -2295,6 +2334,42 @@ static int efx_mcdi_nvram_update_finish(struct efx_nic *efx, unsigned int type)
 
 	return rc;
 }
+
+#define	EFX_MCDI_NVRAM_UPDATE_FINISH_INITIAL_POLL_DELAY_MS 5
+#define	EFX_MCDI_NVRAM_UPDATE_FINISH_MAX_POLL_DELAY_MS 5000
+#define	EFX_MCDI_NVRAM_UPDATE_FINISH_RETRIES 185
+
+int efx_mcdi_nvram_update_finish_polled(struct efx_nic *efx, unsigned int type)
+{
+	unsigned int delay = EFX_MCDI_NVRAM_UPDATE_FINISH_INITIAL_POLL_DELAY_MS;
+	unsigned int retry = 0;
+	int rc;
+
+	/* NVRAM updates can take a long time (e.g. up to 1 minute for bundle
+	 * images). Polling for NVRAM update completion ensures that other MCDI
+	 * commands can be issued before the background NVRAM update completes.
+	 *
+	 * The initial call either completes the update synchronously, or
+	 * returns -EAGAIN to indicate processing is continuing. In the latter
+	 * case, we poll for at least 900 seconds, at increasing intervals
+	 * (5ms, 50ms, 500ms, 5s).
+	 */
+	rc = efx_mcdi_nvram_update_finish(efx, type, EFX_UPDATE_FINISH_BACKGROUND);
+	while (rc == -EAGAIN) {
+		if (retry > EFX_MCDI_NVRAM_UPDATE_FINISH_RETRIES)
+			return -ETIMEDOUT;
+		retry++;
+
+		msleep(delay);
+		if (delay < EFX_MCDI_NVRAM_UPDATE_FINISH_MAX_POLL_DELAY_MS)
+			delay *= 10;
+
+		rc = efx_mcdi_nvram_update_finish(efx, type, EFX_UPDATE_FINISH_POLL);
+	}
+	return rc;
+}
+
+#ifdef CONFIG_SFC_MTD
 
 int efx_mcdi_mtd_read(struct mtd_info *mtd, loff_t start,
 		      size_t len, size_t *retlen, u8 *buffer)
@@ -2389,7 +2464,8 @@ int efx_mcdi_mtd_sync(struct mtd_info *mtd)
 
 	if (part->updating) {
 		part->updating = false;
-		rc = efx_mcdi_nvram_update_finish(efx, part->nvram_type);
+		rc = efx_mcdi_nvram_update_finish(efx, part->nvram_type,
+						  EFX_UPDATE_FINISH_WAIT);
 	}
 
 	return rc;

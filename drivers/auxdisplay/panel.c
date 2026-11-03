@@ -714,10 +714,7 @@ static void lcd_backlight(struct charlcd *charlcd, enum charlcd_onoff on)
 
 	/* The backlight is activated by setting the AUTOFEED line to +5V  */
 	spin_lock_irq(&pprt_lock);
-	if (on)
-		set_bit(LCD_BIT_BL, bits);
-	else
-		clear_bit(LCD_BIT_BL, bits);
+	assign_bit(LCD_BIT_BL, bits, on);
 	panel_set_bits();
 	spin_unlock_irq(&pprt_lock);
 }
@@ -831,18 +828,12 @@ static void lcd_init(void)
 	struct charlcd *charlcd;
 	struct hd44780_common *hdc;
 
-	hdc = hd44780_common_alloc();
-	if (!hdc)
+	charlcd = hd44780_common_alloc();
+	if (!charlcd)
 		return;
 
-	charlcd = charlcd_alloc();
-	if (!charlcd) {
-		kfree(hdc);
-		return;
-	}
-
+	hdc = charlcd->drvdata;
 	hdc->hd44780 = &lcd;
-	charlcd->drvdata = hdc;
 
 	/*
 	 * Init lcd struct with load-time values to preserve exact
@@ -1434,7 +1425,7 @@ static struct logical_input *panel_bind_key(const char *name, const char *press,
 {
 	struct logical_input *key;
 
-	key = kzalloc(sizeof(*key), GFP_KERNEL);
+	key = kzalloc_obj(*key);
 	if (!key)
 		return NULL;
 
@@ -1455,43 +1446,6 @@ static struct logical_input *panel_bind_key(const char *name, const char *press,
 	list_add(&key->list, &logical_inputs);
 	return key;
 }
-
-#if 0
-/* tries to bind a callback function to the signal name <name>. The function
- * <press_fct> will be called with the <press_data> arg when the signal is
- * activated, and so on for <release_fct>/<release_data>
- * Returns the pointer to the new signal if ok, NULL if the signal could not
- * be bound.
- */
-static struct logical_input *panel_bind_callback(char *name,
-						 void (*press_fct)(int),
-						 int press_data,
-						 void (*release_fct)(int),
-						 int release_data)
-{
-	struct logical_input *callback;
-
-	callback = kmalloc(sizeof(*callback), GFP_KERNEL);
-	if (!callback)
-		return NULL;
-
-	memset(callback, 0, sizeof(struct logical_input));
-	if (!input_name2mask(name, &callback->mask, &callback->value,
-			     &scan_mask_i, &scan_mask_o))
-		return NULL;
-
-	callback->type = INPUT_TYPE_STD;
-	callback->state = INPUT_ST_LOW;
-	callback->rise_time = 1;
-	callback->fall_time = 1;
-	callback->u.std.press_fct = press_fct;
-	callback->u.std.press_data = press_data;
-	callback->u.std.release_fct = release_fct;
-	callback->u.std.release_data = release_data;
-	list_add(&callback->list, &logical_inputs);
-	return callback;
-}
-#endif
 
 static void keypad_init(void)
 {
@@ -1660,11 +1614,11 @@ static void panel_attach(struct parport *port)
 
 err_lcd_unreg:
 	if (scan_timer.function)
-		del_timer_sync(&scan_timer);
+		timer_delete_sync(&scan_timer);
 	if (lcd.enabled)
 		charlcd_unregister(lcd.charlcd);
 err_unreg_device:
-	kfree(lcd.charlcd);
+	hd44780_common_free(lcd.charlcd);
 	lcd.charlcd = NULL;
 	parport_unregister_device(pprt);
 	pprt = NULL;
@@ -1681,7 +1635,7 @@ static void panel_detach(struct parport *port)
 		return;
 	}
 	if (scan_timer.function)
-		del_timer_sync(&scan_timer);
+		timer_delete_sync(&scan_timer);
 
 	if (keypad.enabled) {
 		misc_deregister(&keypad_dev);
@@ -1691,8 +1645,7 @@ static void panel_detach(struct parport *port)
 	if (lcd.enabled) {
 		charlcd_unregister(lcd.charlcd);
 		lcd.initialized = false;
-		kfree(lcd.charlcd->drvdata);
-		kfree(lcd.charlcd);
+		hd44780_common_free(lcd.charlcd);
 		lcd.charlcd = NULL;
 	}
 

@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 #define MAX_MAGNITUDE_SHIFT	16
 
@@ -44,7 +45,7 @@ static int regulator_haptic_toggle(struct regulator_haptic *haptic, bool on)
 		if (error) {
 			dev_err(haptic->dev,
 				"failed to switch regulator %s: %d\n",
-				on ? "on" : "off", error);
+				str_on_off(on), error);
 			return error;
 		}
 
@@ -178,7 +179,6 @@ static int regulator_haptic_probe(struct platform_device *pdev)
 
 	haptic->input_dev = input_dev;
 	haptic->input_dev->name = "regulator-haptic";
-	haptic->input_dev->dev.parent = &pdev->dev;
 	haptic->input_dev->close = regulator_haptic_close;
 	input_set_drvdata(haptic->input_dev, haptic);
 	input_set_capability(haptic->input_dev, EV_FF, FF_RUMBLE);

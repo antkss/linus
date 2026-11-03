@@ -681,7 +681,7 @@ static void fsldma_cleanup_descriptors(struct fsldma_chan *chan)
 
 /**
  * fsl_dma_alloc_chan_resources - Allocate resources for DMA channel.
- * @chan : Freescale DMA channel
+ * @dchan : Freescale DMA channel
  *
  * This function will create a dma pool for descriptor allocation.
  *
@@ -738,7 +738,7 @@ static void fsldma_free_desc_list_reverse(struct fsldma_chan *chan,
 
 /**
  * fsl_dma_free_chan_resources - Free all resources of the channel.
- * @chan : Freescale DMA channel
+ * @dchan : Freescale DMA channel
  */
 static void fsl_dma_free_chan_resources(struct dma_chan *dchan)
 {
@@ -873,7 +873,7 @@ static int fsl_dma_device_config(struct dma_chan *dchan,
 
 /**
  * fsl_dma_memcpy_issue_pending - Issue the DMA start command
- * @chan : Freescale DMA channel
+ * @dchan : Freescale DMA channel
  */
 static void fsl_dma_memcpy_issue_pending(struct dma_chan *dchan)
 {
@@ -886,7 +886,9 @@ static void fsl_dma_memcpy_issue_pending(struct dma_chan *dchan)
 
 /**
  * fsl_tx_status - Determine the DMA status
- * @chan : Freescale DMA channel
+ * @dchan : Freescale DMA channel
+ * @cookie : DMA transaction identifier
+ * @txstate : DMA transaction state
  */
 static enum dma_status fsl_tx_status(struct dma_chan *dchan,
 					dma_cookie_t cookie,
@@ -1111,7 +1113,7 @@ static int fsl_dma_chan_probe(struct fsldma_device *fdev,
 	int err;
 
 	/* alloc channel */
-	chan = kzalloc(sizeof(*chan), GFP_KERNEL);
+	chan = kzalloc_obj(*chan);
 	if (!chan) {
 		err = -ENOMEM;
 		goto out_return;
@@ -1205,6 +1207,7 @@ out_return:
 
 static void fsl_dma_chan_remove(struct fsldma_chan *chan)
 {
+	tasklet_kill(&chan->tasklet);
 	irq_dispose_mapping(chan->irq);
 	list_del(&chan->common.device_node);
 	iounmap(chan->regs);
@@ -1216,9 +1219,14 @@ static int fsldma_of_probe(struct platform_device *op)
 	struct fsldma_device *fdev;
 	struct device_node *child;
 	unsigned int i;
+	int irq;
 	int err;
 
-	fdev = kzalloc(sizeof(*fdev), GFP_KERNEL);
+	irq = platform_get_irq_optional(op, 0);
+	if (irq == -EPROBE_DEFER)
+		return irq;
+
+	fdev = kzalloc_obj(*fdev);
 	if (!fdev) {
 		err = -ENOMEM;
 		goto out_return;
@@ -1226,6 +1234,8 @@ static int fsldma_of_probe(struct platform_device *op)
 
 	fdev->dev = &op->dev;
 	INIT_LIST_HEAD(&fdev->common.channels);
+	/* The DMA address bits supported for this device. */
+	fdev->addr_bits = (long)device_get_match_data(fdev->dev);
 
 	/* ioremap the registers for use */
 	fdev->regs = of_iomap(op->dev.of_node, 0);
@@ -1236,7 +1246,9 @@ static int fsldma_of_probe(struct platform_device *op)
 	}
 
 	/* map the channel IRQ if it exists, but don't hookup the handler yet */
-	fdev->irq = irq_of_parse_and_map(op->dev.of_node, 0);
+	fdev->irq = irq;
+	if (fdev->irq < 0)
+		fdev->irq = 0;
 
 	dma_cap_set(DMA_MEMCPY, fdev->common.cap_mask);
 	dma_cap_set(DMA_SLAVE, fdev->common.cap_mask);
@@ -1254,7 +1266,7 @@ static int fsldma_of_probe(struct platform_device *op)
 	fdev->common.directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
 	fdev->common.residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
 
-	dma_set_mask(&(op->dev), DMA_BIT_MASK(36));
+	dma_set_mask(&(op->dev), DMA_BIT_MASK(fdev->addr_bits));
 
 	platform_set_drvdata(op, fdev);
 
@@ -1298,7 +1310,6 @@ out_free_fdev:
 		if (fdev->chan[i])
 			fsl_dma_chan_remove(fdev->chan[i]);
 	}
-	irq_dispose_mapping(fdev->irq);
 	iounmap(fdev->regs);
 out_free:
 	kfree(fdev);
@@ -1320,7 +1331,6 @@ static void fsldma_of_remove(struct platform_device *op)
 		if (fdev->chan[i])
 			fsl_dma_chan_remove(fdev->chan[i]);
 	}
-	irq_dispose_mapping(fdev->irq);
 
 	iounmap(fdev->regs);
 	kfree(fdev);
@@ -1387,10 +1397,20 @@ static const struct dev_pm_ops fsldma_pm_ops = {
 };
 #endif
 
+/* The .data field is used for dma-bit-mask. */
 static const struct of_device_id fsldma_of_ids[] = {
-	{ .compatible = "fsl,elo3-dma", },
-	{ .compatible = "fsl,eloplus-dma", },
-	{ .compatible = "fsl,elo-dma", },
+	{
+		.compatible = "fsl,elo3-dma",
+		.data = (void *)40,
+	},
+	{
+		.compatible = "fsl,eloplus-dma",
+		.data = (void *)36,
+	},
+	{
+		.compatible = "fsl,elo-dma",
+		.data = (void *)32,
+	},
 	{}
 };
 MODULE_DEVICE_TABLE(of, fsldma_of_ids);

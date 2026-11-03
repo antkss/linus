@@ -17,8 +17,8 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
 #include <drm/drm_ioctl.h>
-#include <drm/drm_panel.h>
 #include <drm/drm_prime.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -28,7 +28,6 @@
 
 #define DRIVER_NAME		MODULE_NAME
 #define DRIVER_DESC		"OMAP DRM"
-#define DRIVER_DATE		"20110917"
 #define DRIVER_MAJOR		1
 #define DRIVER_MINOR		0
 #define DRIVER_PATCHLEVEL	0
@@ -46,7 +45,7 @@
  */
 
 static void omap_atomic_wait_for_completion(struct drm_device *dev,
-					    struct drm_atomic_state *old_state)
+					    struct drm_atomic_commit *old_state)
 {
 	struct drm_crtc_state *new_crtc_state;
 	struct drm_crtc *crtc;
@@ -65,7 +64,7 @@ static void omap_atomic_wait_for_completion(struct drm_device *dev,
 	}
 }
 
-static void omap_atomic_commit_tail(struct drm_atomic_state *old_state)
+static void omap_atomic_commit_tail(struct drm_atomic_commit *old_state)
 {
 	struct drm_device *dev = old_state->dev;
 	struct omap_drm_private *priv = dev->dev_private;
@@ -117,7 +116,7 @@ static void omap_atomic_commit_tail(struct drm_atomic_state *old_state)
 	dispc_runtime_put(priv->dispc);
 }
 
-static int drm_atomic_state_normalized_zpos_cmp(const void *a, const void *b)
+static int drm_atomic_commit_normalized_zpos_cmp(const void *a, const void *b)
 {
 	const struct drm_plane_state *sa = *(struct drm_plane_state **)a;
 	const struct drm_plane_state *sb = *(struct drm_plane_state **)b;
@@ -136,7 +135,7 @@ static int drm_atomic_state_normalized_zpos_cmp(const void *a, const void *b)
  * planes zpos is consistent.
  */
 static int omap_atomic_update_normalize_zpos(struct drm_device *dev,
-					     struct drm_atomic_state *state)
+					     struct drm_atomic_commit *state)
 {
 	struct drm_crtc *crtc;
 	struct drm_crtc_state *old_state, *new_state;
@@ -146,7 +145,7 @@ static int omap_atomic_update_normalize_zpos(struct drm_device *dev,
 	struct drm_plane_state **states;
 	int ret = 0;
 
-	states = kmalloc_array(total_planes, sizeof(*states), GFP_KERNEL);
+	states = kmalloc_objs(*states, total_planes);
 	if (!states)
 		return -ENOMEM;
 
@@ -174,7 +173,7 @@ static int omap_atomic_update_normalize_zpos(struct drm_device *dev,
 		}
 
 		sort(states, n, sizeof(*states),
-		     drm_atomic_state_normalized_zpos_cmp, NULL);
+		     drm_atomic_commit_normalized_zpos_cmp, NULL);
 
 		for (i = 0, inc = 0; i < n; i++) {
 			plane = states[i]->plane;
@@ -196,7 +195,7 @@ done:
 }
 
 static int omap_atomic_check(struct drm_device *dev,
-			     struct drm_atomic_state *state)
+			     struct drm_atomic_commit *state)
 {
 	int ret;
 
@@ -241,7 +240,7 @@ omap_get_existing_global_state(struct omap_drm_private *priv)
  * a new duplicated private object state.
  */
 struct omap_global_state *__must_check
-omap_get_global_state(struct drm_atomic_state *s)
+omap_get_global_state(struct drm_atomic_commit *s)
 {
 	struct omap_drm_private *priv = s->dev->dev_private;
 	struct drm_private_state *priv_state;
@@ -275,7 +274,22 @@ static void omap_global_destroy_state(struct drm_private_obj *obj,
 	kfree(omap_state);
 }
 
+static struct drm_private_state *
+omap_global_atomic_create_state(struct drm_private_obj *obj)
+{
+	struct omap_global_state *state;
+
+	state = kzalloc_obj(*state);
+	if (!state)
+		return ERR_PTR(-ENOMEM);
+
+	__drm_atomic_helper_private_obj_create_state(obj, &state->base);
+
+	return &state->base;
+}
+
 static const struct drm_private_state_funcs omap_global_state_funcs = {
+	.atomic_create_state = omap_global_atomic_create_state,
 	.atomic_duplicate_state = omap_global_duplicate_state,
 	.atomic_destroy_state = omap_global_destroy_state,
 };
@@ -283,13 +297,8 @@ static const struct drm_private_state_funcs omap_global_state_funcs = {
 static int omap_global_obj_init(struct drm_device *dev)
 {
 	struct omap_drm_private *priv = dev->dev_private;
-	struct omap_global_state *state;
 
-	state = kzalloc(sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
-
-	drm_atomic_private_obj_init(dev, &priv->glob_obj, &state->base,
+	drm_atomic_private_obj_init(dev, &priv->glob_obj,
 				    &omap_global_state_funcs);
 	return 0;
 }
@@ -379,10 +388,8 @@ static int omap_display_id(struct omap_dss_device *output)
 	struct device_node *node = NULL;
 
 	if (output->bridge) {
-		struct drm_bridge *bridge = output->bridge;
-
-		while (drm_bridge_get_next_bridge(bridge))
-			bridge = drm_bridge_get_next_bridge(bridge);
+		struct drm_bridge *bridge __free(drm_bridge_put) =
+			drm_bridge_chain_get_last_bridge(output->bridge->encoder);
 
 		node = bridge->of_node;
 	}
@@ -498,8 +505,6 @@ static int omap_modeset_init(struct drm_device *dev)
 				pipe->output->name);
 			return PTR_ERR(pipe->connector);
 		}
-
-		drm_connector_attach_encoder(pipe->connector, encoder);
 
 		crtc = omap_crtc_init(dev, pipe, priv->planes[i]);
 		if (IS_ERR(crtc))
@@ -653,7 +658,6 @@ static const struct drm_driver omap_drm_driver = {
 	.fops = &omapdriver_fops,
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
-	.date = DRIVER_DATE,
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
@@ -801,7 +805,7 @@ static int pdev_probe(struct platform_device *pdev)
 	}
 
 	/* Allocate and initialize the driver private structure. */
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv)
 		return -ENOMEM;
 

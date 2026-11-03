@@ -23,8 +23,10 @@ static int pla_read_word(struct usbnet *dev, u16 index)
 
 	ret = usbnet_read_cmd(dev, RTL8152_REQ_GET_REGS, RTL8152_REQT_READ, index,
 			      MCU_TYPE_PLA | byen, &tmp, sizeof(tmp));
-	if (ret < 0)
+	if (ret != sizeof(tmp)) {
+		ret = ret < 0 ? ret : -ENODATA;
 		goto out;
+	}
 
 	ret = __le32_to_cpu(tmp);
 	ret >>= (shift * 8);
@@ -55,8 +57,10 @@ static int pla_write_word(struct usbnet *dev, u16 index, u32 data)
 	ret = usbnet_read_cmd(dev, RTL8152_REQ_GET_REGS, RTL8152_REQT_READ, index,
 			      MCU_TYPE_PLA | byen, &tmp, sizeof(tmp));
 
-	if (ret < 0)
+	if (ret != sizeof(tmp)) {
+		ret = ret < 0 ? ret : -ENODATA;
 		goto out;
+	}
 
 	data |= __le32_to_cpu(tmp) & ~mask;
 	tmp = __cpu_to_le32(data);
@@ -132,6 +136,12 @@ static const struct usb_device_id products[] = {
 /* Lenovo Powered USB-C Travel Hub (4X90S92381, based on Realtek RTL8153) */
 {
 	USB_DEVICE_AND_INTERFACE_INFO(VENDOR_ID_LENOVO, 0x721e, USB_CLASS_COMM,
+				      USB_CDC_SUBCLASS_ETHERNET, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long)&r8153_info,
+},
+/* Lenovo ThinkPad Hybrid USB-C with USB-A Dock (40af0135eu, based on Realtek RTL8153) */
+{
+	USB_DEVICE_AND_INTERFACE_INFO(VENDOR_ID_LENOVO, 0xa359, USB_CLASS_COMM,
 				      USB_CDC_SUBCLASS_ETHERNET, USB_CDC_PROTO_NONE),
 	.driver_info = (unsigned long)&r8153_info,
 },

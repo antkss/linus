@@ -322,13 +322,13 @@ void saa7134_buffer_next(struct saa7134_dev *dev,
 		/* nothing to do -- just stop DMA */
 		core_dbg("buffer_next %p\n", NULL);
 		saa7134_set_dmabits(dev);
-		del_timer(&q->timeout);
+		timer_delete(&q->timeout);
 	}
 }
 
 void saa7134_buffer_timeout(struct timer_list *t)
 {
-	struct saa7134_dmaqueue *q = from_timer(q, t, timeout);
+	struct saa7134_dmaqueue *q = timer_container_of(q, t, timeout);
 	struct saa7134_dev *dev = q->dev;
 	unsigned long flags;
 
@@ -364,7 +364,7 @@ void saa7134_stop_streaming(struct saa7134_dev *dev, struct saa7134_dmaqueue *q)
 		tmp = NULL;
 	}
 	spin_unlock_irqrestore(&dev->slock, flags);
-	saa7134_buffer_timeout(&q->timeout); /* also calls del_timer(&q->timeout) */
+	saa7134_buffer_timeout(&q->timeout); /* also calls timer_delete(&q->timeout) */
 }
 EXPORT_SYMBOL_GPL(saa7134_stop_streaming);
 
@@ -1010,7 +1010,7 @@ static int saa7134_initdev(struct pci_dev *pci_dev,
 	if (saa7134_devcount == SAA7134_MAXBOARDS)
 		return -ENOMEM;
 
-	dev = kzalloc(sizeof(*dev),GFP_KERNEL);
+	dev = kzalloc_obj(*dev);
 	if (NULL == dev)
 		return -ENOMEM;
 
@@ -1018,7 +1018,7 @@ static int saa7134_initdev(struct pci_dev *pci_dev,
 	sprintf(dev->name, "saa%x[%d]", pci_dev->device, dev->nr);
 
 #ifdef CONFIG_MEDIA_CONTROLLER
-	dev->media_dev = kzalloc(sizeof(*dev->media_dev), GFP_KERNEL);
+	dev->media_dev = kzalloc_obj(*dev->media_dev);
 	if (!dev->media_dev) {
 		err = -ENOMEM;
 		goto err_free_dev;
@@ -1368,7 +1368,7 @@ static int __maybe_unused saa7134_buffer_requeue(struct saa7134_dev *dev,
 	return 0;
 }
 
-static int __maybe_unused saa7134_suspend(struct device *dev_d)
+static int saa7134_suspend(struct device *dev_d)
 {
 	struct pci_dev *pci_dev = to_pci_dev(dev_d);
 	struct v4l2_device *v4l2_dev = pci_get_drvdata(pci_dev);
@@ -1390,9 +1390,9 @@ static int __maybe_unused saa7134_suspend(struct device *dev_d)
 	/* Disable timeout timers - if we have active buffers, we will
 	   fill them on resume*/
 
-	del_timer(&dev->video_q.timeout);
-	del_timer(&dev->vbi_q.timeout);
-	del_timer(&dev->ts_q.timeout);
+	timer_delete(&dev->video_q.timeout);
+	timer_delete(&dev->vbi_q.timeout);
+	timer_delete(&dev->ts_q.timeout);
 
 	if (dev->remote && dev->remote->dev->users)
 		saa7134_ir_close(dev->remote->dev);
@@ -1400,7 +1400,7 @@ static int __maybe_unused saa7134_suspend(struct device *dev_d)
 	return 0;
 }
 
-static int __maybe_unused saa7134_resume(struct device *dev_d)
+static int saa7134_resume(struct device *dev_d)
 {
 	struct v4l2_device *v4l2_dev = dev_get_drvdata(dev_d);
 	struct saa7134_dev *dev = container_of(v4l2_dev, struct saa7134_dev, v4l2_dev);
@@ -1484,14 +1484,14 @@ EXPORT_SYMBOL(saa7134_ts_unregister);
 
 /* ----------------------------------------------------------- */
 
-static SIMPLE_DEV_PM_OPS(saa7134_pm_ops, saa7134_suspend, saa7134_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(saa7134_pm_ops, saa7134_suspend, saa7134_resume);
 
 static struct pci_driver saa7134_pci_driver = {
 	.name     = "saa7134",
 	.id_table = saa7134_pci_tbl,
 	.probe    = saa7134_initdev,
 	.remove   = saa7134_finidev,
-	.driver.pm = &saa7134_pm_ops,
+	.driver.pm = pm_sleep_ptr(&saa7134_pm_ops),
 };
 
 static int __init saa7134_init(void)

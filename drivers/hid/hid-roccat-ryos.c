@@ -47,7 +47,7 @@ ROCCAT_COMMON2_BIN_ATTRIBUTE_RW(stored_lights, 0x17, 0x0566);
 ROCCAT_COMMON2_BIN_ATTRIBUTE_W(custom_lights, 0x18, 0x14);
 ROCCAT_COMMON2_BIN_ATTRIBUTE_RW(light_macro, 0x19, 0x07d2);
 
-static struct bin_attribute *ryos_bin_attrs[] = {
+static const struct bin_attribute *const ryos_bin_attrs[] = {
 	&bin_attr_control,
 	&bin_attr_profile,
 	&bin_attr_keys_primary,
@@ -96,7 +96,7 @@ static int ryos_init_specials(struct hid_device *hdev)
 		return 0;
 	}
 
-	ryos = kzalloc(sizeof(*ryos), GFP_KERNEL);
+	ryos = kzalloc_obj(*ryos);
 	if (!ryos) {
 		hid_err(hdev, "can't alloc device descriptor\n");
 		return -ENOMEM;
@@ -187,6 +187,9 @@ static int ryos_raw_event(struct hid_device *hdev,
 
 	if (intf->cur_altsetting->desc.bInterfaceProtocol
 			!= RYOS_USB_INTERFACE_PROTOCOL)
+		return 0;
+
+	if (size < sizeof(struct ryos_report_special))
 		return 0;
 
 	if (data[0] != RYOS_REPORT_NUMBER_SPECIAL)

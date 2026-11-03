@@ -14,6 +14,7 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 #include <linux/pinctrl/machine.h>
 #include <linux/pinctrl/pinconf-generic.h>
@@ -40,7 +41,7 @@ struct gemini_pin_conf {
 /**
  * struct gemini_pmx - state holder for the gemini pin controller
  * @dev: a pointer back to containing device
- * @virtbase: the offset to the controller in virtual memory
+ * @pctl: the pin controller device
  * @map: regmap to access registers
  * @is_3512: whether the SoC/package is the 3512 variant
  * @is_3516: whether the SoC/package is the 3516 variant
@@ -2030,6 +2031,7 @@ static const struct pinctrl_ops gemini_pctrl_ops = {
  * struct gemini_pmx_func - describes Gemini pinmux functions
  * @name: the name of this specific function
  * @groups: corresponding pin groups
+ * @num_groups: the number of pin groups
  */
 struct gemini_pmx_func {
 	const char *name;
@@ -2237,7 +2239,7 @@ static int gemini_pmx_set_mux(struct pinctrl_dev *pctldev,
 				"pin group %s could not be %s: "
 				"probably a hardware limitation\n",
 				gemini_padgroups[i],
-				enabled ? "enabled" : "disabled");
+				str_enabled_disabled(enabled));
 			dev_err(pmx->dev,
 				"GLOBAL MISC CTRL before: %08x, after %08x, expected %08x\n",
 				before, after, expected);
@@ -2245,7 +2247,7 @@ static int gemini_pmx_set_mux(struct pinctrl_dev *pctldev,
 			dev_dbg(pmx->dev,
 				"padgroup %s %s\n",
 				gemini_padgroups[i],
-				enabled ? "enabled" : "disabled");
+				str_enabled_disabled(enabled));
 		}
 	}
 
@@ -2259,7 +2261,7 @@ static int gemini_pmx_set_mux(struct pinctrl_dev *pctldev,
 				"pin group %s could not be %s: "
 				"probably a hardware limitation\n",
 				gemini_padgroups[i],
-				enabled ? "enabled" : "disabled");
+				str_enabled_disabled(enabled));
 			dev_err(pmx->dev,
 				"GLOBAL MISC CTRL before: %08x, after %08x, expected %08x\n",
 				before, after, expected);
@@ -2267,7 +2269,7 @@ static int gemini_pmx_set_mux(struct pinctrl_dev *pctldev,
 			dev_dbg(pmx->dev,
 				"padgroup %s %s\n",
 				gemini_padgroups[i],
-				enabled ? "enabled" : "disabled");
+				str_enabled_disabled(enabled));
 		}
 	}
 
@@ -2588,7 +2590,7 @@ static int gemini_pmx_probe(struct platform_device *pdev)
 	tmp = val;
 	for_each_set_bit(i, &tmp, PADS_MAXBIT) {
 		dev_dbg(dev, "pad group %s %s\n", gemini_padgroups[i],
-			(val & BIT(i)) ? "enabled" : "disabled");
+			str_enabled_disabled(val & BIT(i)));
 	}
 
 	/* Check if flash pin is set */

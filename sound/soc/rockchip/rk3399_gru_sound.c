@@ -258,10 +258,20 @@ static int rockchip_sound_dmic_hw_params(struct snd_pcm_substream *substream,
 static int rockchip_sound_startup(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
 
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
-	return snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_RATE,
-			8000, 96000);
+	ret = snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_RATE,
+					   8000, 96000);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * ASoC only marks the DAI link as started when .startup() returns 0.
+	 * Since snd_pcm_hw_constraint_minmax() may return 1, explicitly
+	 * return 0 to ensure the DAI link is correctly marked as started.
+	 */
+	return 0;
 }
 
 static const struct snd_soc_ops rockchip_sound_max98357a_ops = {
@@ -338,7 +348,7 @@ static const struct snd_soc_dai_link rockchip_dais[] = {
 		.stream_name = "DP PCM",
 		.init = rockchip_sound_cdndp_init,
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS,
+			SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(cdndp),
 	},
 	[DAILINK_DA7219] = {
@@ -348,7 +358,7 @@ static const struct snd_soc_dai_link rockchip_dais[] = {
 		.ops = &rockchip_sound_da7219_ops,
 		/* set da7219 as slave */
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS,
+			SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(da7219),
 	},
 	[DAILINK_DMIC] = {
@@ -356,7 +366,7 @@ static const struct snd_soc_dai_link rockchip_dais[] = {
 		.stream_name = "DMIC PCM",
 		.ops = &rockchip_sound_dmic_ops,
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS,
+			SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(dmic),
 	},
 	[DAILINK_MAX98357A] = {
@@ -365,7 +375,7 @@ static const struct snd_soc_dai_link rockchip_dais[] = {
 		.ops = &rockchip_sound_max98357a_ops,
 		/* set max98357a as slave */
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS,
+			SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(max98357a),
 	},
 	[DAILINK_RT5514] = {
@@ -374,7 +384,7 @@ static const struct snd_soc_dai_link rockchip_dais[] = {
 		.ops = &rockchip_sound_rt5514_ops,
 		/* set rt5514 as slave */
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS,
+			SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(rt5514),
 	},
 	/* RT5514 DSP for voice wakeup via spi bus */
@@ -505,8 +515,8 @@ static int rockchip_sound_of_parse_dais(struct device *dev,
 	int i, index;
 	int num_routes;
 
-	card->dai_link = devm_kzalloc(dev, sizeof(rockchip_dais),
-				      GFP_KERNEL);
+	card->dai_link = devm_kcalloc(dev, ARRAY_SIZE(rockchip_dais),
+				      sizeof(*card->dai_link), GFP_KERNEL);
 	if (!card->dai_link)
 		return -ENOMEM;
 
@@ -606,6 +616,7 @@ static const struct of_device_id rockchip_sound_of_match[] = {
 	{ .compatible = "rockchip,rk3399-gru-sound", },
 	{},
 };
+MODULE_DEVICE_TABLE(of, rockchip_sound_of_match);
 
 static struct platform_driver rockchip_sound_driver = {
 	.probe = rockchip_sound_probe,
@@ -624,4 +635,3 @@ MODULE_AUTHOR("Xing Zheng <zhengxing@rock-chips.com>");
 MODULE_DESCRIPTION("Rockchip ASoC Machine Driver");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:" DRV_NAME);
-MODULE_DEVICE_TABLE(of, rockchip_sound_of_match);

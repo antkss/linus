@@ -21,7 +21,7 @@ static int tb_eeprom_ctl_write(struct tb_switch *sw, struct tb_eeprom_ctl *ctl)
 }
 
 /*
- * tb_eeprom_ctl_write() - read control word
+ * tb_eeprom_ctl_read() - read control word
  */
 static int tb_eeprom_ctl_read(struct tb_switch *sw, struct tb_eeprom_ctl *ctl)
 {
@@ -211,7 +211,7 @@ static u8 tb_crc8(u8 *data, int len)
 
 static u32 tb_crc32(void *data, size_t len)
 {
-	return ~__crc32c_le(~0, data, len);
+	return ~crc32c(~0, data, len);
 }
 
 #define TB_DROM_DATA_START		13
@@ -298,6 +298,8 @@ struct tb_drom_entry_desc {
  *
  * Does not use the cached copy in sw->drom. Used during resume to check switch
  * identity.
+ *
+ * Return: %0 on success, negative errno otherwise.
  */
 int tb_drom_read_uid_only(struct tb_switch *sw, u64 *uid)
 {
@@ -322,7 +324,7 @@ int tb_drom_read_uid_only(struct tb_switch *sw, u64 *uid)
 }
 
 static int tb_drom_parse_entry_generic(struct tb_switch *sw,
-		struct tb_drom_entry_header *header)
+		const struct tb_drom_entry_header *header)
 {
 	const struct tb_drom_entry_generic *entry =
 		(const struct tb_drom_entry_generic *)header;
@@ -358,7 +360,7 @@ static int tb_drom_parse_entry_generic(struct tb_switch *sw,
 }
 
 static int tb_drom_parse_entry_port(struct tb_switch *sw,
-				    struct tb_drom_entry_header *header)
+				    const struct tb_drom_entry_header *header)
 {
 	struct tb_port *port;
 	int res;
@@ -384,17 +386,26 @@ static int tb_drom_parse_entry_port(struct tb_switch *sw,
 	type &= 0xffffff;
 
 	if (type == TB_TYPE_PORT) {
-		struct tb_drom_entry_port *entry = (void *) header;
+		const struct tb_drom_entry_port *entry =
+			(const struct tb_drom_entry_port *)header;
+
 		if (header->len != sizeof(*entry)) {
 			tb_sw_warn(sw,
 				"port entry has size %#x (expected %#zx)\n",
-				header->len, sizeof(struct tb_drom_entry_port));
+				header->len, sizeof(*entry));
 			return -EIO;
 		}
 		port->link_nr = entry->link_nr;
-		if (entry->has_dual_link_port)
+		if (entry->has_dual_link_port) {
+			if (entry->dual_link_port_nr > sw->config.max_port_number) {
+				tb_sw_warn(sw,
+					"port entry has invalid dual link port number %u\n",
+					entry->dual_link_port_nr);
+				return -EIO;
+			}
 			port->dual_link_port =
 				&port->sw->ports[entry->dual_link_port_nr];
+		}
 	}
 	return 0;
 }
@@ -412,9 +423,16 @@ static int tb_drom_parse_entries(struct tb_switch *sw, size_t header_size)
 	int res;
 
 	while (pos < drom_size) {
-		struct tb_drom_entry_header *entry = (void *) (sw->drom + pos);
-		if (pos + 1 == drom_size || pos + entry->len > drom_size
-				|| !entry->len) {
+		const struct tb_drom_entry_header *entry;
+
+		if (drom_size - pos < sizeof(*entry)) {
+			tb_sw_warn(sw, "DROM buffer overrun\n");
+			return -EIO;
+		}
+
+		entry = (const struct tb_drom_entry_header *)(sw->drom + pos);
+		if (entry->len < sizeof(*entry) ||
+		    entry->len > drom_size - pos) {
 			tb_sw_warn(sw, "DROM buffer overrun\n");
 			return -EIO;
 		}
@@ -435,21 +453,44 @@ static int tb_drom_parse_entries(struct tb_switch *sw, size_t header_size)
 	return 0;
 }
 
+static int tb_switch_drom_alloc(struct tb_switch *sw, size_t size)
+{
+	sw->drom = kzalloc(size, GFP_KERNEL);
+	if (!sw->drom)
+		return -ENOMEM;
+
+#ifdef CONFIG_DEBUG_FS
+	sw->drom_blob.data = sw->drom;
+	sw->drom_blob.size = size;
+#endif
+	return 0;
+}
+
+static void tb_switch_drom_free(struct tb_switch *sw)
+{
+#ifdef CONFIG_DEBUG_FS
+	sw->drom_blob.data = NULL;
+	sw->drom_blob.size = 0;
+#endif
+	kfree(sw->drom);
+	sw->drom = NULL;
+}
+
 /*
  * tb_drom_copy_efi - copy drom supplied by EFI to sw->drom if present
  */
 static int tb_drom_copy_efi(struct tb_switch *sw, u16 *size)
 {
-	struct device *dev = &sw->tb->nhi->pdev->dev;
+	struct device *dev = sw->tb->nhi->dev;
 	int len, res;
 
 	len = device_property_count_u8(dev, "ThunderboltDROM");
 	if (len < 0 || len < sizeof(struct tb_drom_header))
 		return -EINVAL;
 
-	sw->drom = kmalloc(len, GFP_KERNEL);
-	if (!sw->drom)
-		return -ENOMEM;
+	res = tb_switch_drom_alloc(sw, len);
+	if (res)
+		return res;
 
 	res = device_property_read_u8_array(dev, "ThunderboltDROM", sw->drom,
 									len);
@@ -464,8 +505,7 @@ static int tb_drom_copy_efi(struct tb_switch *sw, u16 *size)
 	return 0;
 
 err:
-	kfree(sw->drom);
-	sw->drom = NULL;
+	tb_switch_drom_free(sw);
 	return -EINVAL;
 }
 
@@ -491,13 +531,15 @@ static int tb_drom_copy_nvm(struct tb_switch *sw, u16 *size)
 
 	/* Size includes CRC8 + UID + CRC32 */
 	*size += 1 + 8 + 4;
-	sw->drom = kzalloc(*size, GFP_KERNEL);
-	if (!sw->drom)
-		return -ENOMEM;
+	ret = tb_switch_drom_alloc(sw, *size);
+	if (ret)
+		return ret;
 
 	ret = dma_port_flash_read(sw->dma_port, drom_offset, sw->drom, *size);
-	if (ret)
-		goto err_free;
+	if (ret) {
+		tb_switch_drom_free(sw);
+		return ret;
+	}
 
 	/*
 	 * Read UID from the minimal DROM because the one in NVM is just
@@ -505,11 +547,6 @@ static int tb_drom_copy_nvm(struct tb_switch *sw, u16 *size)
 	 */
 	tb_drom_read_uid_only(sw, &sw->uid);
 	return 0;
-
-err_free:
-	kfree(sw->drom);
-	sw->drom = NULL;
-	return ret;
 }
 
 static int usb4_copy_drom(struct tb_switch *sw, u16 *size)
@@ -522,15 +559,13 @@ static int usb4_copy_drom(struct tb_switch *sw, u16 *size)
 
 	/* Size includes CRC8 + UID + CRC32 */
 	*size += 1 + 8 + 4;
-	sw->drom = kzalloc(*size, GFP_KERNEL);
-	if (!sw->drom)
-		return -ENOMEM;
+	ret = tb_switch_drom_alloc(sw, *size);
+	if (ret)
+		return ret;
 
 	ret = usb4_switch_drom_read(sw, 0, sw->drom, *size);
-	if (ret) {
-		kfree(sw->drom);
-		sw->drom = NULL;
-	}
+	if (ret)
+		tb_switch_drom_free(sw);
 
 	return ret;
 }
@@ -552,19 +587,14 @@ static int tb_drom_bit_bang(struct tb_switch *sw, u16 *size)
 		return -EIO;
 	}
 
-	sw->drom = kzalloc(*size, GFP_KERNEL);
-	if (!sw->drom)
-		return -ENOMEM;
+	ret = tb_switch_drom_alloc(sw, *size);
+	if (ret)
+		return ret;
 
 	ret = tb_eeprom_read_n(sw, 0, sw->drom, *size);
 	if (ret)
-		goto err;
+		tb_switch_drom_free(sw);
 
-	return 0;
-
-err:
-	kfree(sw->drom);
-	sw->drom = NULL;
 	return ret;
 }
 
@@ -646,9 +676,7 @@ static int tb_drom_parse(struct tb_switch *sw, u16 size)
 	return 0;
 
 err:
-	kfree(sw->drom);
-	sw->drom = NULL;
-
+	tb_switch_drom_free(sw);
 	return ret;
 }
 
@@ -699,7 +727,7 @@ static int tb_drom_device_read(struct tb_switch *sw)
  * populates the fields in @sw accordingly. Can be called for any router
  * generation.
  *
- * Returns %0 in case of success and negative errno otherwise.
+ * Return: %0 on success, negative errno otherwise.
  */
 int tb_drom_read(struct tb_switch *sw)
 {

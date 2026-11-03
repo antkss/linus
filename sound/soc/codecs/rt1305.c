@@ -697,11 +697,11 @@ static int rt1305_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int reg_val = 0, reg1_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		reg_val |= RT1305_SEL_I2S_OUT_MODE_M;
 		rt1305->master = 1;
 		break;
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		reg_val |= RT1305_SEL_I2S_OUT_MODE_S;
 		rt1305->master = 0;
 		break;
@@ -896,9 +896,7 @@ static int rt1305_resume(struct snd_soc_component *component)
 	struct rt1305_priv *rt1305 = snd_soc_component_get_drvdata(component);
 
 	regcache_cache_only(rt1305->regmap, false);
-	regcache_sync(rt1305->regmap);
-
-	return 0;
+	return regcache_sync(rt1305->regmap);
 }
 #else
 #define rt1305_suspend NULL
@@ -910,9 +908,19 @@ static int rt1305_resume(struct snd_soc_component *component)
 			SNDRV_PCM_FMTBIT_S20_3LE | SNDRV_PCM_FMTBIT_S16_LE | \
 			SNDRV_PCM_FMTBIT_S24_LE)
 
+static const u64 rt1305_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt1305_aif_dai_ops = {
 	.hw_params = rt1305_hw_params,
 	.set_fmt = rt1305_set_dai_fmt,
+	.auto_selectable_formats = &rt1305_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver rt1305_dai[] = {
@@ -966,23 +974,23 @@ static const struct regmap_config rt1305_regmap = {
 static const struct of_device_id rt1305_of_match[] = {
 	{ .compatible = "realtek,rt1305", },
 	{ .compatible = "realtek,rt1306", },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, rt1305_of_match);
 #endif
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id rt1305_acpi_match[] = {
-	{"10EC1305", 0,},
-	{"10EC1306", 0,},
-	{},
+	{ "10EC1305" },
+	{ "10EC1306" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, rt1305_acpi_match);
 #endif
 
 static const struct i2c_device_id rt1305_i2c_id[] = {
-	{ "rt1305" },
-	{ "rt1306" },
+	{ .name = "rt1305" },
+	{ .name = "rt1306" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt1305_i2c_id);

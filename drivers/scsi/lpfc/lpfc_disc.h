@@ -1,7 +1,7 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017-2024 Broadcom. All Rights Reserved. The term *
+ * Copyright (C) 2017-2026 Broadcom. All Rights Reserved. The term *
  * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2013 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
@@ -77,6 +77,11 @@ struct lpfc_node_rrqs {
 	unsigned long xri_bitmap[XRI_BITMAP_ULONGS];
 };
 
+struct lpfc_enc_info {
+	u8 status; /* encryption status for session */
+	u8 level; /* CNSA encryption level */
+};
+
 enum lpfc_fc4_xpt_flags {
 	NLP_XPT_REGD		= 0x1,
 	SCSI_XPT_REGD		= 0x2,
@@ -85,13 +90,13 @@ enum lpfc_fc4_xpt_flags {
 	NLP_XPT_HAS_HH		= 0x10
 };
 
-enum lpfc_nlp_save_flags {
+enum lpfc_nlp_save_flags { /* mask bits */
 	/* devloss occurred during recovery */
-	NLP_IN_RECOV_POST_DEV_LOSS	= 0x1,
+	NLP_IN_RECOV_POST_DEV_LOSS,
 	/* wait for outstanding LOGO to cmpl */
-	NLP_WAIT_FOR_LOGO		= 0x2,
+	NLP_WAIT_FOR_LOGO,
 	/* wait for outstanding DA_ID to finish */
-	NLP_WAIT_FOR_DA_ID              = 0x4
+	NLP_WAIT_FOR_DA_ID
 };
 
 struct lpfc_nodelist {
@@ -132,11 +137,14 @@ struct lpfc_nodelist {
 	uint16_t	nlp_maxframe;		/* Max RCV frame size */
 	uint8_t		nlp_class_sup;		/* Supported Classes */
 	uint8_t         nlp_retry;		/* used for ELS retries */
-	uint8_t         nlp_fcp_info;	        /* class info, bits 0-3 */
+	uint8_t         nlp_fcp_info;	        /* class info, bits 0-2 */
+#define NLP_FCP_CLASS_MASK 0x07			/* class info bitmask */
 #define NLP_FCP_2_DEVICE   0x10			/* FCP-2 device */
 	u8		nlp_nvme_info;	        /* NVME NSLER Support */
 	uint8_t		vmid_support;		/* destination VMID support */
 #define NLP_NVME_NSLER     0x1			/* NVME NSLER device */
+
+	struct lpfc_enc_info nlp_enc_info; /* Encryption information struct */
 
 	struct timer_list   nlp_delayfunc;	/* Used for delayed ELS cmds */
 	struct lpfc_hba *phba;
@@ -154,7 +162,7 @@ struct lpfc_nodelist {
 	uint32_t fc4_prli_sent;
 
 	/* flags to keep ndlp alive until special conditions are met */
-	enum lpfc_nlp_save_flags save_flags;
+	unsigned long save_flags;
 
 	enum lpfc_fc4_xpt_flags fc4_xpt_flags;
 
@@ -208,7 +216,7 @@ enum lpfc_nlp_flag {
 					   NPR list */
 	NLP_RM_DFLT_RPI    = 26,        /* need to remove leftover dflt RPI */
 	NLP_NODEV_REMOVE   = 27,        /* Defer removal till discovery ends */
-	NLP_TARGET_REMOVE  = 28,        /* Target remove in process */
+	NLP_FLOGI_DFR_ACC  = 28,        /* FLOGI LS_ACC was Deferred */
 	NLP_SC_REQ         = 29,        /* Target requires authentication */
 	NLP_FIRSTBURST     = 30,        /* Target supports FirstBurst */
 	NLP_RPI_REGISTERED = 31         /* nlp_rpi is valid */

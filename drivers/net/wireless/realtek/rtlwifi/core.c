@@ -58,17 +58,6 @@ void rtl_rfreg_delay(struct ieee80211_hw *hw, enum radio_path rfpath, u32 addr,
 }
 EXPORT_SYMBOL(rtl_rfreg_delay);
 
-void rtl_bb_delay(struct ieee80211_hw *hw, u32 addr, u32 data)
-{
-	if (addr >= 0xf9 && addr <= 0xfe) {
-		rtl_addr_delay(addr);
-	} else {
-		rtl_set_bbreg(hw, addr, MASKDWORD, data);
-		udelay(1);
-	}
-}
-EXPORT_SYMBOL(rtl_bb_delay);
-
 static void rtl_fw_do_work(const struct firmware *firmware, void *context,
 			   bool is_wow)
 {
@@ -577,7 +566,7 @@ static int rtl_op_resume(struct ieee80211_hw *hw)
 }
 #endif
 
-static int rtl_op_config(struct ieee80211_hw *hw, u32 changed)
+static int rtl_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct rtl_phy *rtlphy = &(rtlpriv->phy);
@@ -619,7 +608,7 @@ static int rtl_op_config(struct ieee80211_hw *hw, u32 changed)
 			/* sleep here is must, or we may recv the beacon and
 			 * cause mac80211 into wrong ps state, this will cause
 			 * power save nullfunc send fail, and further cause
-			 * pkt loss, So sleep must quickly but not immediatly
+			 * pkt loss, So sleep must quickly but not immediately
 			 * because that will cause nullfunc send by mac80211
 			 * fail, and cause pkt loss, we have tested that 5mA
 			 * is worked very well */
@@ -1722,7 +1711,7 @@ static void rtl_op_rfkill_poll(struct ieee80211_hw *hw)
 }
 
 /* this function is called by mac80211 to flush tx buffer
- * before switch channle or power save, or tx buffer packet
+ * before switch channel or power save, or tx buffer packet
  * maybe send after offchannel or rf sleep, this may cause
  * dis-association by AP */
 static void rtl_op_flush(struct ieee80211_hw *hw,

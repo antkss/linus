@@ -43,6 +43,7 @@ extern void rtnl_lock(void);
 extern void rtnl_unlock(void);
 extern int rtnl_trylock(void);
 extern int rtnl_is_locked(void);
+extern int rtnl_lock_interruptible(void);
 extern int rtnl_lock_killable(void);
 extern bool refcount_dec_and_rtnl_lock(refcount_t *r);
 
@@ -78,7 +79,7 @@ static inline bool lockdep_rtnl_is_held(void)
  * rtnl_dereference - fetch RCU pointer when updates are prevented by RTNL
  * @p: The pointer to read, prior to dereferencing
  *
- * Return the value of the specified RCU-protected pointer, but omit
+ * Return: the value of the specified RCU-protected pointer, but omit
  * the READ_ONCE(), because caller holds RTNL.
  */
 #define rtnl_dereference(p)					\
@@ -102,6 +103,7 @@ void __rtnl_net_unlock(struct net *net);
 void rtnl_net_lock(struct net *net);
 void rtnl_net_unlock(struct net *net);
 int rtnl_net_trylock(struct net *net);
+int rtnl_net_lock_killable(struct net *net);
 int rtnl_net_lock_cmp_fn(const struct lockdep_map *a, const struct lockdep_map *b);
 
 bool rtnl_net_is_locked(struct net *net);
@@ -112,6 +114,10 @@ bool rtnl_net_is_locked(struct net *net);
 		  __FILE__,  __LINE__)
 
 bool lockdep_rtnl_net_is_held(struct net *net);
+
+void rtnl_net_queue_work(struct net *net);
+void rtnl_net_flush_workqueue(void);
+void rtnl_net_work_func(struct work_struct *work);
 
 #define rcu_dereference_rtnl_net(net, p)				\
 	rcu_dereference_check(p, lockdep_rtnl_net_is_held(net))
@@ -138,9 +144,18 @@ static inline int rtnl_net_trylock(struct net *net)
 	return rtnl_trylock();
 }
 
+static inline int rtnl_net_lock_killable(struct net *net)
+{
+	return rtnl_lock_killable();
+}
+
 static inline void ASSERT_RTNL_NET(struct net *net)
 {
 	ASSERT_RTNL();
+}
+
+static inline void rtnl_net_flush_workqueue(void)
+{
 }
 
 #define rcu_dereference_rtnl_net(net, p)		\
@@ -171,12 +186,23 @@ void net_dec_ingress_queue(void);
 #ifdef CONFIG_NET_EGRESS
 void net_inc_egress_queue(void);
 void net_dec_egress_queue(void);
-void netdev_xmit_skip_txqueue(bool skip);
+bool netdev_xmit_skip_txqueue(bool skip);
+#else
+static inline bool netdev_xmit_skip_txqueue(bool skip)
+{
+	return false;
+}
 #endif
 
 void rtnetlink_init(void);
 void __rtnl_unlock(void);
 void rtnl_kfree_skbs(struct sk_buff *head, struct sk_buff *tail);
+
+/* Shared by rtnl_fdb_dump() and various ndo_fdb_dump() helpers. */
+struct ndo_fdb_dump_context {
+	unsigned long ifindex;
+	unsigned long fdb_idx;
+};
 
 extern int ndo_dflt_fdb_dump(struct sk_buff *skb,
 			     struct netlink_callback *cb,
@@ -227,6 +253,6 @@ rtnl_notify_needed(const struct net *net, u16 nlflags, u32 group)
 	return (nlflags & NLM_F_ECHO) || rtnl_has_listeners(net, group);
 }
 
-void netdev_set_operstate(struct net_device *dev, int newstate);
+void netif_set_operstate(struct net_device *dev, int newstate);
 
 #endif	/* __LINUX_RTNETLINK_H */

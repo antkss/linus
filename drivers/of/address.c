@@ -16,25 +16,12 @@
 #include <linux/string.h>
 #include <linux/dma-direct.h> /* for bus_dma_region */
 
+#include <kunit/visibility.h>
+
+/* Uncomment me to enable of_dump_addr() debugging output */
+// #define DEBUG
+
 #include "of_private.h"
-
-/* Max address size we deal with */
-#define OF_MAX_ADDR_CELLS	4
-#define OF_CHECK_ADDR_COUNT(na)	((na) > 0 && (na) <= OF_MAX_ADDR_CELLS)
-#define OF_CHECK_COUNTS(na, ns)	(OF_CHECK_ADDR_COUNT(na) && (ns) > 0)
-
-/* Debug utility */
-#ifdef DEBUG
-static void of_dump_addr(const char *s, const __be32 *addr, int na)
-{
-	pr_debug("%s", s);
-	while (na--)
-		pr_cont(" %08x", be32_to_cpu(*(addr++)));
-	pr_cont("\n");
-}
-#else
-static void of_dump_addr(const char *s, const __be32 *addr, int na) { }
-#endif
 
 /* Callbacks for bus specific translators */
 struct of_bus {
@@ -198,22 +185,21 @@ static u64 of_bus_pci_map(__be32 *addr, const __be32 *range, int na, int ns,
 
 #endif /* CONFIG_PCI */
 
-static int __of_address_resource_bounds(struct resource *r, u64 start, u64 size)
+VISIBLE_IF_KUNIT int __of_address_resource_bounds(struct resource *r, u64 start, u64 size)
 {
-	u64 end = start;
-
 	if (overflows_type(start, r->start))
-		return -EOVERFLOW;
-	if (size && check_add_overflow(end, size - 1, &end))
-		return -EOVERFLOW;
-	if (overflows_type(end, r->end))
 		return -EOVERFLOW;
 
 	r->start = start;
-	r->end = end;
+
+	if (!size)
+		r->end = wrapping_sub(typeof(r->end), r->start, 1);
+	else if (size && check_add_overflow(r->start, size - 1, &r->end))
+		return -EOVERFLOW;
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(__of_address_resource_bounds);
 
 /*
  * of_pci_range_to_resource - Create a resource from an of_pci_range
@@ -340,6 +326,11 @@ static int of_bus_default_flags_match(struct device_node *np)
 	return of_property_present(np, "#address-cells") && (of_bus_n_addr_cells(np) == 3);
 }
 
+static int of_bus_default_match(struct device_node *np)
+{
+	return of_property_present(np, "#address-cells");
+}
+
 /*
  * Array of bus specific translators
  */
@@ -384,7 +375,7 @@ static const struct of_bus of_busses[] = {
 	{
 		.name = "default",
 		.addresses = "reg",
-		.match = NULL,
+		.match = of_bus_default_match,
 		.count_cells = of_bus_default_count_cells,
 		.map = of_bus_default_map,
 		.translate = of_bus_default_translate,
@@ -399,7 +390,6 @@ static const struct of_bus *of_match_bus(struct device_node *np)
 	for (i = 0; i < ARRAY_SIZE(of_busses); i++)
 		if (!of_busses[i].match || of_busses[i].match(np))
 			return &of_busses[i];
-	BUG();
 	return NULL;
 }
 
@@ -521,6 +511,8 @@ static u64 __of_translate_address(struct device_node *node,
 	if (parent == NULL)
 		return OF_BAD_ADDR;
 	bus = of_match_bus(parent);
+	if (!bus)
+		return OF_BAD_ADDR;
 
 	/* Count address cells & copy address locally */
 	bus->count_cells(dev, &na, &ns);
@@ -564,6 +556,8 @@ static u64 __of_translate_address(struct device_node *node,
 
 		/* Get new parent bus and counts */
 		pbus = of_match_bus(parent);
+		if (!pbus)
+			return OF_BAD_ADDR;
 		pbus->count_cells(dev, &pna, &pns);
 		if (!OF_CHECK_COUNTS(pna, pns)) {
 			pr_err("Bad cell count for %pOF\n", dev);
@@ -703,7 +697,7 @@ const __be32 *__of_get_address(struct device_node *dev, int index, int bar_no,
 
 	/* match the parent's bus type */
 	bus = of_match_bus(parent);
-	if (strcmp(bus->name, "pci") && (bar_no >= 0))
+	if (!bus || (strcmp(bus->name, "pci") && (bar_no >= 0)))
 		return NULL;
 
 	/* Get "reg" or "assigned-addresses" property */
@@ -759,6 +753,7 @@ EXPORT_SYMBOL(of_property_read_reg);
 static int parser_init(struct of_pci_range_parser *parser,
 			struct device_node *node, const char *name)
 {
+	const __be32 *range;
 	int rlen;
 
 	parser->node = node;
@@ -767,12 +762,20 @@ static int parser_init(struct of_pci_range_parser *parser,
 	parser->ns = of_bus_n_size_cells(node);
 	parser->dma = !strcmp(name, "dma-ranges");
 	parser->bus = of_match_bus(node);
+	parser->range = NULL;
+	parser->end = NULL;
 
-	parser->range = of_get_property(node, name, &rlen);
-	if (parser->range == NULL)
+	range = of_get_property(node, name, &rlen);
+	if (!range)
 		return -ENOENT;
 
-	parser->end = parser->range + rlen / sizeof(__be32);
+	if (!parser->bus ||
+	    !OF_CHECK_COUNTS(parser->na, parser->ns) ||
+	    !OF_CHECK_ADDR_COUNT(parser->pna))
+		return -EINVAL;
+
+	parser->range = range;
+	parser->end = range + rlen / sizeof(__be32);
 
 	return 0;
 }
@@ -798,13 +801,15 @@ struct of_pci_range *of_pci_range_parser_one(struct of_pci_range_parser *parser,
 	int na = parser->na;
 	int ns = parser->ns;
 	int np = parser->pna + na + ns;
-	int busflag_na = parser->bus->flag_cells;
+	int busflag_na;
 
 	if (!range)
 		return NULL;
 
 	if (!parser->range || parser->range + np > parser->end)
 		return NULL;
+
+	busflag_na = parser->bus->flag_cells;
 
 	range->flags = parser->bus->get_flags(parser->range);
 
@@ -816,6 +821,8 @@ struct of_pci_range *of_pci_range_parser_one(struct of_pci_range_parser *parser,
 	else
 		range->cpu_addr = of_translate_address(parser->node,
 				parser->range + na);
+
+	range->parent_bus_addr = of_read_number(parser->range + na, parser->pna);
 	range->size = of_read_number(parser->range + parser->pna + na, ns);
 
 	parser->range += np;
@@ -933,7 +940,7 @@ int of_dma_get_range(struct device_node *np, const struct bus_dma_region **map)
 	if (!num_ranges)
 		return -EINVAL;
 
-	r = kcalloc(num_ranges + 1, sizeof(*r), GFP_KERNEL);
+	r = kzalloc_objs(*r, num_ranges + 1);
 	if (!r)
 		return -ENOMEM;
 
@@ -980,8 +987,7 @@ phys_addr_t __init of_dma_get_max_cpu_address(struct device_node *np)
 		np = of_root;
 
 	ranges = of_get_property(np, "dma-ranges", &len);
-	if (ranges && len) {
-		of_dma_range_parser_init(&parser, np);
+	if (ranges && len && !of_dma_range_parser_init(&parser, np)) {
 		for_each_of_range(&parser, &range)
 			if (range.cpu_addr + range.size > cpu_end)
 				cpu_end = range.cpu_addr + range.size - 1;
@@ -1031,20 +1037,15 @@ EXPORT_SYMBOL_GPL(of_dma_is_coherent);
  *
  * Returns true if the "nonposted-mmio" property was found for
  * the device's bus.
- *
- * This is currently only enabled on builds that support Apple ARM devices, as
- * an optimization.
  */
 static bool of_mmio_is_nonposted(const struct device_node *np)
 {
-	if (!IS_ENABLED(CONFIG_ARCH_APPLE))
-		return false;
-
 	struct device_node *parent __free(device_node) = of_get_parent(np);
-	if (!parent)
-		return false;
 
-	return of_property_read_bool(parent, "nonposted-mmio");
+	if (of_property_read_bool(np, "nonposted-mmio"))
+		return true;
+
+	return parent && of_property_read_bool(parent, "nonposted-mmio");
 }
 
 static int __of_address_to_resource(struct device_node *dev, int index, int bar_no,

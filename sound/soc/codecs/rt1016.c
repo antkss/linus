@@ -367,11 +367,11 @@ static int rt1016_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int reg_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		reg_val |= RT1016_I2S_MS_M;
 		rt1016->master = 1;
 		break;
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		reg_val |= RT1016_I2S_MS_S;
 		break;
 	default:
@@ -534,9 +534,19 @@ static void rt1016_remove(struct snd_soc_component *component)
 #define RT1016_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
 			SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8)
 
+static const u64 rt1016_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt1016_aif_dai_ops = {
 	.hw_params = rt1016_hw_params,
 	.set_fmt = rt1016_set_dai_fmt,
+	.auto_selectable_formats	= &rt1016_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 };
 
 static struct snd_soc_dai_driver rt1016_dai[] = {
@@ -570,9 +580,7 @@ static int rt1016_resume(struct snd_soc_component *component)
 	struct rt1016_priv *rt1016 = snd_soc_component_get_drvdata(component);
 
 	regcache_cache_only(rt1016->regmap, false);
-	regcache_sync(rt1016->regmap);
-
-	return 0;
+	return regcache_sync(rt1016->regmap);
 }
 #else
 #define rt1016_suspend NULL
@@ -608,7 +616,7 @@ static const struct regmap_config rt1016_regmap = {
 };
 
 static const struct i2c_device_id rt1016_i2c_id[] = {
-	{ "rt1016" },
+	{ .name = "rt1016" },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt1016_i2c_id);
@@ -616,15 +624,15 @@ MODULE_DEVICE_TABLE(i2c, rt1016_i2c_id);
 #if defined(CONFIG_OF)
 static const struct of_device_id rt1016_of_match[] = {
 	{ .compatible = "realtek,rt1016", },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, rt1016_of_match);
 #endif
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id rt1016_acpi_match[] = {
-	{"10EC1016", 0,},
-	{},
+	{ "10EC1016" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, rt1016_acpi_match);
 #endif

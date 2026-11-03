@@ -82,7 +82,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
+#include <linux/device-id/hid.h>
 #include <linux/hid.h>
 #include <linux/kfifo.h>
 #include <linux/leds.h>
@@ -216,6 +216,14 @@ static inline __u32 wacom_s32tou(s32 value, __u8 n)
 	case 32: return ((__u32)value);
 	}
 	return value & (1 << (n - 1)) ? value & (~(~0U << n)) : value;
+}
+
+static inline u32 wacom_rescale(u32 value, u32 in_max, u32 out_max)
+{
+	if (in_max == 0 || out_max == 0)
+		return 0;
+	value = clamp(value, 0, in_max);
+	return DIV_ROUND_CLOSEST(value * out_max, in_max);
 }
 
 extern const struct hid_device_id wacom_ids[];

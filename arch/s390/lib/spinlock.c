@@ -10,12 +10,15 @@
 #include <linux/export.h>
 #include <linux/spinlock.h>
 #include <linux/jiffies.h>
+#include <linux/sysctl.h>
 #include <linux/init.h>
 #include <linux/smp.h>
 #include <linux/percpu.h>
 #include <linux/io.h>
 #include <asm/alternative.h>
+#include <asm/machine.h>
 #include <asm/asm.h>
+#include <trace/events/lock.h>
 
 int spin_retry = -1;
 
@@ -36,6 +39,23 @@ static int __init spin_retry_setup(char *str)
 	return 1;
 }
 __setup("spin_retry=", spin_retry_setup);
+
+static const struct ctl_table s390_spin_sysctl_table[] = {
+	{
+		.procname	= "spin_retry",
+		.data		= &spin_retry,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec,
+	},
+};
+
+static int __init init_s390_spin_sysctls(void)
+{
+	register_sysctl_init("kernel", s390_spin_sysctl_table);
+	return 0;
+}
+arch_initcall(init_s390_spin_sysctls);
 
 struct spin_wait {
 	struct spin_wait *next, *prev;
@@ -77,7 +97,7 @@ static inline int arch_load_niai4(int *lock)
 
 	asm_inline volatile(
 		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,4,0", ALT_FACILITY(49)) /* NIAI 4 */
-		"	l	%[owner],%[lock]\n"
+		"	l	%[owner],%[lock]"
 		: [owner] "=d" (owner) : [lock] "R" (*lock) : "memory");
 	return owner;
 }
@@ -90,7 +110,7 @@ static inline int arch_try_cmpxchg_niai8(int *lock, int old, int new)
 
 	asm_inline volatile(
 		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,8,0", ALT_FACILITY(49)) /* NIAI 8 */
-		"	cs	%[old],%[new],%[lock]\n"
+		"	cs	%[old],%[new],%[lock]"
 		: [old] "+d" (old), [lock] "+Q" (*lock), "=@cc" (cc)
 		: [new] "d" (new)
 		: "memory");
@@ -105,7 +125,7 @@ static inline int arch_try_cmpxchg_niai8(int *lock, int old, int new)
 
 	asm_inline volatile(
 		ALTERNATIVE("nop", ".insn rre,0xb2fa0000,8,0", ALT_FACILITY(49)) /* NIAI 8 */
-		"	cs	%[old],%[new],%[lock]\n"
+		"	cs	%[old],%[new],%[lock]"
 		: [old] "+d" (old), [lock] "+Q" (*lock)
 		: [new] "d" (new)
 		: "cc", "memory");
@@ -141,7 +161,7 @@ static inline void arch_spin_lock_queued(arch_spinlock_t *lp)
 
 	ix = get_lowcore()->spinlock_index++;
 	barrier();
-	lockval = SPINLOCK_LOCKVAL;	/* cpu + 1 */
+	lockval = spinlock_lockval();	/* cpu + 1 */
 	node = this_cpu_ptr(&spin_wait[ix]);
 	node->prev = node->next = NULL;
 	node_id = node->node_id;
@@ -212,7 +232,7 @@ static inline void arch_spin_lock_queued(arch_spinlock_t *lp)
 		if (count-- >= 0)
 			continue;
 		count = spin_retry;
-		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(owner - 1))
+		if (!machine_is_lpar() || arch_vcpu_is_preempted(owner - 1))
 			smp_yield_cpu(owner - 1);
 	}
 
@@ -232,7 +252,7 @@ static inline void arch_spin_lock_classic(arch_spinlock_t *lp)
 {
 	int lockval, old, new, owner, count;
 
-	lockval = SPINLOCK_LOCKVAL;	/* cpu + 1 */
+	lockval = spinlock_lockval();	/* cpu + 1 */
 
 	/* Pass the virtual CPU to the lock holder if it is not running */
 	owner = arch_spin_yield_target(READ_ONCE(lp->lock), NULL);
@@ -255,23 +275,25 @@ static inline void arch_spin_lock_classic(arch_spinlock_t *lp)
 		if (count-- >= 0)
 			continue;
 		count = spin_retry;
-		if (!MACHINE_IS_LPAR || arch_vcpu_is_preempted(owner - 1))
+		if (!machine_is_lpar() || arch_vcpu_is_preempted(owner - 1))
 			smp_yield_cpu(owner - 1);
 	}
 }
 
 void arch_spin_lock_wait(arch_spinlock_t *lp)
 {
+	trace_contention_begin(lp, LCB_F_SPIN);
 	if (test_cpu_flag(CIF_DEDICATED_CPU))
 		arch_spin_lock_queued(lp);
 	else
 		arch_spin_lock_classic(lp);
+	trace_contention_end(lp, 0);
 }
 EXPORT_SYMBOL(arch_spin_lock_wait);
 
 int arch_spin_trylock_retry(arch_spinlock_t *lp)
 {
-	int cpu = SPINLOCK_LOCKVAL;
+	int cpu = spinlock_lockval();
 	int owner, count;
 
 	for (count = spin_retry; count > 0; count--) {
@@ -296,6 +318,7 @@ void arch_read_lock_wait(arch_rwlock_t *rw)
 
 	/* Remove this reader again to allow recursive read locking */
 	__atomic_add_const(-1, &rw->cnts);
+	trace_contention_begin(rw, LCB_F_SPIN | LCB_F_READ);
 	/* Put the reader into the wait queue */
 	arch_spin_lock(&rw->wait);
 	/* Now add this reader to the count value again */
@@ -304,6 +327,7 @@ void arch_read_lock_wait(arch_rwlock_t *rw)
 	while (READ_ONCE(rw->cnts) & 0x10000)
 		barrier();
 	arch_spin_unlock(&rw->wait);
+	trace_contention_end(rw, 0);
 }
 EXPORT_SYMBOL(arch_read_lock_wait);
 
@@ -311,6 +335,7 @@ void arch_write_lock_wait(arch_rwlock_t *rw)
 {
 	int old;
 
+	trace_contention_begin(rw, LCB_F_SPIN | LCB_F_WRITE);
 	/* Add this CPU to the write waiters */
 	__atomic_add(0x20000, &rw->cnts);
 
@@ -327,6 +352,7 @@ void arch_write_lock_wait(arch_rwlock_t *rw)
 	}
 
 	arch_spin_unlock(&rw->wait);
+	trace_contention_end(rw, 0);
 }
 EXPORT_SYMBOL(arch_write_lock_wait);
 
@@ -337,7 +363,7 @@ void arch_spin_relax(arch_spinlock_t *lp)
 	cpu = READ_ONCE(lp->lock) & _Q_LOCK_CPU_MASK;
 	if (!cpu)
 		return;
-	if (MACHINE_IS_LPAR && !arch_vcpu_is_preempted(cpu - 1))
+	if (machine_is_lpar() && !arch_vcpu_is_preempted(cpu - 1))
 		return;
 	smp_yield_cpu(cpu - 1);
 }

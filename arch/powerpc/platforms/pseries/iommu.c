@@ -52,7 +52,8 @@ enum {
 enum {
 	DDW_EXT_SIZE = 0,
 	DDW_EXT_RESET_DMA_WIN = 1,
-	DDW_EXT_QUERY_OUT_SIZE = 2
+	DDW_EXT_QUERY_OUT_SIZE = 2,
+	DDW_EXT_LIMITED_ADDR_MODE = 3
 };
 
 static struct iommu_table *iommu_pseries_alloc_table(int node)
@@ -67,6 +68,8 @@ static struct iommu_table *iommu_pseries_alloc_table(int node)
 	kref_init(&tbl->it_kref);
 	return tbl;
 }
+
+static phys_addr_t pseries_ddw_max_ram __ro_after_init;
 
 #ifdef CONFIG_IOMMU_API
 static struct iommu_table_group_ops spapr_tce_table_group_ops;
@@ -196,7 +199,7 @@ static void tce_iommu_userspace_view_free(struct iommu_table *tbl)
 
 static void tce_free_pSeries(struct iommu_table *tbl)
 {
-	if (!tbl->it_userspace)
+	if (tbl->it_userspace)
 		tce_iommu_userspace_view_free(tbl);
 }
 
@@ -811,18 +814,11 @@ static struct device_node *pci_dma_find(struct device_node *dn,
 
 	/* parse DMA window property. During normal system boot, only default
 	 * DMA window is passed in OF. But, for kdump, a dedicated adapter might
-	 * have both default and DDW in FDT. In this scenario, DDW takes precedence
-	 * over default window.
+	 * have both default and DDW in FDT. In this scenario, default window
+	 * takes precedence over DDW. For a dedicated adapter, default window will
+	 * potentially have more unused TCEs.
 	 */
-	if (ddw_win) {
-		struct dynamic_dma_window_prop *p;
-
-		p = (struct dynamic_dma_window_prop *)ddw_prop;
-		prop->liobn = p->liobn;
-		prop->dma_base = p->dma_base;
-		prop->tce_shift = p->tce_shift;
-		prop->window_shift = p->window_shift;
-	} else if (default_win) {
+	if (default_win) {
 		unsigned long offset, size, liobn;
 
 		of_parse_dma_window(rdn, default_prop, &liobn, &offset, &size);
@@ -831,6 +827,14 @@ static struct device_node *pci_dma_find(struct device_node *dn,
 		prop->dma_base = cpu_to_be64(offset);
 		prop->tce_shift = cpu_to_be32(IOMMU_PAGE_SHIFT_4K);
 		prop->window_shift = cpu_to_be32(order_base_2(size));
+	} else {
+		struct dynamic_dma_window_prop *p;
+
+		p = (struct dynamic_dma_window_prop *)ddw_prop;
+		prop->liobn = p->liobn;
+		prop->dma_base = p->dma_base;
+		prop->tce_shift = p->tce_shift;
+		prop->window_shift = p->window_shift;
 	}
 
 	return rdn;
@@ -999,7 +1003,7 @@ static void copy_property(struct device_node *pdn, const char *from, const char 
 	if (!src)
 		return;
 
-	dst = kzalloc(sizeof(*dst), GFP_KERNEL);
+	dst = kzalloc_obj(*dst);
 	if (!dst)
 		return;
 
@@ -1088,7 +1092,7 @@ static struct dma_win *ddw_list_new_entry(struct device_node *pdn,
 {
 	struct dma_win *window;
 
-	window = kzalloc(sizeof(*window), GFP_KERNEL);
+	window = kzalloc_obj(*window);
 	if (!window)
 		return NULL;
 
@@ -1282,7 +1286,7 @@ struct failed_ddw_pdn {
 
 static LIST_HEAD(failed_ddw_pdn_list);
 
-static phys_addr_t ddw_memory_hotplug_max(void)
+static phys_addr_t __init ddw_memory_hotplug_max(void)
 {
 	resource_size_t max_addr = memory_hotplug_max();
 	struct device_node *memory;
@@ -1331,6 +1335,54 @@ static void reset_dma_window(struct pci_dev *dev, struct device_node *par_dn)
 			 ret);
 }
 
+/*
+ * Platforms support placing PHB in limited address mode starting with LoPAR
+ * level 2.13 implement. In this mode, the DMA address returned by DDW is over
+ * 4GB but, less than 64-bits. This benefits IO adapters that don't support
+ * 64-bits for DMA addresses.
+ */
+static int limited_dma_window(struct pci_dev *dev, struct device_node *par_dn)
+{
+	int ret;
+	u32 cfg_addr, reset_dma_win, las_supported;
+	u64 buid;
+	struct device_node *dn;
+	struct pci_dn *pdn;
+
+	ret = ddw_read_ext(par_dn, DDW_EXT_RESET_DMA_WIN, &reset_dma_win);
+	if (ret)
+		goto out;
+
+	ret = ddw_read_ext(par_dn, DDW_EXT_LIMITED_ADDR_MODE, &las_supported);
+
+	/* Limited Address Space extension available on the platform but DDW in
+	 * limited addressing mode not supported
+	 */
+	if (!ret && !las_supported)
+		ret = -EPROTO;
+
+	if (ret) {
+		dev_info(&dev->dev, "Limited Address Space for DDW not Supported, err: %d", ret);
+		goto out;
+	}
+
+	dn = pci_device_to_OF_node(dev);
+	pdn = PCI_DN(dn);
+	buid = pdn->phb->buid;
+	cfg_addr = (pdn->busno << 16) | (pdn->devfn << 8);
+
+	ret = rtas_call(reset_dma_win, 4, 1, NULL, cfg_addr, BUID_HI(buid),
+			BUID_LO(buid), 1);
+	if (ret)
+		dev_info(&dev->dev,
+			 "ibm,reset-pe-dma-windows(%x) for Limited Addr Support: %x %x %x returned %d ",
+			 reset_dma_win, cfg_addr, BUID_HI(buid), BUID_LO(buid),
+			 ret);
+
+out:
+	return ret;
+}
+
 /* Return largest page shift based on "IO Page Sizes" output of ibm,query-pe-dma-window. */
 static int iommu_get_page_shift(u32 query_page_size)
 {
@@ -1364,12 +1416,12 @@ static struct property *ddw_property_create(const char *propname, u32 liobn, u64
 	struct dynamic_dma_window_prop *ddwprop;
 	struct property *win64;
 
-	win64 = kzalloc(sizeof(*win64), GFP_KERNEL);
+	win64 = kzalloc_obj(*win64);
 	if (!win64)
 		return NULL;
 
 	win64->name = kstrdup(propname, GFP_KERNEL);
-	ddwprop = kzalloc(sizeof(*ddwprop), GFP_KERNEL);
+	ddwprop = kzalloc_obj(*ddwprop);
 	win64->value = ddwprop;
 	win64->length = sizeof(*ddwprop);
 	if (!win64->name || !win64->value) {
@@ -1398,10 +1450,10 @@ static struct property *ddw_property_create(const char *propname, u32 liobn, u64
  *
  * returns true if can map all pages (direct mapping), false otherwise..
  */
-static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
+static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn, u64 dma_mask)
 {
 	int len = 0, ret;
-	int max_ram_len = order_base_2(ddw_memory_hotplug_max());
+	int max_ram_len = order_base_2(pseries_ddw_max_ram);
 	struct ddw_query_response query;
 	struct ddw_create_response create;
 	int page_shift;
@@ -1417,6 +1469,9 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	bool pmem_present;
 	struct pci_dn *pci = PCI_DN(pdn);
 	struct property *default_win = NULL;
+	bool limited_addr_req = false, limited_addr_enabled = false;
+	int dev_max_ddw;
+	int ddw_sz;
 
 	dn = of_find_node_by_type(NULL, "ibm,pmemory");
 	pmem_present = dn != NULL;
@@ -1443,7 +1498,6 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	 * the ibm,ddw-applicable property holds the tokens for:
 	 * ibm,query-pe-dma-window
 	 * ibm,create-pe-dma-window
-	 * ibm,remove-pe-dma-window
 	 * for the given node in that order.
 	 * the property is actually in the parent, not the PE
 	 */
@@ -1462,6 +1516,20 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	ret = query_ddw(dev, ddw_avail, &query, pdn);
 	if (ret != 0)
 		goto out_failed;
+
+	/* DMA Limited Addressing required? This is when the driver has
+	 * requested to create DDW but supports mask which is less than 64-bits
+	 */
+	limited_addr_req = (dma_mask != DMA_BIT_MASK(64));
+
+	/* place the PHB in Limited Addressing mode */
+	if (limited_addr_req) {
+		if (limited_dma_window(dev, pdn))
+			goto out_failed;
+
+		/* PHB is in Limited address mode */
+		limited_addr_enabled = true;
+	}
 
 	/*
 	 * If there is no window available, remove the default DMA window,
@@ -1509,6 +1577,15 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 		goto out_failed;
 	}
 
+	/* Maximum DMA window size that the device can address (in log2) */
+	dev_max_ddw = fls64(dma_mask);
+
+	/* If the device DMA mask is less than 64-bits, make sure the DMA window
+	 * size is not bigger than what the device can access
+	 */
+	ddw_sz = min(order_base_2(query.largest_available_block << page_shift),
+			dev_max_ddw);
+
 	/*
 	 * The "ibm,pmemory" can appear anywhere in the address space.
 	 * Assuming it is still backed by page structs, try MAX_PHYSMEM_BITS
@@ -1517,23 +1594,21 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 	 */
 	len = max_ram_len;
 	if (pmem_present) {
-		if (query.largest_available_block >=
-		    (1ULL << (MAX_PHYSMEM_BITS - page_shift)))
+		if (ddw_sz >= MAX_PHYSMEM_BITS)
 			len = MAX_PHYSMEM_BITS;
 		else
 			dev_info(&dev->dev, "Skipping ibm,pmemory");
 	}
 
 	/* check if the available block * number of ptes will map everything */
-	if (query.largest_available_block < (1ULL << (len - page_shift))) {
+	if (ddw_sz < len) {
 		dev_dbg(&dev->dev,
 			"can't map partition max 0x%llx with %llu %llu-sized pages\n",
 			1ULL << len,
 			query.largest_available_block,
 			1ULL << page_shift);
 
-		len = order_base_2(query.largest_available_block << page_shift);
-
+		len = ddw_sz;
 		dynamic_mapping = true;
 	} else {
 		direct_mapping = !default_win_removed ||
@@ -1547,20 +1622,20 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 		 */
 		if (default_win_removed && pmem_present && !direct_mapping) {
 			/* DDW is big enough to be split */
-			if ((query.largest_available_block << page_shift) >=
-			     MIN_DDW_VPMEM_DMA_WINDOW + (1ULL << max_ram_len)) {
+			if ((1ULL << ddw_sz) >=
+			    MIN_DDW_VPMEM_DMA_WINDOW + pseries_ddw_max_ram) {
+
 				direct_mapping = true;
 
 				/* offset of the Dynamic part of DDW */
-				dynamic_offset = 1ULL << max_ram_len;
+				dynamic_offset = pseries_ddw_max_ram;
 			}
 
 			/* DDW will at least have dynamic allocation */
 			dynamic_mapping = true;
 
 			/* create max size DDW possible */
-			len = order_base_2(query.largest_available_block
-							<< page_shift);
+			len = ddw_sz;
 		}
 	}
 
@@ -1600,7 +1675,7 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 
 	if (direct_mapping) {
 		/* DDW maps the whole partition, so enable direct DMA mapping */
-		ret = walk_system_ram_range(0, memblock_end_of_DRAM() >> PAGE_SHIFT,
+		ret = walk_system_ram_range(0, pseries_ddw_max_ram >> PAGE_SHIFT,
 					    win64->value, tce_setrange_multi_pSeriesLP_walk);
 		if (ret) {
 			dev_info(&dev->dev, "failed to map DMA window for %pOF: %d\n",
@@ -1650,7 +1725,8 @@ static bool enable_ddw(struct pci_dev *dev, struct device_node *pdn)
 		iommu_table_setparms_common(newtbl, pci->phb->bus->number, create.liobn,
 					    dynamic_addr, dynamic_len, page_shift, NULL,
 					    &iommu_table_lpar_multi_ops);
-		iommu_init_table(newtbl, pci->phb->node, start, end);
+		iommu_init_table(newtbl, pci->phb->node,
+				 start >> page_shift, end >> page_shift);
 
 		pci->table_group->tables[default_win_removed ? 0 : 1] = newtbl;
 
@@ -1688,10 +1764,10 @@ out_remove_win:
 	__remove_dma_window(pdn, ddw_avail, create.liobn);
 
 out_failed:
-	if (default_win_removed)
+	if (default_win_removed || limited_addr_enabled)
 		reset_dma_window(dev, pdn);
 
-	fpdn = kzalloc(sizeof(*fpdn), GFP_KERNEL);
+	fpdn = kzalloc_obj(*fpdn);
 	if (!fpdn)
 		goto out_unlock;
 	fpdn->pdn = pdn;
@@ -1700,12 +1776,12 @@ out_failed:
 out_unlock:
 	mutex_unlock(&dma_win_init_mutex);
 
-	/* If we have persistent memory and the window size is not big enough
-	 * to directly map both RAM and vPMEM, then we need to set DMA limit.
-	 */
-	if (pmem_present && direct_mapping && len != MAX_PHYSMEM_BITS)
-		dev->dev.bus_dma_limit = dev->dev.archdata.dma_offset +
-						(1ULL << max_ram_len);
+	/* For pre-mapped memory, set bus_dma_limit to the max RAM */
+	if (direct_mapping)
+		dev->dev.bus_dma_limit = dev->dev.archdata.dma_offset + pseries_ddw_max_ram;
+
+	dev_info(&dev->dev, "lsa_required: %x, lsa_enabled: %x, direct mapping: %x\n",
+			limited_addr_req, limited_addr_enabled, direct_mapping);
 
 	return direct_mapping;
 }
@@ -1832,8 +1908,11 @@ static bool iommu_bypass_supported_pSeriesLP(struct pci_dev *pdev, u64 dma_mask)
 {
 	struct device_node *dn = pci_device_to_OF_node(pdev), *pdn;
 
-	/* only attempt to use a new window if 64-bit DMA is requested */
-	if (dma_mask < DMA_BIT_MASK(64))
+	/* For DDW, DMA mask should be more than 32-bits. For mask more then
+	 * 32-bits but less then 64-bits, DMA addressing is supported in
+	 * Limited Addressing mode.
+	 */
+	if (dma_mask <= DMA_BIT_MASK(32))
 		return false;
 
 	dev_dbg(&pdev->dev, "node is %pOF\n", dn);
@@ -1846,7 +1925,7 @@ static bool iommu_bypass_supported_pSeriesLP(struct pci_dev *pdev, u64 dma_mask)
 	 */
 	pdn = pci_dma_find(dn, NULL);
 	if (pdn && PCI_DN(pdn))
-		return enable_ddw(pdev, pdn);
+		return enable_ddw(pdev, pdn, dma_mask);
 
 	return false;
 }
@@ -2065,7 +2144,9 @@ static long spapr_tce_create_table(struct iommu_table_group *table_group, int nu
 							    offset, 1UL << window_shift,
 							    IOMMU_PAGE_SHIFT_4K, NULL,
 							    &iommu_table_lpar_multi_ops);
-				iommu_init_table(tbl, pci->phb->node, start, end);
+				iommu_init_table(tbl, pci->phb->node,
+						 start >> IOMMU_PAGE_SHIFT_4K,
+						 end >> IOMMU_PAGE_SHIFT_4K);
 
 				table_group->tables[0] = tbl;
 
@@ -2136,7 +2217,7 @@ static long spapr_tce_create_table(struct iommu_table_group *table_group, int nu
 	/* New table for using DDW instead of the default DMA window */
 	iommu_table_setparms_common(tbl, pci->phb->bus->number, create.liobn, win_addr,
 				    1UL << len, page_shift, NULL, &iommu_table_lpar_multi_ops);
-	iommu_init_table(tbl, pci->phb->node, start, end);
+	iommu_init_table(tbl, pci->phb->node, start >> page_shift, end >> page_shift);
 
 	pci->table_group->tables[num] = tbl;
 	set_iommu_table_base(&pdev->dev, tbl);
@@ -2160,7 +2241,7 @@ remove_window:
 	__remove_dma_window(pdn, ddw_avail, create.liobn);
 
 out_failed:
-	fpdn = kzalloc(sizeof(*fpdn), GFP_KERNEL);
+	fpdn = kzalloc_obj(*fpdn);
 	if (!fpdn)
 		goto out_unlock;
 	fpdn->pdn = pdn;
@@ -2205,6 +2286,9 @@ static long spapr_tce_unset_window(struct iommu_table_group *table_group, int nu
 	const char *win_name;
 	int ret = -ENODEV;
 
+	if (!tbl) /* The table was never created OR window was never opened */
+		return 0;
+
 	mutex_lock(&dma_win_init_mutex);
 
 	if ((num == 0) && is_default_window_table(table_group, tbl))
@@ -2244,7 +2328,7 @@ static long spapr_tce_unset_window(struct iommu_table_group *table_group, int nu
 	goto out_unlock;
 
 out_failed:
-	fpdn = kzalloc(sizeof(*fpdn), GFP_KERNEL);
+	fpdn = kzalloc_obj(*fpdn);
 	if (!fpdn)
 		goto out_unlock;
 	fpdn->pdn = pdn;
@@ -2341,7 +2425,26 @@ static int iommu_mem_notifier(struct notifier_block *nb, unsigned long action,
 {
 	struct dma_win *window;
 	struct memory_notify *arg = data;
+	unsigned long limit = arg->nr_pages;
+	unsigned long max_ram_pages = pseries_ddw_max_ram >> PAGE_SHIFT;
 	int ret = 0;
+
+	/* This notifier can get called when onlining persistent memory as well.
+	 * TCEs are not pre-mapped for persistent memory. Persistent memory will
+	 * always be above pseries_ddw_max_ram
+	 */
+	if (arg->start_pfn >= max_ram_pages)
+		return NOTIFY_OK;
+
+	/* RAM is being DLPAR'ed. The range should never exceed max ram.
+	 * Just in case, clamp the range and throw a warning.
+	 */
+	if (arg->start_pfn + limit > max_ram_pages) {
+		limit = max_ram_pages - arg->start_pfn;
+		WARN_ONCE(1, "Limiting Page Range %lx - %lx to Max Mem Pages: %lx\n",
+					arg->start_pfn, arg->start_pfn + arg->nr_pages,
+					max_ram_pages);
+	}
 
 	switch (action) {
 	case MEM_GOING_ONLINE:
@@ -2349,9 +2452,8 @@ static int iommu_mem_notifier(struct notifier_block *nb, unsigned long action,
 		list_for_each_entry(window, &dma_win_list, list) {
 			if (window->direct) {
 				ret |= tce_setrange_multi_pSeriesLP(arg->start_pfn,
-						arg->nr_pages, window->prop);
+						limit, window->prop);
 			}
-			/* XXX log error */
 		}
 		spin_unlock(&dma_win_list_lock);
 		break;
@@ -2361,9 +2463,8 @@ static int iommu_mem_notifier(struct notifier_block *nb, unsigned long action,
 		list_for_each_entry(window, &dma_win_list, list) {
 			if (window->direct) {
 				ret |= tce_clearrange_multi_pSeriesLP(arg->start_pfn,
-						arg->nr_pages, window->prop);
+						limit, window->prop);
 			}
-			/* XXX log error */
 		}
 		spin_unlock(&dma_win_list_lock);
 		break;
@@ -2447,6 +2548,14 @@ void __init iommu_init_early_pSeries(void)
 	register_memory_notifier(&iommu_mem_nb);
 
 	set_pci_dma_ops(&dma_iommu_ops);
+
+	/* During init determine the max memory an LPAR can have and set it. This
+	 * will be used for pre-mapping RAM in DDW. memblock_end_of_DRAM() can
+	 * change during the running of LPAR - daxctl can add pmemory as
+	 * "system-ram". This memory range should not be pre-mapped in DDW since
+	 * the address of pmemory can be much higher than the DDW size.
+	 */
+	pseries_ddw_max_ram = ddw_memory_hotplug_max();
 }
 
 static int __init disable_multitce(char *str)

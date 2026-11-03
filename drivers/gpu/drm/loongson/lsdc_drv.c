@@ -7,14 +7,16 @@
 #include <linux/pci.h>
 #include <linux/vgaarb.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
-#include <drm/drm_client_setup.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_ttm.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_gem_ttm_helper.h>
 #include <drm/drm_ioctl.h>
 #include <drm/drm_modeset_helper.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -26,7 +28,6 @@
 #define DRIVER_AUTHOR               "Sui Jingfeng <suijingfeng@loongson.cn>"
 #define DRIVER_NAME                 "loongson"
 #define DRIVER_DESC                 "drm driver for loongson graphics"
-#define DRIVER_DATE                 "20220701"
 #define DRIVER_MAJOR                1
 #define DRIVER_MINOR                0
 #define DRIVER_PATCHLEVEL           0
@@ -39,14 +40,13 @@ static const struct drm_driver lsdc_drm_driver = {
 
 	.name = DRIVER_NAME,
 	.desc = DRIVER_DESC,
-	.date = DRIVER_DATE,
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
 
 	.debugfs_init = lsdc_debugfs_init,
 	.dumb_create = lsdc_dumb_create,
-	.dumb_map_offset = lsdc_dumb_map_offset,
+	.dumb_map_offset = drm_gem_ttm_dumb_map_offset,
 	.gem_prime_import_sg_table = lsdc_prime_import_sg_table,
 	DRM_FBDEV_TTM_DRIVER_OPS,
 };
@@ -232,9 +232,9 @@ lsdc_create_device(struct pci_dev *pdev,
 	lsdc_gem_init(ddev);
 
 	/* Bar 0 of the DC device contains the MMIO register's base address */
-	ldev->reg_base = pcim_iomap(pdev, 0, 0);
-	if (!ldev->reg_base)
-		return ERR_PTR(-ENODEV);
+	ldev->reg_base = pcim_iomap_region(pdev, 0, "lsdc");
+	if (IS_ERR(ldev->reg_base))
+		return ldev->reg_base;
 
 	spin_lock_init(&ldev->reglock);
 
@@ -254,7 +254,7 @@ lsdc_create_device(struct pci_dev *pdev,
 
 /* For multiple GPU driver instance co-exixt in the system */
 
-static unsigned int lsdc_vga_set_decode(struct pci_dev *pdev, bool state)
+static unsigned int lsdc_vga_set_decode(void *data, bool state)
 {
 	return VGA_RSRC_NORMAL_IO | VGA_RSRC_NORMAL_MEM;
 }
@@ -291,9 +291,9 @@ static int lsdc_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	pci_set_drvdata(pdev, ddev);
 
-	vga_client_register(pdev, lsdc_vga_set_decode);
+	vga_client_register(pdev, lsdc_vga_set_decode, NULL);
 
-	drm_kms_helper_poll_init(ddev);
+	drmm_kms_helper_poll_init(ddev);
 
 	if (loongson_vblank) {
 		ret = drm_vblank_init(ddev, descp->num_of_crtc);
@@ -444,8 +444,8 @@ static const struct dev_pm_ops lsdc_pm_ops = {
 };
 
 static const struct pci_device_id lsdc_pciid_list[] = {
-	{PCI_VDEVICE(LOONGSON, 0x7a06), CHIP_LS7A1000},
-	{PCI_VDEVICE(LOONGSON, 0x7a36), CHIP_LS7A2000},
+	{ PCI_VDEVICE(LOONGSON, 0x7a06), .driver_data = CHIP_LS7A1000 },
+	{ PCI_VDEVICE(LOONGSON, 0x7a36), .driver_data = CHIP_LS7A2000 },
 	{ }
 };
 

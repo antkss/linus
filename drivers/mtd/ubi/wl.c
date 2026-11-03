@@ -89,33 +89,11 @@
 #include <linux/crc32.h>
 #include <linux/freezer.h>
 #include <linux/kthread.h>
-#include <linux/reboot.h>
 #include "ubi.h"
 #include "wl.h"
 
 /* Number of physical eraseblocks reserved for wear-leveling purposes */
 #define WL_RESERVED_PEBS 1
-
-/*
- * Maximum difference between two erase counters. If this threshold is
- * exceeded, the WL sub-system starts moving data from used physical
- * eraseblocks with low erase counter to free physical eraseblocks with high
- * erase counter.
- */
-#define UBI_WL_THRESHOLD CONFIG_MTD_UBI_WL_THRESHOLD
-
-/*
- * When a physical eraseblock is moved, the WL sub-system has to pick the target
- * physical eraseblock to move to. The simplest way would be just to pick the
- * one with the highest erase counter. But in certain workloads this could lead
- * to an unlimited wear of one or few physical eraseblock. Indeed, imagine a
- * situation when the picked physical eraseblock is constantly erased after the
- * data is written to it. So, we have a constant which limits the highest erase
- * counter of the free physical eraseblock to pick. Namely, the WL sub-system
- * does not pick eraseblocks with erase counter greater than the lowest erase
- * counter plus %WL_FREE_MAX_DIFF.
- */
-#define WL_FREE_MAX_DIFF (2*UBI_WL_THRESHOLD)
 
 /*
  * Maximum number of consecutive background thread failures which is enough to
@@ -128,8 +106,6 @@ static int self_check_in_wl_tree(const struct ubi_device *ubi,
 				 struct ubi_wl_entry *e, struct rb_root *root);
 static int self_check_in_pq(const struct ubi_device *ubi,
 			    struct ubi_wl_entry *e);
-static int ubi_wl_reboot_notifier(struct notifier_block *n,
-				  unsigned long state, void *cmd);
 
 /**
  * wl_tree_add - add a wear-leveling entry to a WL RB-tree.
@@ -361,7 +337,7 @@ static struct ubi_wl_entry *find_wl_entry(struct ubi_device *ubi,
  *
  * This function looks for a wear leveling entry with medium erase counter,
  * but not greater or equivalent than the lowest erase counter plus
- * %WL_FREE_MAX_DIFF/2.
+ * @ubi->wl_free_max_diff/2.
  */
 static struct ubi_wl_entry *find_mean_wl_entry(struct ubi_device *ubi,
 					       struct rb_root *root)
@@ -371,7 +347,7 @@ static struct ubi_wl_entry *find_mean_wl_entry(struct ubi_device *ubi,
 	first = rb_entry(rb_first(root), struct ubi_wl_entry, u.rb);
 	last = rb_entry(rb_last(root), struct ubi_wl_entry, u.rb);
 
-	if (last->ec - first->ec < WL_FREE_MAX_DIFF) {
+	if (last->ec - first->ec < ubi->wl_free_max_diff) {
 		e = rb_entry(root->rb_node, struct ubi_wl_entry, u.rb);
 
 		/*
@@ -382,7 +358,7 @@ static struct ubi_wl_entry *find_mean_wl_entry(struct ubi_device *ubi,
 		 */
 		e = may_reserve_for_fm(ubi, e, root);
 	} else
-		e = find_wl_entry(ubi, root, WL_FREE_MAX_DIFF/2, 0);
+		e = find_wl_entry(ubi, root, ubi->wl_free_max_diff/2, 0);
 
 	return e;
 }
@@ -446,12 +422,14 @@ static int prot_queue_del(struct ubi_device *ubi, int pnum)
  * ubi_sync_erase - synchronously erase a physical eraseblock.
  * @ubi: UBI device description object
  * @e: the physical eraseblock to erase
- * @torture: if the physical eraseblock has to be tortured
+ * @torture: if the physical eraseblock has to be tortured; cleared to zero
+ *           once the torture test has completed successfully so that a retry
+ *           of the erase does not torture the physical eraseblock again
  *
  * This function returns zero in case of success and a negative error code in
  * case of failure.
  */
-int ubi_sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e, int torture)
+int ubi_sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e, int *torture)
 {
 	int err;
 	struct ubi_ec_hdr *ec_hdr;
@@ -605,7 +583,7 @@ static int schedule_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
 	dbg_wl("schedule erasure of PEB %d, EC %d, torture %d",
 	       e->pnum, e->ec, torture);
 
-	wl_wrk = kmalloc(sizeof(struct ubi_work), GFP_NOFS);
+	wl_wrk = kmalloc_obj(struct ubi_work, GFP_NOFS);
 	if (!wl_wrk)
 		return -ENOMEM;
 
@@ -709,7 +687,7 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
 #ifdef CONFIG_MTD_UBI_FASTMAP
 	e1 = find_anchor_wl_entry(&ubi->used);
 	if (e1 && ubi->fm_anchor &&
-	    (ubi->fm_anchor->ec - e1->ec >= UBI_WL_THRESHOLD)) {
+	    (ubi->fm_anchor->ec - e1->ec >= ubi->wl_threshold)) {
 		ubi->fm_do_produce_anchor = 1;
 		/*
 		 * fm_anchor is no longer considered a good anchor.
@@ -746,7 +724,7 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
 		if (!e2)
 			goto out_cancel;
 
-		if (!(e2->ec - e1->ec >= UBI_WL_THRESHOLD)) {
+		if (!(e2->ec - e1->ec >= ubi->wl_threshold)) {
 			dbg_wl("no WL needed: min used EC %d, max free EC %d",
 			       e1->ec, e2->ec);
 
@@ -1059,12 +1037,12 @@ static int ensure_wear_leveling(struct ubi_device *ubi, int nested)
 		 * We schedule wear-leveling only if the difference between the
 		 * lowest erase counter of used physical eraseblocks and a high
 		 * erase counter of free physical eraseblocks is greater than
-		 * %UBI_WL_THRESHOLD.
+		 * @ubi->wl_threshold.
 		 */
 		e1 = rb_entry(rb_first(&ubi->used), struct ubi_wl_entry, u.rb);
-		e2 = find_wl_entry(ubi, &ubi->free, WL_FREE_MAX_DIFF, 0);
+		e2 = find_wl_entry(ubi, &ubi->free, ubi->wl_free_max_diff, 0);
 
-		if (!(e2->ec - e1->ec >= UBI_WL_THRESHOLD))
+		if (!(e2->ec - e1->ec >= ubi->wl_threshold))
 			goto out_unlock;
 #endif
 		dbg_wl("schedule wear-leveling");
@@ -1074,7 +1052,7 @@ static int ensure_wear_leveling(struct ubi_device *ubi, int nested)
 	ubi->wl_scheduled = 1;
 	spin_unlock(&ubi->wl_lock);
 
-	wrk = kmalloc(sizeof(struct ubi_work), GFP_NOFS);
+	wrk = kmalloc_obj(struct ubi_work, GFP_NOFS);
 	if (!wrk) {
 		err = -ENOMEM;
 		goto out_cancel;
@@ -1116,7 +1094,7 @@ static int __erase_worker(struct ubi_device *ubi, struct ubi_work *wl_wrk)
 	dbg_wl("erase PEB %d EC %d LEB %d:%d",
 	       pnum, e->ec, wl_wrk->vol_id, wl_wrk->lnum);
 
-	err = ubi_sync_erase(ubi, e, wl_wrk->torture);
+	err = ubi_sync_erase(ubi, e, &wl_wrk->torture);
 	if (!err) {
 		spin_lock(&ubi->wl_lock);
 
@@ -1153,7 +1131,8 @@ static int __erase_worker(struct ubi_device *ubi, struct ubi_work *wl_wrk)
 		int err1;
 
 		/* Re-schedule the LEB for erasure */
-		err1 = schedule_erase(ubi, e, vol_id, lnum, 0, true);
+		err1 = schedule_erase(ubi, e, vol_id, lnum, wl_wrk->torture,
+				      true);
 		if (err1) {
 			spin_lock(&ubi->wl_lock);
 			wl_entry_destroy(ubi, e);
@@ -1760,7 +1739,7 @@ static void shutdown_work(struct ubi_device *ubi)
 static int erase_aeb(struct ubi_device *ubi, struct ubi_ainf_peb *aeb, bool sync)
 {
 	struct ubi_wl_entry *e;
-	int err;
+	int err, torture = 0;
 
 	e = kmem_cache_alloc(ubi_wl_entry_slab, GFP_KERNEL);
 	if (!e)
@@ -1771,7 +1750,7 @@ static int erase_aeb(struct ubi_device *ubi, struct ubi_ainf_peb *aeb, bool sync
 	ubi->lookuptbl[e->pnum] = e;
 
 	if (sync) {
-		err = ubi_sync_erase(ubi, e, false);
+		err = ubi_sync_erase(ubi, e, &torture);
 		if (err)
 			goto out_free;
 
@@ -1953,13 +1932,6 @@ int ubi_wl_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 	if (!ubi->ro_mode && !ubi->fm_disabled)
 		ubi_ensure_anchor_pebs(ubi);
 #endif
-
-	if (!ubi->wl_reboot_notifier.notifier_call) {
-		ubi->wl_reboot_notifier.notifier_call = ubi_wl_reboot_notifier;
-		ubi->wl_reboot_notifier.priority = 1; /* Higher than MTD */
-		register_reboot_notifier(&ubi->wl_reboot_notifier);
-	}
-
 	return 0;
 
 out_free:
@@ -2003,17 +1975,6 @@ void ubi_wl_close(struct ubi_device *ubi)
 	tree_destroy(ubi, &ubi->free);
 	tree_destroy(ubi, &ubi->scrub);
 	kfree(ubi->lookuptbl);
-}
-
-static int ubi_wl_reboot_notifier(struct notifier_block *n,
-				  unsigned long state, void *cmd)
-{
-	struct ubi_device *ubi;
-
-	ubi = container_of(n, struct ubi_device, wl_reboot_notifier);
-	ubi_wl_close(ubi);
-
-	return NOTIFY_DONE;
 }
 
 /**
@@ -2111,7 +2072,7 @@ static struct ubi_wl_entry *get_peb_for_wl(struct ubi_device *ubi)
 {
 	struct ubi_wl_entry *e;
 
-	e = find_wl_entry(ubi, &ubi->free, WL_FREE_MAX_DIFF, 0);
+	e = find_wl_entry(ubi, &ubi->free, ubi->wl_free_max_diff, 0);
 	self_check_in_wl_tree(ubi, e, &ubi->free);
 	ubi->free_count--;
 	ubi_assert(ubi->free_count >= 0);

@@ -17,6 +17,7 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/spinlock.h>
+#include <linux/string_choices.h>
 #include <linux/reboot.h>
 
 /*
@@ -116,9 +117,9 @@ static void __init nomadik_src_init(void)
 
 	val = readl(src_base + SRC_XTALCR);
 	pr_info("SXTALO is %s\n",
-		(val & SRC_XTALCR_SXTALDIS) ? "disabled" : "enabled");
+		str_disabled_enabled(val & SRC_XTALCR_SXTALDIS));
 	pr_info("MXTAL is %s\n",
-		(val & SRC_XTALCR_MXTALSTAT) ? "enabled" : "disabled");
+		str_enabled_disabled(val & SRC_XTALCR_MXTALSTAT));
 	if (of_property_read_bool(np, "disable-sxtalo")) {
 		/* The machine uses an external oscillator circuit */
 		val |= SRC_XTALCR_SXTALDIS;
@@ -262,14 +263,14 @@ pll_clk_register(struct device *dev, const char *name,
 {
 	int ret;
 	struct clk_pll *pll;
-	struct clk_init_data init;
+	struct clk_init_data init = {};
 
 	if (id != 1 && id != 2) {
 		pr_err("%s: the Nomadik has only PLL 1 & 2\n", __func__);
 		return ERR_PTR(-EINVAL);
 	}
 
-	pll = kzalloc(sizeof(*pll), GFP_KERNEL);
+	pll = kzalloc_obj(*pll);
 	if (!pll)
 		return ERR_PTR(-ENOMEM);
 
@@ -354,9 +355,9 @@ src_clk_register(struct device *dev, const char *name,
 {
 	int ret;
 	struct clk_src *sclk;
-	struct clk_init_data init;
+	struct clk_init_data init = {};
 
-	sclk = kzalloc(sizeof(*sclk), GFP_KERNEL);
+	sclk = kzalloc_obj(*sclk);
 	if (!sclk)
 		return ERR_PTR(-ENOMEM);
 

@@ -14,12 +14,13 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/notifier.h>
-#include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 
 #include <linux/gpio/consumer.h>
@@ -515,7 +516,7 @@ static void cpcap_charger_vbus_work(struct work_struct *work)
 out_err:
 	cpcap_charger_update_state(ddata, POWER_SUPPLY_STATUS_UNKNOWN);
 	dev_err(ddata->dev, "%s could not %s vbus: %i\n", __func__,
-		ddata->vbus_enabled ? "enable" : "disable", error);
+		str_enable_disable(ddata->vbus_enabled), error);
 }
 
 static int cpcap_charger_set_vbus(struct phy_companion *comparator,
@@ -688,9 +689,8 @@ static void cpcap_usb_detect(struct work_struct *work)
 		struct power_supply *battery;
 
 		battery = power_supply_get_by_name("battery");
-		if (IS_ERR_OR_NULL(battery)) {
-			dev_err(ddata->dev, "battery power_supply not available %li\n",
-					PTR_ERR(battery));
+		if (!battery) {
+			dev_err(ddata->dev, "battery power_supply not available\n");
 			return;
 		}
 
@@ -761,12 +761,8 @@ static int cpcap_usb_init_irq(struct platform_device *pdev,
 					  cpcap_charger_irq_thread,
 					  IRQF_SHARED | IRQF_ONESHOT,
 					  name, ddata);
-	if (error) {
-		dev_err(ddata->dev, "could not get irq %s: %i\n",
-			name, error);
-
+	if (error)
 		return error;
-	}
 
 	d = devm_kzalloc(ddata->dev, sizeof(*d), GFP_KERNEL);
 	if (!d)
@@ -812,8 +808,8 @@ static void cpcap_charger_init_optional_gpios(struct cpcap_charger_ddata *ddata)
 		ddata->gpio[i] = devm_gpiod_get_index(ddata->dev, "mode",
 						      i, GPIOD_OUT_HIGH);
 		if (IS_ERR(ddata->gpio[i])) {
-			dev_info(ddata->dev, "no mode change GPIO%i: %li\n",
-				 i, PTR_ERR(ddata->gpio[i]));
+			dev_info(ddata->dev, "no mode change GPIO%i: %pe\n",
+				 i, ddata->gpio[i]);
 			ddata->gpio[i] = NULL;
 		}
 	}
@@ -901,7 +897,7 @@ static int cpcap_charger_probe(struct platform_device *pdev)
 
 	atomic_set(&ddata->active, 1);
 
-	psy_cfg.of_node = pdev->dev.of_node;
+	psy_cfg.fwnode = dev_fwnode(&pdev->dev);
 	psy_cfg.drv_data = ddata;
 	psy_cfg.supplied_to = cpcap_charger_supplied_to;
 	psy_cfg.num_supplicants = ARRAY_SIZE(cpcap_charger_supplied_to);
@@ -977,3 +973,4 @@ MODULE_AUTHOR("Tony Lindgren <tony@atomide.com>");
 MODULE_DESCRIPTION("CPCAP Battery Charger Interface driver");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("platform:cpcap-charger");
+MODULE_IMPORT_NS("IIO_CONSUMER");

@@ -112,12 +112,6 @@ properties:
     description: List of necessary clock names.
     # details are defined below
 
-  post-init-providers:
-    description: At least if rsnd is using DPCM connection on Audio-Graph-Card2,
-      fw_devlink might doesn't have enough information to break the cycle. rsnd
-      driver will not be probed in such case. Same problem might occur with
-      Multi-CPU/Codec or Codec2Codec.
-
   # ports is below
   port:
     $ref: audio-graph-port.yaml#/definitions/port-base
@@ -438,14 +432,14 @@ examples:
                       "ssi.1", "ssi.0";
 
         rcar_sound,dvc {
-               dvc0: dvc-0 {
-                    dmas = <&audma0 0xbc>;
-                    dma-names = "tx";
-               };
-               dvc1: dvc-1 {
-                    dmas = <&audma0 0xbe>;
-                    dma-names = "tx";
-               };
+            dvc0: dvc-0 {
+                dmas = <&audma0 0xbc>;
+                dma-names = "tx";
+            };
+            dvc1: dvc-1 {
+                dmas = <&audma0 0xbe>;
+                dma-names = "tx";
+            };
         };
 
         rcar_sound,mix {

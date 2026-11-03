@@ -29,6 +29,7 @@ struct ocfs2_alloc_context {
 #define OCFS2_AC_USE_MAIN  2
 #define OCFS2_AC_USE_INODE 3
 #define OCFS2_AC_USE_META  4
+#define OCFS2_AC_USE_MAIN_DISCONTIG  5
 	u32    ac_which;
 
 	/* these are used by the chain search */
@@ -205,7 +206,7 @@ int ocfs2_lock_allocators(struct inode *inode, struct ocfs2_extent_tree *et,
 
 int ocfs2_test_inode_bit(struct ocfs2_super *osb, u64 blkno, int *res);
 
-
+void ocfs2_suballoc_reclaim_worker(struct work_struct *work);
 
 /*
  * The following two interfaces are for ocfs2_create_inode_in_orphan().

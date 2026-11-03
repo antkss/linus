@@ -36,6 +36,8 @@
 #include "amdgpu_ring_mux.h"
 #include "amdgpu_xcp.h"
 
+struct amdgpu_usermode_queue;
+
 /* GFX current status */
 #define AMDGPU_GFX_NORMAL_MODE			0x00000000L
 #define AMDGPU_GFX_SAFE_MODE			0x00000001L
@@ -57,6 +59,9 @@ enum amdgpu_gfx_pipe_priority {
 #define AMDGPU_GFX_QUEUE_PRIORITY_MINIMUM  0
 #define AMDGPU_GFX_QUEUE_PRIORITY_MAXIMUM  15
 
+/* 1 second timeout */
+#define GFX_PROFILE_IDLE_TIMEOUT	msecs_to_jiffies(1000)
+
 enum amdgpu_gfx_partition {
 	AMDGPU_SPX_PARTITION_MODE = 0,
 	AMDGPU_DPX_PARTITION_MODE = 1,
@@ -66,6 +71,11 @@ enum amdgpu_gfx_partition {
 	AMDGPU_UNKNOWN_COMPUTE_PARTITION_MODE = -1,
 	/* Automatically choose the right mode */
 	AMDGPU_AUTO_COMPUTE_PARTITION_MODE = -2,
+};
+
+enum amdgpu_gfx_partition_mem_alloc_mode {
+	AMDGPU_PARTITION_MEM_CAPPING_EVEN = 0,
+	AMDGPU_PARTITION_MEM_ALLOC_ALL  = 1,
 };
 
 #define NUM_XCC(x) hweight16(x)
@@ -108,6 +118,9 @@ struct amdgpu_mec {
 	u32 num_pipe_per_mec;
 	u32 num_queue_per_pipe;
 	void			*mqd_backup[AMDGPU_MAX_COMPUTE_RINGS * AMDGPU_MAX_GC_INSTANCES];
+	bool use_mmio_for_reset;
+	u32 *mes_hung_db_array;
+	struct mutex		reset_mutex;
 };
 
 struct amdgpu_mec_bitmap {
@@ -167,10 +180,46 @@ struct amdgpu_kiq {
 #define AMDGPU_GFX_MAX_SE 4
 #define AMDGPU_GFX_MAX_SH_PER_SE 2
 
+/**
+ * amdgpu_rb_config - Configure a single Render Backend (RB)
+ *
+ * Bad RBs are fused off and there is a harvest register the driver reads to
+ * determine which RB(s) are fused off so that the driver can configure the
+ * hardware state so that nothing gets sent to them. There are also user
+ * harvest registers that the driver can program to disable additional RBs,
+ * etc., for testing purposes.
+ */
 struct amdgpu_rb_config {
+	/**
+	 * @rb_backend_disable:
+	 *
+	 * The value captured from register RB_BACKEND_DISABLE indicates if the
+	 * RB backend is disabled or not.
+	 */
 	uint32_t rb_backend_disable;
+
+	/**
+	 * @user_rb_backend_disable:
+	 *
+	 * The value captured from register USER_RB_BACKEND_DISABLE indicates
+	 * if the User RB backend is disabled or not.
+	 */
 	uint32_t user_rb_backend_disable;
+
+	/**
+	 * @raster_config:
+	 *
+	 * To set up all of the states, it is necessary to have two registers
+	 * to keep all of the states. This field holds the first register.
+	 */
 	uint32_t raster_config;
+
+	/**
+	 * @raster_config_1:
+	 *
+	 * To set up all of the states, it is necessary to have two registers
+	 * to keep all of the states. This field holds the second register.
+	 */
 	uint32_t raster_config_1;
 };
 
@@ -218,6 +267,13 @@ struct amdgpu_gfx_config {
 	uint32_t macrotile_mode_array[16];
 
 	struct gb_addr_config gb_addr_config_fields;
+
+	/**
+	 * @rb_config:
+	 *
+	 * Matrix that keeps all the Render Backend (color and depth buffer
+	 * handling) configuration on the 3D engine.
+	 */
 	struct amdgpu_rb_config rb_config[AMDGPU_GFX_MAX_SE][AMDGPU_GFX_MAX_SH_PER_SE];
 
 	/* gfx configure feature */
@@ -251,6 +307,9 @@ struct amdgpu_gfx_config {
 	uint32_t gc_scalar_data_cache_size_per_sqc;
 	uint32_t gc_scalar_data_cache_line_size;
 	uint32_t gc_tcc_cache_line_size;
+	uint32_t gc_max_num_residency_ways;
+	uint32_t gc_cache_ways_size_in_bytes;
+	uint32_t gc_reserved;
 };
 
 struct amdgpu_cu_info {
@@ -282,6 +341,8 @@ struct amdgpu_gfx_shadow_info {
 	u32 shadow_alignment;
 	u32 csa_size;
 	u32 csa_alignment;
+	u32 eop_size;
+	u32 eop_alignment;
 };
 
 struct amdgpu_gfx_funcs {
@@ -302,13 +363,19 @@ struct amdgpu_gfx_funcs {
 	void (*init_spm_golden)(struct amdgpu_device *adev);
 	void (*update_perfmon_mgcg)(struct amdgpu_device *adev, bool enable);
 	int (*get_gfx_shadow_info)(struct amdgpu_device *adev,
-				   struct amdgpu_gfx_shadow_info *shadow_info);
+				   struct amdgpu_gfx_shadow_info *shadow_info,
+				   bool skip_check);
 	enum amdgpu_gfx_partition
 			(*query_partition_mode)(struct amdgpu_device *adev);
 	int (*switch_partition_mode)(struct amdgpu_device *adev,
 				     int num_xccs_per_xcp);
 	int (*ih_node_to_logical_xcc)(struct amdgpu_device *adev, int ih_node);
 	int (*get_xccs_per_xcp)(struct amdgpu_device *adev);
+	void (*get_hdp_flush_mask)(struct amdgpu_ring *ring,
+				uint32_t *ref_and_mask, uint32_t *reg_mem_engine);
+	/* find the gfx HQD slot (me/pipe/queue) for a doorbell */
+	bool (*detect_hung_queue)(struct amdgpu_device *adev, u32 doorbell_index,
+				  u32 *me, u32 *pipe, u32 *queue);
 };
 
 struct sq_work {
@@ -345,6 +412,7 @@ struct amdgpu_me {
 	uint32_t			num_pipe_per_me;
 	uint32_t			num_queue_per_pipe;
 	void				*mqd_backup[AMDGPU_MAX_GFX_RINGS];
+	bool				use_mmio_for_reset;
 
 	/* These are the resources for which amdgpu takes ownership */
 	DECLARE_BITMAP(queue_bitmap, AMDGPU_MAX_GFX_QUEUES);
@@ -412,6 +480,8 @@ struct amdgpu_gfx {
 	struct amdgpu_irq_src		cp_ecc_error_irq;
 	struct amdgpu_irq_src		sq_irq;
 	struct amdgpu_irq_src		rlc_gc_fed_irq;
+	struct amdgpu_irq_src		rlc_poison_irq;
+	struct amdgpu_irq_src		pmr_ea_irq;
 	struct sq_work			sq_work;
 
 	/* gfx status */
@@ -422,8 +492,6 @@ struct amdgpu_gfx {
 	const struct amdgpu_gfx_funcs	*funcs;
 
 	/* reset mask */
-	uint32_t                        grbm_soft_reset;
-	uint32_t                        srbm_soft_reset;
 	uint32_t 			gfx_supported_reset;
 	uint32_t 			compute_supported_reset;
 
@@ -471,11 +539,27 @@ struct amdgpu_gfx {
 	bool				enable_cleaner_shader;
 	struct amdgpu_isolation_work	enforce_isolation[MAX_XCP];
 	/* Mutex for synchronizing KFD scheduler operations */
-	struct mutex                    kfd_sch_mutex;
-	u64				kfd_sch_req_count[MAX_XCP];
-	bool				kfd_sch_inactive[MAX_XCP];
+	struct mutex                    userq_sch_mutex;
+	u64				userq_sch_req_count[MAX_XCP];
+	bool				userq_sch_inactive[MAX_XCP];
+	/* atomic bitmap of faulted gfx UQ slots (index = pipe | queue << 2) */
+	unsigned long			userq_priv_fault_slots;
+	struct work_struct		userq_priv_fault_work;
 	unsigned long			enforce_isolation_jiffies[MAX_XCP];
 	unsigned long			enforce_isolation_time[MAX_XCP];
+
+	atomic_t			total_submission_cnt;
+	struct delayed_work		idle_work;
+	bool				workload_profile_active;
+	struct mutex                    workload_profile_mutex;
+
+	bool				disable_kq;
+	bool				disable_uq;
+};
+
+struct amdgpu_gfx_deferred_entry {
+	struct amdgpu_ring	*ring;
+	struct amdgpu_fence	*fence;
 };
 
 struct amdgpu_gfx_ras_reg_entry {
@@ -495,7 +579,7 @@ struct amdgpu_gfx_ras_mem_id_entry {
 #define amdgpu_gfx_select_se_sh(adev, se, sh, instance, xcc_id) ((adev)->gfx.funcs->select_se_sh((adev), (se), (sh), (instance), (xcc_id)))
 #define amdgpu_gfx_select_me_pipe_q(adev, me, pipe, q, vmid, xcc_id) ((adev)->gfx.funcs->select_me_pipe_q((adev), (me), (pipe), (q), (vmid), (xcc_id)))
 #define amdgpu_gfx_init_spm_golden(adev) (adev)->gfx.funcs->init_spm_golden((adev))
-#define amdgpu_gfx_get_gfx_shadow_info(adev, si) ((adev)->gfx.funcs->get_gfx_shadow_info((adev), (si)))
+#define amdgpu_gfx_get_gfx_shadow_info(adev, si) ((adev)->gfx.funcs->get_gfx_shadow_info((adev), (si), false))
 
 /**
  * amdgpu_gfx_create_bitmask - create a bitmask
@@ -510,8 +594,8 @@ static inline u32 amdgpu_gfx_create_bitmask(u32 bit_width)
 	return (u32)((1ULL << bit_width) - 1);
 }
 
-void amdgpu_gfx_parse_disable_cu(unsigned *mask, unsigned max_se,
-				 unsigned max_sh);
+void amdgpu_gfx_parse_disable_cu(struct amdgpu_device *adev, unsigned int *mask,
+				 unsigned int max_se, unsigned int max_sh);
 
 int amdgpu_gfx_kiq_init_ring(struct amdgpu_device *adev, int xcc_id);
 
@@ -524,6 +608,8 @@ int amdgpu_gfx_kiq_init(struct amdgpu_device *adev,
 int amdgpu_gfx_mqd_sw_init(struct amdgpu_device *adev,
 			   unsigned mqd_size, int xcc_id);
 void amdgpu_gfx_mqd_sw_fini(struct amdgpu_device *adev, int xcc_id);
+void amdgpu_gfx_mqd_symmetrically_map_cu_mask(struct amdgpu_device *adev, const uint32_t *cu_mask,
+					      uint32_t cu_mask_count, uint32_t *se_mask);
 int amdgpu_gfx_disable_kcq(struct amdgpu_device *adev, int xcc_id);
 int amdgpu_gfx_enable_kcq(struct amdgpu_device *adev, int xcc_id);
 int amdgpu_gfx_disable_kgq(struct amdgpu_device *adev, int xcc_id);
@@ -542,14 +628,17 @@ bool amdgpu_gfx_is_high_priority_compute_queue(struct amdgpu_device *adev,
 					       struct amdgpu_ring *ring);
 bool amdgpu_gfx_is_high_priority_graphics_queue(struct amdgpu_device *adev,
 						struct amdgpu_ring *ring);
-int amdgpu_gfx_me_queue_to_bit(struct amdgpu_device *adev, int me,
-			       int pipe, int queue);
 bool amdgpu_gfx_is_me_queue_enabled(struct amdgpu_device *adev, int me,
 				    int pipe, int queue);
+void amdgpu_gfx_handle_priv_fault(struct amdgpu_device *adev,
+					struct amdgpu_iv_entry *entry,
+					u8 me_id, u8 pipe_id, u8 queue_id);
 void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable);
+void amdgpu_gfx_off_ctrl_immediate(struct amdgpu_device *adev, bool enable);
 int amdgpu_get_gfx_off_status(struct amdgpu_device *adev, uint32_t *value);
 int amdgpu_gfx_ras_late_init(struct amdgpu_device *adev, struct ras_common_if *ras_block);
-void amdgpu_gfx_ras_fini(struct amdgpu_device *adev);
+void amdgpu_gfx_ras_suspend(struct amdgpu_device *adev, struct ras_common_if *ras_block);
+void amdgpu_gfx_ras_fini(struct amdgpu_device *adev, struct ras_common_if *ras_block);
 int amdgpu_get_gfx_off_entrycount(struct amdgpu_device *adev, u64 *value);
 int amdgpu_get_gfx_off_residency(struct amdgpu_device *adev, u32 *residency);
 int amdgpu_set_gfx_off_residency(struct amdgpu_device *adev, bool value);
@@ -561,6 +650,9 @@ int amdgpu_gfx_cp_ecc_error_irq(struct amdgpu_device *adev,
 				  struct amdgpu_iv_entry *entry);
 uint32_t amdgpu_kiq_rreg(struct amdgpu_device *adev, uint32_t reg, uint32_t xcc_id);
 void amdgpu_kiq_wreg(struct amdgpu_device *adev, uint32_t reg, uint32_t v, uint32_t xcc_id);
+void amdgpu_gfx_get_hdp_flush_mask(struct amdgpu_ring *ring,
+		uint32_t *ref_and_mask, uint32_t *reg_mem_engine);
+int amdgpu_kiq_hdp_flush(struct amdgpu_device *adev);
 int amdgpu_gfx_get_num_kcq(struct amdgpu_device *adev);
 void amdgpu_gfx_cp_init_microcode(struct amdgpu_device *adev, uint32_t ucode_id);
 
@@ -571,6 +663,12 @@ int amdgpu_gfx_poison_consumption_handler(struct amdgpu_device *adev,
 bool amdgpu_gfx_is_master_xcc(struct amdgpu_device *adev, int xcc_id);
 int amdgpu_gfx_sysfs_init(struct amdgpu_device *adev);
 void amdgpu_gfx_sysfs_fini(struct amdgpu_device *adev);
+int amdgpu_gfx_reset_mes_compute(struct amdgpu_device *adev,
+				 struct amdgpu_ring *ring,
+				 struct amdgpu_fence *guilty_fence,
+				 struct amdgpu_usermode_queue *uq,
+				 unsigned int *hung_queue_count,
+				 void *faulty_queue_input);
 void amdgpu_gfx_ras_error_func(struct amdgpu_device *adev,
 		void *ras_error_status,
 		void (*func)(struct amdgpu_device *adev, void *ras_error_status,
@@ -584,8 +682,41 @@ void amdgpu_gfx_cleaner_shader_init(struct amdgpu_device *adev,
 void amdgpu_gfx_enforce_isolation_handler(struct work_struct *work);
 void amdgpu_gfx_enforce_isolation_ring_begin_use(struct amdgpu_ring *ring);
 void amdgpu_gfx_enforce_isolation_ring_end_use(struct amdgpu_ring *ring);
+
+void amdgpu_gfx_profile_idle_work_handler(struct work_struct *work);
+void amdgpu_gfx_profile_ring_begin_use(struct amdgpu_ring *ring);
+void amdgpu_gfx_profile_ring_end_use(struct amdgpu_ring *ring);
+u32 amdgpu_gfx_csb_preamble_start(u32 *buffer);
+u32 amdgpu_gfx_csb_data_parser(struct amdgpu_device *adev, u32 *buffer, u32 count);
+void amdgpu_gfx_csb_preamble_end(u32 *buffer, u32 count);
+
 void amdgpu_debugfs_gfx_sched_mask_init(struct amdgpu_device *adev);
 void amdgpu_debugfs_compute_sched_mask_init(struct amdgpu_device *adev);
+
+int amdgpu_gfx_ring_preempt_ib(struct amdgpu_ring *ring);
+
+int amdgpu_gfx_mes_reset_queue(struct amdgpu_ring *ring,
+			       unsigned int vmid,
+			       struct amdgpu_fence *timedout_fence,
+			       bool use_mmio);
+void amdgpu_gfx_mqd_reset_restore(struct amdgpu_ring *ring);
+struct amdgpu_gfx_pipe_reset_ctx {
+	/* Schedulers stopped by this reset. */
+	unsigned long sched_mask;
+	/* Rings with backed-up commands. */
+	unsigned long replay_mask;
+};
+
+bool amdgpu_gfx_me_pipe_reset_supported(struct amdgpu_device *adev);
+void amdgpu_gfx_pipe_reset_prepare(struct amdgpu_device *adev,
+				   struct amdgpu_ring *guilty_ring,
+				   u32 me, u32 pipe,
+				   struct amdgpu_gfx_pipe_reset_ctx *ctx);
+int amdgpu_gfx_reset_mes_gfx(struct amdgpu_device *adev,
+			     struct amdgpu_ring *ring,
+			     struct amdgpu_fence *guilty_fence,
+			     struct amdgpu_usermode_queue *queue,
+			     unsigned int vmid, bool use_mmio);
 
 static inline const char *amdgpu_gfx_compute_mode_desc(int mode)
 {
@@ -600,6 +731,18 @@ static inline const char *amdgpu_gfx_compute_mode_desc(int mode)
 		return "QPX";
 	case AMDGPU_CPX_PARTITION_MODE:
 		return "CPX";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static inline const char *amdgpu_gfx_compute_mem_alloc_mode_desc(int mode)
+{
+	switch (mode) {
+	case AMDGPU_PARTITION_MEM_CAPPING_EVEN:
+			return "CAPPING";
+	case AMDGPU_PARTITION_MEM_ALLOC_ALL:
+		return "ALL";
 	default:
 		return "UNKNOWN";
 	}

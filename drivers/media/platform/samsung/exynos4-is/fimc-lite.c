@@ -611,7 +611,7 @@ static void fimc_lite_try_crop(struct fimc_lite *fimc, struct v4l2_rect *r)
 	r->left = round_down(r->left, fimc->dd->win_hor_offs_align);
 	r->top  = clamp_t(u32, r->top, 0, frame->f_height - r->height);
 
-	v4l2_dbg(1, debug, &fimc->subdev, "(%d,%d)/%dx%d, sink fmt: %dx%d\n",
+	v4l2_dbg(1, debug, &fimc->subdev, "(%d,%d)/%ux%u, sink fmt: %dx%d\n",
 		 r->left, r->top, r->width, r->height,
 		 frame->f_width, frame->f_height);
 }
@@ -631,7 +631,7 @@ static void fimc_lite_try_compose(struct fimc_lite *fimc, struct v4l2_rect *r)
 	r->left = round_down(r->left, fimc->dd->out_hor_offs_align);
 	r->top  = clamp_t(u32, r->top, 0, fimc->out_frame.f_height - r->height);
 
-	v4l2_dbg(1, debug, &fimc->subdev, "(%d,%d)/%dx%d, source fmt: %dx%d\n",
+	v4l2_dbg(1, debug, &fimc->subdev, "(%d,%d)/%ux%u, source fmt: %dx%d\n",
 		 r->left, r->top, r->width, r->height,
 		 frame->f_width, frame->f_height);
 }
@@ -1052,6 +1052,7 @@ static int fimc_lite_subdev_get_fmt(struct v4l2_subdev *sd,
 }
 
 static int fimc_lite_subdev_set_fmt(struct v4l2_subdev *sd,
+				    const struct v4l2_subdev_client_info *ci,
 				    struct v4l2_subdev_state *sd_state,
 				    struct v4l2_subdev_format *fmt)
 {
@@ -1113,6 +1114,7 @@ static int fimc_lite_subdev_set_fmt(struct v4l2_subdev *sd,
 }
 
 static int fimc_lite_subdev_get_selection(struct v4l2_subdev *sd,
+					  const struct v4l2_subdev_client_info *ci,
 					  struct v4l2_subdev_state *sd_state,
 					  struct v4l2_subdev_selection *sel)
 {
@@ -1140,7 +1142,7 @@ static int fimc_lite_subdev_get_selection(struct v4l2_subdev *sd,
 	}
 	mutex_unlock(&fimc->lock);
 
-	v4l2_dbg(1, debug, sd, "%s: (%d,%d) %dx%d, f_w: %d, f_h: %d\n",
+	v4l2_dbg(1, debug, sd, "%s: (%d,%d)/%ux%u, f_w: %d, f_h: %d\n",
 		 __func__, f->rect.left, f->rect.top, f->rect.width,
 		 f->rect.height, f->f_width, f->f_height);
 
@@ -1148,6 +1150,7 @@ static int fimc_lite_subdev_get_selection(struct v4l2_subdev *sd,
 }
 
 static int fimc_lite_subdev_set_selection(struct v4l2_subdev *sd,
+					  const struct v4l2_subdev_client_info *ci,
 					  struct v4l2_subdev_state *sd_state,
 					  struct v4l2_subdev_selection *sel)
 {
@@ -1174,7 +1177,7 @@ static int fimc_lite_subdev_set_selection(struct v4l2_subdev *sd,
 	}
 	mutex_unlock(&fimc->lock);
 
-	v4l2_dbg(1, debug, sd, "%s: (%d,%d) %dx%d, f_w: %d, f_h: %d\n",
+	v4l2_dbg(1, debug, sd, "%s: (%d,%d)/%ux%u, f_w: %d, f_h: %d\n",
 		 __func__, f->rect.left, f->rect.top, f->rect.width,
 		 f->rect.height, f->f_width, f->f_height);
 
@@ -1209,9 +1212,8 @@ static int fimc_lite_subdev_s_stream(struct v4l2_subdev *sd, int on)
 			spin_unlock_irqrestore(&fimc->slock, flags);
 		}
 	} else {
-		set_bit(ST_FLITE_OFF, &fimc->state);
-
 		spin_lock_irqsave(&fimc->slock, flags);
+		set_bit(ST_FLITE_OFF, &fimc->state);
 		flite_hw_capture_stop(fimc);
 		spin_unlock_irqrestore(&fimc->slock, flags);
 
@@ -1662,4 +1664,3 @@ static struct platform_driver fimc_lite_driver = {
 module_platform_driver(fimc_lite_driver);
 MODULE_DESCRIPTION("Samsung EXYNOS FIMC-LITE (camera host interface) driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:" FIMC_LITE_DRV_NAME);

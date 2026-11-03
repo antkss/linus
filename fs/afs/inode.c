@@ -25,10 +25,6 @@
 #include "internal.h"
 #include "afs_fs.h"
 
-static const struct inode_operations afs_symlink_inode_operations = {
-	.get_link	= page_get_link,
-};
-
 static noinline void dump_vnode(struct afs_vnode *vnode, struct afs_vnode *parent_vnode)
 {
 	static unsigned long once_only;
@@ -56,9 +52,9 @@ static noinline void dump_vnode(struct afs_vnode *vnode, struct afs_vnode *paren
 /*
  * Set parameters for the netfs library
  */
-static void afs_set_netfs_context(struct afs_vnode *vnode)
+static void afs_set_netfs_context(struct afs_vnode *vnode, bool is_file)
 {
-	netfs_inode_init(&vnode->netfs, &afs_req_ops, true);
+	netfs_inode_init(&vnode->netfs, &afs_req_ops, is_file);
 }
 
 /*
@@ -97,6 +93,10 @@ static int afs_inode_init_from_status(struct afs_operation *op,
 	inode->i_gid = make_kgid(&init_user_ns, status->group);
 	set_nlink(&vnode->netfs.inode, status->nlink);
 
+	i_size_write(inode, status->size);
+	inode_set_bytes(inode, status->size);
+	afs_set_netfs_context(vnode, status->type == AFS_FTYPE_FILE);
+
 	switch (status->type) {
 	case AFS_FTYPE_FILE:
 		inode->i_mode	= S_IFREG | (status->mode & S_IALLUGO);
@@ -110,7 +110,9 @@ static int afs_inode_init_from_status(struct afs_operation *op,
 		inode->i_op	= &afs_dir_inode_operations;
 		inode->i_fop	= &afs_dir_file_operations;
 		inode->i_mapping->a_ops	= &afs_dir_aops;
-		mapping_set_large_folios(inode->i_mapping);
+		__set_bit(NETFS_ICTX_SINGLE_NO_UPLOAD, &vnode->netfs.flags);
+		/* Assume locally cached directory data will be valid. */
+		__set_bit(AFS_VNODE_DIR_VALID, &vnode->flags);
 		break;
 	case AFS_FTYPE_SYMLINK:
 		/* Symlinks with a mode of 0644 are actually mountpoints. */
@@ -122,12 +124,11 @@ static int afs_inode_init_from_status(struct afs_operation *op,
 			inode->i_mode	= S_IFDIR | 0555;
 			inode->i_op	= &afs_mntpt_inode_operations;
 			inode->i_fop	= &afs_mntpt_file_operations;
-			inode->i_mapping->a_ops	= &afs_symlink_aops;
 		} else {
 			inode->i_mode	= S_IFLNK | status->mode;
 			inode->i_op	= &afs_symlink_inode_operations;
-			inode->i_mapping->a_ops	= &afs_symlink_aops;
 		}
+		inode->i_mapping->a_ops	= &afs_symlink_aops;
 		inode_nohighmem(inode);
 		break;
 	default:
@@ -136,19 +137,18 @@ static int afs_inode_init_from_status(struct afs_operation *op,
 		return afs_protocol_error(NULL, afs_eproto_file_type);
 	}
 
-	afs_set_i_size(vnode, status->size);
-	afs_set_netfs_context(vnode);
-
 	vnode->invalid_before	= status->data_version;
+	trace_afs_set_dv(vnode, status->data_version);
 	inode_set_iversion_raw(&vnode->netfs.inode, status->data_version);
 
 	if (!vp->scb.have_cb) {
 		/* it's a symlink we just created (the fileserver
 		 * didn't give us a callback) */
-		atomic64_set(&vnode->cb_expires_at, AFS_NO_CB_PROMISE);
+		afs_clear_cb_promise(vnode, afs_cb_promise_set_new_symlink);
 	} else {
 		vnode->cb_server = op->server;
-		atomic64_set(&vnode->cb_expires_at, vp->scb.callback.expires_at);
+		afs_set_cb_promise(vnode, vp->scb.callback.expires_at,
+				   afs_cb_promise_set_new_inode);
 	}
 
 	write_sequnlock(&vnode->cb_lock);
@@ -163,7 +163,8 @@ static void afs_apply_status(struct afs_operation *op,
 {
 	struct afs_file_status *status = &vp->scb.status;
 	struct afs_vnode *vnode = vp->vnode;
-	struct inode *inode = &vnode->netfs.inode;
+	struct netfs_inode *ictx = &vnode->netfs;
+	struct inode *inode = &ictx->inode;
 	struct timespec64 t;
 	umode_t mode;
 	bool unexpected_jump = false;
@@ -207,12 +208,17 @@ static void afs_apply_status(struct afs_operation *op,
 	if (vp->update_ctime)
 		inode_set_ctime_to_ts(inode, op->ctime);
 
-	if (vnode->status.data_version != status->data_version)
+	if (vnode->status.data_version != status->data_version) {
+		trace_afs_set_dv(vnode, status->data_version);
 		data_changed = true;
+	}
 
 	vnode->status = *status;
 
 	if (vp->dv_before + vp->dv_delta != status->data_version) {
+		trace_afs_dv_mismatch(vnode, vp->dv_before, vp->dv_delta,
+				      status->data_version);
+
 		if (vnode->cb_ro_snapshot == atomic_read(&vnode->volume->cb_ro_snapshot) &&
 		    atomic64_read(&vnode->cb_expires_at) != AFS_NO_CB_PROMISE)
 			pr_warn("kAFS: vnode modified {%llx:%llu} %llx->%llx %s (op=%x)\n",
@@ -223,12 +229,10 @@ static void afs_apply_status(struct afs_operation *op,
 				op->debug_id);
 
 		vnode->invalid_before = status->data_version;
-		if (vnode->status.type == AFS_FTYPE_DIR) {
-			if (test_and_clear_bit(AFS_VNODE_DIR_VALID, &vnode->flags))
-				afs_stat_v(vnode, n_inval);
-		} else {
+		if (vnode->status.type == AFS_FTYPE_DIR)
+			afs_invalidate_dir(vnode, afs_dir_invalid_dv_mismatch);
+		else
 			set_bit(AFS_VNODE_ZAP_DATA, &vnode->flags);
-		}
 		change_size = true;
 		data_changed = true;
 		unexpected_jump = true;
@@ -243,6 +247,8 @@ static void afs_apply_status(struct afs_operation *op,
 	}
 
 	if (data_changed) {
+		unsigned long long zero_point, size = status->size;
+
 		inode_set_iversion_raw(inode, status->data_version);
 
 		/* Only update the size if the data version jumped.  If the
@@ -250,14 +256,25 @@ static void afs_apply_status(struct afs_operation *op,
 		 * idea of what the size should be that's not the same as
 		 * what's on the server.
 		 */
-		vnode->netfs.remote_i_size = status->size;
-		if (change_size || status->size > i_size_read(inode)) {
-			afs_set_i_size(vnode, status->size);
+		spin_lock(&inode->i_lock);
+
+		if (change_size || size > i_size_read(inode)) {
+			/* We can read the sizes directly as we hold i_lock. */
+			zero_point = ictx->_zero_point;
+
 			if (unexpected_jump)
-				vnode->netfs.zero_point = status->size;
+				zero_point = size;
+			netfs_write_sizes(inode, size, size, zero_point);
+			inode_set_bytes(inode, size);
 			inode_set_ctime_to_ts(inode, t);
 			inode_set_atime_to_ts(inode, t);
+		} else {
+			netfs_write_remote_i_size(inode, size);
 		}
+		spin_unlock(&inode->i_lock);
+
+		if (op->ops == &afs_fetch_data_operation)
+			op->fetch.subreq->rreq->i_size = size;
 	}
 }
 
@@ -273,7 +290,7 @@ static void afs_apply_callback(struct afs_operation *op,
 	if (!afs_cb_is_broken(vp->cb_break_before, vnode)) {
 		if (op->volume->type == AFSVL_RWVOL)
 			vnode->cb_server = op->server;
-		atomic64_set(&vnode->cb_expires_at, cb->expires_at);
+		afs_set_cb_promise(vnode, cb->expires_at, afs_cb_promise_set_apply_cb);
 	}
 }
 
@@ -332,7 +349,7 @@ static void afs_fetch_status_success(struct afs_operation *op)
 	struct afs_vnode *vnode = vp->vnode;
 	int ret;
 
-	if (vnode->netfs.inode.i_state & I_NEW) {
+	if (inode_state_read_once(&vnode->netfs.inode) & I_NEW) {
 		ret = afs_inode_init_from_status(op, vp, vnode);
 		afs_op_set_error(op, ret);
 		if (ret == 0)
@@ -435,7 +452,9 @@ static void afs_get_inode_cache(struct afs_vnode *vnode)
 	} __packed key;
 	struct afs_vnode_cache_aux aux;
 
-	if (vnode->status.type != AFS_FTYPE_FILE) {
+	if (vnode->status.type != AFS_FTYPE_FILE &&
+	    vnode->status.type != AFS_FTYPE_DIR &&
+	    vnode->status.type != AFS_FTYPE_SYMLINK) {
 		vnode->netfs.cache = NULL;
 		return;
 	}
@@ -482,7 +501,7 @@ struct inode *afs_iget(struct afs_operation *op, struct afs_vnode_param *vp)
 	       inode, vnode->fid.vid, vnode->fid.vnode, vnode->fid.unique);
 
 	/* deal with an existing inode */
-	if (!(inode->i_state & I_NEW)) {
+	if (!(inode_state_read_once(inode) & I_NEW)) {
 		_leave(" = %p", inode);
 		return inode;
 	}
@@ -542,11 +561,10 @@ struct inode *afs_root_iget(struct super_block *sb, struct key *key)
 
 	_debug("GOT ROOT INODE %p { vl=%llx }", inode, as->volume->vid);
 
-	BUG_ON(!(inode->i_state & I_NEW));
+	BUG_ON(!(inode_state_read_once(inode) & I_NEW));
 
 	vnode = AFS_FS_I(inode);
 	vnode->cb_v_check = atomic_read(&as->volume->cb_v_break);
-	afs_set_netfs_context(vnode);
 
 	op = afs_alloc_operation(key, as->volume);
 	if (IS_ERR(op)) {
@@ -578,7 +596,7 @@ error:
 /*
  * read the attributes of an inode
  */
-int afs_getattr(struct mnt_idmap *idmap, const struct path *path,
+int afs_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -586,7 +604,7 @@ int afs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	struct key *key;
 	int ret, seq;
 
-	_enter("{ ino=%lu v=%u }", inode->i_ino, inode->i_generation);
+	_enter("{ ino=%llu v=%u }", inode->i_ino, inode->i_generation);
 
 	if (vnode->volume &&
 	    !(query_flags & AT_STATX_DONT_SYNC) &&
@@ -612,7 +630,7 @@ int afs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		 * it, but we need to give userspace the server's size.
 		 */
 		if (S_ISDIR(inode->i_mode))
-			stat->size = vnode->netfs.remote_i_size;
+			stat->size = netfs_read_remote_i_size(inode);
 	} while (read_seqretry(&vnode->cb_lock, seq));
 
 	return 0;
@@ -626,9 +644,9 @@ int afs_drop_inode(struct inode *inode)
 	_enter("");
 
 	if (test_bit(AFS_VNODE_PSEUDODIR, &AFS_FS_I(inode)->flags))
-		return generic_delete_inode(inode);
+		return inode_just_drop(inode);
 	else
-		return generic_drop_inode(inode);
+		return inode_generic_drop(inode);
 }
 
 /*
@@ -637,6 +655,7 @@ int afs_drop_inode(struct inode *inode)
 void afs_evict_inode(struct inode *inode)
 {
 	struct afs_vnode_cache_aux aux;
+	struct afs_super_info *sbi = AFS_FS_S(inode->i_sb);
 	struct afs_vnode *vnode = AFS_FS_I(inode);
 
 	_enter("{%llx:%llu.%d}",
@@ -648,8 +667,25 @@ void afs_evict_inode(struct inode *inode)
 
 	ASSERTCMP(inode->i_ino, ==, vnode->fid.vnode);
 
+	if ((S_ISDIR(inode->i_mode) ||
+	     S_ISLNK(inode->i_mode)) &&
+	    (inode_state_read_once(inode) & I_DIRTY) &&
+	    !sbi->dyn_root) {
+		struct writeback_control wbc = {
+			.sync_mode = WB_SYNC_ALL,
+			.for_sync = true,
+			.range_end = LLONG_MAX,
+		};
+
+		inode->i_mapping->a_ops->writepages(inode->i_mapping, &wbc);
+	}
+
+	flush_delayed_work(&vnode->lock_work);
 	netfs_wait_for_outstanding_io(inode);
 	truncate_inode_pages_final(&inode->i_data);
+	netfs_free_folioq_buffer(vnode->directory);
+	if (vnode->symlink)
+		afs_evict_symlink(vnode);
 
 	afs_set_cache_aux(vnode, &aux);
 	netfs_clear_inode_writeback(inode, &aux);
@@ -708,7 +744,7 @@ static void afs_setattr_edit_file(struct afs_operation *op)
 		if (size != old) {
 			truncate_pagecache(inode, size);
 			netfs_resize_file(&vnode->netfs, size, true);
-			fscache_resize_cookie(afs_vnode_cache(vnode), size);
+			fscache_resize_cookie(afs_vnode_cache(vnode), size, size < old);
 		}
 	}
 }
@@ -723,7 +759,7 @@ static const struct afs_operation_ops afs_setattr_operation = {
 /*
  * set the attributes of an inode
  */
-int afs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int afs_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		struct iattr *attr)
 {
 	const unsigned int supported =
@@ -777,11 +813,11 @@ int afs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 */
 		if (!(attr->ia_valid & (supported & ~ATTR_SIZE & ~ATTR_MTIME)) &&
 		    attr->ia_size < i_size &&
-		    attr->ia_size > vnode->netfs.remote_i_size) {
+		    attr->ia_size > netfs_read_remote_i_size(inode)) {
 			truncate_setsize(inode, attr->ia_size);
 			netfs_resize_file(&vnode->netfs, size, false);
 			fscache_resize_cookie(afs_vnode_cache(vnode),
-					      attr->ia_size);
+					      attr->ia_size, attr->ia_size < i_size);
 			ret = 0;
 			goto out_unlock;
 		}

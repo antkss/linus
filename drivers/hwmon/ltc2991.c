@@ -125,7 +125,7 @@ static int ltc2991_get_curr(struct ltc2991_state *st, u32 reg, int channel,
 
 	/* Vx-Vy, 19.075uV/LSB */
 	*val = DIV_ROUND_CLOSEST(sign_extend32(reg_val, 14) * 19075,
-				 st->r_sense_uohm[channel]);
+				 (s32)st->r_sense_uohm[channel]);
 
 	return 0;
 }
@@ -409,8 +409,8 @@ static const struct of_device_id ltc2991_of_match[] = {
 MODULE_DEVICE_TABLE(of, ltc2991_of_match);
 
 static const struct i2c_device_id ltc2991_i2c_id[] = {
-	{ "ltc2991" },
-	{}
+	{ .name = "ltc2991" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, ltc2991_i2c_id);
 

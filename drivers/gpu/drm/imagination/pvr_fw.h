@@ -86,7 +86,7 @@ struct pvr_fw_defs {
 	 * FW processor specific finalisation.
 	 * @pvr_dev: Target PowerVR device.
 	 *
-	 * This function is optional.
+	 * This function is mandatory.
 	 */
 	void (*fini)(struct pvr_device *pvr_dev);
 
@@ -167,47 +167,30 @@ struct pvr_fw_defs {
 	int (*wrapper_init)(struct pvr_device *pvr_dev);
 
 	/**
-	 * @has_fixed_data_addr:
+	 * @irq_pending: Check interrupt status register for pending interrupts.
 	 *
-	 * Called to check if firmware fixed data must be loaded at the address given by the
-	 * firmware layout table.
+	 * @pvr_dev: Target PowerVR device.
 	 *
 	 * This function is mandatory.
-	 *
-	 * Returns:
-	 *  * %true if firmware fixed data must be loaded at the address given by the firmware
-	 *    layout table.
-	 *  * %false otherwise.
 	 */
-	bool (*has_fixed_data_addr)(void);
+	bool (*irq_pending)(struct pvr_device *pvr_dev);
 
 	/**
-	 * @irq: FW Interrupt information.
+	 * @irq_clear: Clear pending interrupts.
 	 *
-	 * Those are processor dependent, and should be initialized by the
-	 * processor backend in pvr_fw_funcs::init().
+	 * @pvr_dev: Target PowerVR device.
+	 *
+	 * This function is mandatory.
 	 */
-	struct {
-		/** @enable_reg: FW interrupt enable register. */
-		u32 enable_reg;
+	void (*irq_clear)(struct pvr_device *pvr_dev);
 
-		/** @status_reg: FW interrupt status register. */
-		u32 status_reg;
-
-		/**
-		 * @clear_reg: FW interrupt clear register.
-		 *
-		 * If @status_reg == @clear_reg, we clear by write a bit to zero,
-		 * otherwise we clear by writing a bit to one.
-		 */
-		u32 clear_reg;
-
-		/** @event_mask: Bitmask of events to listen for. */
-		u32 event_mask;
-
-		/** @clear_mask: Value to write to the clear_reg in order to clear FW IRQs. */
-		u32 clear_mask;
-	} irq;
+	/**
+	 * @has_fixed_data_addr: Specify whether the firmware fixed data must be loaded at the
+	 *                       address given by the firmware layout table.
+	 *
+	 * This value is mandatory.
+	 */
+	bool has_fixed_data_addr;
 };
 
 /**
@@ -312,8 +295,11 @@ struct pvr_fw_device {
 	/** @mem: Structure containing objects representing firmware memory allocations. */
 	struct pvr_fw_mem mem;
 
-	/** @booted: %true if the firmware has been booted, %false otherwise. */
-	bool booted;
+	/**
+	 * @initialised: %true if the firmware has been successfully initialised,
+	 *               %false otherwise.
+	 */
+	bool initialised;
 
 	/**
 	 * @processor_type: FW processor type for this device. Must be one of
@@ -363,29 +349,17 @@ struct pvr_fw_device {
 	/** @fw_mm_base: Base address of address space managed by @fw_mm. */
 	u64 fw_mm_base;
 
-	/**
-	 * @fwif_connection_ctl: Pointer to CPU mapping of FWIF connection
-	 *                       control structure.
-	 */
-	struct rogue_fwif_connection_ctl *fwif_connection_ctl;
-
 	/** @fwif_sysinit: Pointer to CPU mapping of FW SYSINIT structure. */
 	struct rogue_fwif_sysinit *fwif_sysinit;
 
 	/** @fwif_sysdata: Pointer to CPU mapping of FW SYSDATA structure. */
 	struct rogue_fwif_sysdata *fwif_sysdata;
 
-	/** @fwif_osinit: Pointer to CPU mapping of FW OSINIT structure. */
-	struct rogue_fwif_osinit *fwif_osinit;
-
 	/** @fwif_osdata: Pointer to CPU mapping of FW OSDATA structure. */
 	struct rogue_fwif_osdata *fwif_osdata;
 
 	/** @power_sync: Pointer to CPU mapping of power sync state. */
 	u32 *power_sync;
-
-	/** @hwrinfobuf: Pointer to CPU mapping of FW HWR info buffer. */
-	struct rogue_fwif_hwrinfobuf *hwrinfobuf;
 
 	/** @fw_trace: Device firmware trace buffer state. */
 	struct pvr_fw_trace fw_trace;
@@ -400,26 +374,16 @@ struct pvr_fw_device {
 	} fw_objs;
 };
 
-#define pvr_fw_irq_read_reg(pvr_dev, name) \
-	pvr_cr_read32((pvr_dev), (pvr_dev)->fw_dev.defs->irq.name ## _reg)
-
-#define pvr_fw_irq_write_reg(pvr_dev, name, value) \
-	pvr_cr_write32((pvr_dev), (pvr_dev)->fw_dev.defs->irq.name ## _reg, value)
-
-#define pvr_fw_irq_pending(pvr_dev) \
-	(pvr_fw_irq_read_reg(pvr_dev, status) & (pvr_dev)->fw_dev.defs->irq.event_mask)
-
-#define pvr_fw_irq_clear(pvr_dev) \
-	pvr_fw_irq_write_reg(pvr_dev, clear, (pvr_dev)->fw_dev.defs->irq.clear_mask)
-
-#define pvr_fw_irq_enable(pvr_dev) \
-	pvr_fw_irq_write_reg(pvr_dev, enable, (pvr_dev)->fw_dev.defs->irq.event_mask)
-
-#define pvr_fw_irq_disable(pvr_dev) \
-	pvr_fw_irq_write_reg(pvr_dev, enable, 0)
+enum pvr_fw_processor_type {
+	PVR_FW_PROCESSOR_TYPE_META = 0,
+	PVR_FW_PROCESSOR_TYPE_MIPS,
+	PVR_FW_PROCESSOR_TYPE_RISCV,
+	PVR_FW_PROCESSOR_TYPE_COUNT,
+};
 
 extern const struct pvr_fw_defs pvr_fw_defs_meta;
 extern const struct pvr_fw_defs pvr_fw_defs_mips;
+extern const struct pvr_fw_defs pvr_fw_defs_riscv;
 
 int pvr_fw_validate_init_device_info(struct pvr_device *pvr_dev);
 int pvr_fw_init(struct pvr_device *pvr_dev);
@@ -453,6 +417,12 @@ int pvr_fw_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags,
 void *pvr_fw_object_create_and_map(struct pvr_device *pvr_dev, size_t size, u64 flags,
 				   void (*init)(void *cpu_ptr, void *priv),
 				   void *init_priv, struct pvr_fw_object **pvr_obj_out);
+
+int
+pvr_fw_object_create_offset(struct pvr_device *pvr_dev, u32 fw_addr,
+			    size_t size, u64 flags,
+			    void (*init)(void *cpu_ptr, void *priv),
+			    void *init_priv, struct pvr_fw_object **pvr_obj_out);
 
 void *
 pvr_fw_object_create_and_map_offset(struct pvr_device *pvr_dev, u32 dev_offset, size_t size,
@@ -505,5 +475,19 @@ pvr_fw_object_get_fw_addr(struct pvr_fw_object *fw_obj, u32 *fw_addr_out)
 {
 	pvr_fw_object_get_fw_addr_offset(fw_obj, 0, fw_addr_out);
 }
+
+u64
+pvr_fw_obj_get_gpu_addr(struct pvr_fw_object *fw_obj);
+
+static __always_inline size_t
+pvr_fw_obj_get_object_size(struct pvr_fw_object *fw_obj)
+{
+	return pvr_gem_object_size(fw_obj->gem);
+}
+
+/* Util functions defined in pvr_fw_util.c. These are intended for use in pvr_fw_<arch>.c files. */
+int
+pvr_fw_process_elf_command_stream(struct pvr_device *pvr_dev, const u8 *fw, u8 *fw_code_ptr,
+				  u8 *fw_data_ptr, u8 *fw_core_code_ptr, u8 *fw_core_data_ptr);
 
 #endif /* PVR_FW_H */

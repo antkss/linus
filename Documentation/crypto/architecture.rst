@@ -95,7 +95,7 @@ additional templates may enclose other templates, such as
 
 ::
 
-        template1(template2(single block cipher)))
+        template1(template2(single block cipher))
 
 
 The kernel crypto API may provide multiple implementations of a template
@@ -195,8 +195,6 @@ Otherwise, the caller may provide the following selections which match
 the aforementioned cipher types:
 
 -  CRYPTO_ALG_TYPE_CIPHER Single block cipher
-
--  CRYPTO_ALG_TYPE_COMPRESS Compression
 
 -  CRYPTO_ALG_TYPE_AEAD Authenticated Encryption with Associated Data
    (MAC)

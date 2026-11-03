@@ -164,6 +164,7 @@ void optc1_program_timing(
 	const enum signal_type signal,
 	bool use_vbios)
 {
+	(void)use_vbios;
 	struct dc_crtc_timing patched_crtc_timing;
 	uint32_t asic_blank_end;
 	uint32_t asic_blank_start;
@@ -302,7 +303,6 @@ void optc1_program_timing(
 	/* Enable stereo - only when we need to pack 3D frame. Other types
 	 * of stereo handled in explicit call
 	 */
-
 	if (optc->funcs->is_two_pixels_per_container(&patched_crtc_timing) || optc1->opp_count == 2)
 		h_div = H_TIMING_DIV_BY2;
 
@@ -375,7 +375,7 @@ void optc1_set_vtg_params(struct timing_generator *optc,
 	if (REG(OTG_INTERLACE_CONTROL)) {
 		if (patched_crtc_timing.flags.INTERLACE == 1) {
 			v_init = v_init / 2;
-			if ((optc1->vstartup_start/2)*2 > asic_blank_end)
+			if ((uint32_t)((optc1->vstartup_start/2)*2) > asic_blank_end)
 				v_fp2 = v_fp2 / 2;
 		}
 	}
@@ -539,15 +539,10 @@ static bool optc1_enable_crtc(struct timing_generator *optc)
 	REG_UPDATE(CONTROL,
 			VTG0_ENABLE, 1);
 
-	REG_SEQ_START();
-
 	/* Enable CRTC */
 	REG_UPDATE_2(OTG_CONTROL,
 			OTG_DISABLE_POINT_CNTL, 3,
 			OTG_MASTER_EN, 1);
-
-	REG_SEQ_SUBMIT();
-	REG_SEQ_WAIT_DONE();
 
 	return true;
 }
@@ -856,6 +851,8 @@ void optc1_set_early_control(
 	struct timing_generator *optc,
 	uint32_t early_cntl)
 {
+	(void)optc;
+	(void)early_cntl;
 	/* asic design change, do not need this control
 	 * empty for share caller logic
 	 */
@@ -1250,6 +1247,7 @@ void optc1_get_crtc_scanoutpos(
 static void optc1_enable_stereo(struct timing_generator *optc,
 	const struct dc_crtc_timing *timing, struct crtc_stereo_flags *flags)
 {
+	(void)timing;
 	struct optc *optc1 = DCN10TG_FROM_TG(optc);
 
 	if (flags) {
@@ -1313,7 +1311,7 @@ bool optc1_get_hw_timing(struct timing_generator *tg,
 	if (tg == NULL || hw_crtc_timing == NULL)
 		return false;
 
-	optc1_read_otg_state(DCN10TG_FROM_TG(tg), &s);
+	optc1_read_otg_state(tg, &s);
 
 	hw_crtc_timing->h_total = s.h_total + 1;
 	hw_crtc_timing->h_addressable = s.h_total - ((s.h_total - s.h_blank_start) + s.h_blank_end);
@@ -1329,9 +1327,11 @@ bool optc1_get_hw_timing(struct timing_generator *tg,
 }
 
 
-void optc1_read_otg_state(struct optc *optc1,
+void optc1_read_otg_state(struct timing_generator *optc,
 		struct dcn_otg_state *s)
 {
+	struct optc *optc1 = DCN10TG_FROM_TG(optc);
+
 	REG_GET(OTG_CONTROL,
 			OTG_MASTER_EN, &s->otg_enabled);
 
@@ -1471,37 +1471,90 @@ bool optc1_configure_crc(struct timing_generator *optc,
 	if (!optc1_is_tg_enabled(optc))
 		return false;
 
-	REG_WRITE(OTG_CRC_CNTL, 0);
+	if (!params->enable || params->reset) {
+		switch (params->crc_eng_inst) {
+		case 0:
+			REG_UPDATE(OTG_CRC_CNTL, OTG_CRC_EN, 0);
+			break;
+		case 1:
+			if (optc1->tg_mask->OTG_CRC1_EN != 0)
+				REG_UPDATE(OTG_CRC_CNTL, OTG_CRC1_EN, 0);
+			else
+				REG_UPDATE(OTG_CRC_CNTL, OTG_CRC_EN, 0);
+			break;
+		default:
+			return false;
+		}
+	}
 
 	if (!params->enable)
 		return true;
 
 	/* Program frame boundaries */
-	/* Window A x axis start and end. */
-	REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
-			OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
-			OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
+	switch (params->crc_eng_inst) {
+	case 0:
+		/* Window A x axis start and end. */
+		REG_UPDATE_2(OTG_CRC0_WINDOWA_X_CONTROL,
+				OTG_CRC0_WINDOWA_X_START, params->windowa_x_start,
+				OTG_CRC0_WINDOWA_X_END, params->windowa_x_end);
 
-	/* Window A y axis start and end. */
-	REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
-			OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
-			OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
+		/* Window A y axis start and end. */
+		REG_UPDATE_2(OTG_CRC0_WINDOWA_Y_CONTROL,
+				OTG_CRC0_WINDOWA_Y_START, params->windowa_y_start,
+				OTG_CRC0_WINDOWA_Y_END, params->windowa_y_end);
 
-	/* Window B x axis start and end. */
-	REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
-			OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
-			OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
+		/* Window B x axis start and end. */
+		REG_UPDATE_2(OTG_CRC0_WINDOWB_X_CONTROL,
+				OTG_CRC0_WINDOWB_X_START, params->windowb_x_start,
+				OTG_CRC0_WINDOWB_X_END, params->windowb_x_end);
 
-	/* Window B y axis start and end. */
-	REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
-			OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
-			OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
+		/* Window B y axis start and end. */
+		REG_UPDATE_2(OTG_CRC0_WINDOWB_Y_CONTROL,
+				OTG_CRC0_WINDOWB_Y_START, params->windowb_y_start,
+				OTG_CRC0_WINDOWB_Y_END, params->windowb_y_end);
 
-	/* Set crc mode and selection, and enable. Only using CRC0*/
-	REG_UPDATE_3(OTG_CRC_CNTL,
-			OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
-			OTG_CRC0_SELECT, params->selection,
-			OTG_CRC_EN, 1);
+		/* Set crc mode and selection, and enable.*/
+		REG_UPDATE_3(OTG_CRC_CNTL,
+				OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+				OTG_CRC0_SELECT, params->selection,
+				OTG_CRC_EN, 1);
+		break;
+	case 1:
+		/* Window A x axis start and end. */
+		REG_UPDATE_2(OTG_CRC1_WINDOWA_X_CONTROL,
+				OTG_CRC1_WINDOWA_X_START, params->windowa_x_start,
+				OTG_CRC1_WINDOWA_X_END, params->windowa_x_end);
+
+		/* Window A y axis start and end. */
+		REG_UPDATE_2(OTG_CRC1_WINDOWA_Y_CONTROL,
+				OTG_CRC1_WINDOWA_Y_START, params->windowa_y_start,
+				OTG_CRC1_WINDOWA_Y_END, params->windowa_y_end);
+
+		/* Window B x axis start and end. */
+		REG_UPDATE_2(OTG_CRC1_WINDOWB_X_CONTROL,
+				OTG_CRC1_WINDOWB_X_START, params->windowb_x_start,
+				OTG_CRC1_WINDOWB_X_END, params->windowb_x_end);
+
+		/* Window B y axis start and end. */
+		REG_UPDATE_2(OTG_CRC1_WINDOWB_Y_CONTROL,
+				OTG_CRC1_WINDOWB_Y_START, params->windowb_y_start,
+				OTG_CRC1_WINDOWB_Y_END, params->windowb_y_end);
+
+		/* Set crc mode and selection, and enable.*/
+		if (optc1->tg_mask->OTG_CRC1_EN != 0)
+			REG_UPDATE_3(OTG_CRC_CNTL,
+					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+					OTG_CRC1_SELECT, params->selection,
+					OTG_CRC1_EN, 1);
+		else
+			REG_UPDATE_3(OTG_CRC_CNTL,
+					OTG_CRC_CONT_EN, params->continuous_mode ? 1 : 0,
+					OTG_CRC1_SELECT, params->selection,
+					OTG_CRC_EN, 1);
+		break;
+	default:
+		return false;
+	}
 
 	return true;
 }
@@ -1510,6 +1563,7 @@ bool optc1_configure_crc(struct timing_generator *optc,
  * optc1_get_crc - Capture CRC result per component
  *
  * @optc: timing_generator instance.
+ * @idx: index of crc engine to get CRC from
  * @r_cr: 16-bit primary CRC signature for red data.
  * @g_y: 16-bit primary CRC signature for green data.
  * @b_cb: 16-bit primary CRC signature for blue data.
@@ -1521,26 +1575,45 @@ bool optc1_configure_crc(struct timing_generator *optc,
  * If CRC is disabled, return false; otherwise, return true, and the CRC
  * results in the parameters.
  */
-bool optc1_get_crc(struct timing_generator *optc,
+bool optc1_get_crc(struct timing_generator *optc, uint8_t idx,
 		   uint32_t *r_cr, uint32_t *g_y, uint32_t *b_cb)
 {
 	uint32_t field = 0;
 	struct optc *optc1 = DCN10TG_FROM_TG(optc);
 
-	REG_GET(OTG_CRC_CNTL, OTG_CRC_EN, &field);
+	if (idx == 1 && optc1->tg_mask->OTG_CRC1_EN != 0)
+		REG_GET(OTG_CRC_CNTL, OTG_CRC1_EN, &field);
+	else
+		REG_GET(OTG_CRC_CNTL, OTG_CRC_EN, &field);
 
 	/* Early return if CRC is not enabled for this CRTC */
 	if (!field)
 		return false;
 
-	/* OTG_CRC0_DATA_RG has the CRC16 results for the red and green component */
-	REG_GET_2(OTG_CRC0_DATA_RG,
-		  CRC0_R_CR, r_cr,
-		  CRC0_G_Y, g_y);
+	switch (idx) {
+	case 0:
+		/* OTG_CRC0_DATA_RG has the CRC16 results for the red and green component */
+		REG_GET_2(OTG_CRC0_DATA_RG,
+			  CRC0_R_CR, r_cr,
+			  CRC0_G_Y, g_y);
 
-	/* OTG_CRC0_DATA_B has the CRC16 results for the blue component */
-	REG_GET(OTG_CRC0_DATA_B,
-		CRC0_B_CB, b_cb);
+		/* OTG_CRC0_DATA_B has the CRC16 results for the blue component */
+		REG_GET(OTG_CRC0_DATA_B,
+			CRC0_B_CB, b_cb);
+		break;
+	case 1:
+		/* OTG_CRC1_DATA_RG has the CRC16 results for the red and green component */
+		REG_GET_2(OTG_CRC1_DATA_RG,
+			  CRC1_R_CR, r_cr,
+			  CRC1_G_Y, g_y);
+
+		/* OTG_CRC1_DATA_B has the CRC16 results for the blue component */
+		REG_GET(OTG_CRC1_DATA_B,
+			CRC1_B_CB, b_cb);
+		break;
+	default:
+		return false;
+	}
 
 	return true;
 }
@@ -1613,6 +1686,7 @@ static const struct timing_generator_funcs dcn10_tg_funcs = {
 		.setup_manual_trigger = optc1_setup_manual_trigger,
 		.get_hw_timing = optc1_get_hw_timing,
 		.is_two_pixels_per_container = optc1_is_two_pixels_per_container,
+		.read_otg_state = optc1_read_otg_state,
 };
 
 void dcn10_timing_generator_init(struct optc *optc1)

@@ -667,7 +667,7 @@ out:
 
 static ssize_t alarm_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct power_supply *psy = dev_get_drvdata(dev);
+	struct power_supply *psy = dev_to_psy(dev);
 	struct spwr_battery_device *bat = power_supply_get_drvdata(psy);
 	int status;
 
@@ -681,7 +681,7 @@ static ssize_t alarm_show(struct device *dev, struct device_attribute *attr, cha
 static ssize_t alarm_store(struct device *dev, struct device_attribute *attr, const char *buf,
 			   size_t count)
 {
-	struct power_supply *psy = dev_get_drvdata(dev);
+	struct power_supply *psy = dev_to_psy(dev);
 	struct spwr_battery_device *bat = power_supply_get_drvdata(psy);
 	unsigned long value;
 	int status;
@@ -852,9 +852,14 @@ static const struct spwr_psy_properties spwr_psy_props_bat2_sb3 = {
 };
 
 static const struct ssam_device_id surface_battery_match[] = {
-	{ SSAM_SDEV(BAT, SAM, 0x01, 0x00), (unsigned long)&spwr_psy_props_bat1     },
-	{ SSAM_SDEV(BAT, KIP, 0x01, 0x00), (unsigned long)&spwr_psy_props_bat2_sb3 },
-	{ },
+	{
+		SSAM_SDEV(BAT, SAM, 0x01, 0x00),
+		.driver_data = (unsigned long)&spwr_psy_props_bat1,
+	}, {
+		SSAM_SDEV(BAT, KIP, 0x01, 0x00),
+		.driver_data = (unsigned long)&spwr_psy_props_bat2_sb3,
+	},
+	{ }
 };
 MODULE_DEVICE_TABLE(ssam, surface_battery_match);
 

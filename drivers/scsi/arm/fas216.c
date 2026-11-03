@@ -2202,11 +2202,12 @@ no_command:
  * Returns: 0 on success, else error.
  * Notes: io_request_lock is held, interrupts are disabled.
  */
-static int fas216_queue_command_internal(struct scsi_cmnd *SCpnt,
-					 void (*done)(struct scsi_cmnd *))
+static enum scsi_qc_status
+fas216_queue_command_internal(struct scsi_cmnd *SCpnt,
+			      void (*done)(struct scsi_cmnd *))
 {
 	FAS216_Info *info = (FAS216_Info *)SCpnt->device->host->hostdata;
-	int result;
+	enum scsi_qc_status result;
 
 	fas216_checkmagic(info);
 
@@ -2243,7 +2244,7 @@ static int fas216_queue_command_internal(struct scsi_cmnd *SCpnt,
 	return result;
 }
 
-static int fas216_queue_command_lck(struct scsi_cmnd *SCpnt)
+static enum scsi_qc_status fas216_queue_command_lck(struct scsi_cmnd *SCpnt)
 {
 	return fas216_queue_command_internal(SCpnt, scsi_done);
 }
@@ -2273,7 +2274,7 @@ static void fas216_internal_done(struct scsi_cmnd *SCpnt)
  * Returns: scsi result code.
  * Notes: io_request_lock is held, interrupts are disabled.
  */
-static int fas216_noqueue_command_lck(struct scsi_cmnd *SCpnt)
+static enum scsi_qc_status fas216_noqueue_command_lck(struct scsi_cmnd *SCpnt)
 {
 	FAS216_Info *info = (FAS216_Info *)SCpnt->device->host->hostdata;
 
@@ -2294,7 +2295,7 @@ static int fas216_noqueue_command_lck(struct scsi_cmnd *SCpnt)
 	 * However, we must re-enable interrupts, or else we'll be
 	 * waiting forever.
 	 */
-	spin_unlock_irq(info->host->host_lock);
+	spin_unlock_irq(&info->host->host_lock);
 
 	while (!info->internal_done) {
 		/*
@@ -2306,13 +2307,13 @@ static int fas216_noqueue_command_lck(struct scsi_cmnd *SCpnt)
 		 * to be some time (eg, disconnected).
 		 */
 		if (fas216_readb(info, REG_STAT) & STAT_INT) {
-			spin_lock_irq(info->host->host_lock);
+			spin_lock_irq(&info->host->host_lock);
 			fas216_intr(info);
-			spin_unlock_irq(info->host->host_lock);
+			spin_unlock_irq(&info->host->host_lock);
 		}
 	}
 
-	spin_lock_irq(info->host->host_lock);
+	spin_lock_irq(&info->host->host_lock);
 
 	scsi_done(SCpnt);
 
@@ -2327,11 +2328,11 @@ DEF_SCSI_QCMD(fas216_noqueue_command)
  */
 static void fas216_eh_timer(struct timer_list *t)
 {
-	FAS216_Info *info = from_timer(info, t, eh_timer);
+	FAS216_Info *info = timer_container_of(info, t, eh_timer);
 
 	fas216_log(info, LOG_ERROR, "error handling timed out\n");
 
-	del_timer(&info->eh_timer);
+	timer_delete(&info->eh_timer);
 
 	if (info->rst_bus_status == 0)
 		info->rst_bus_status = -1;
@@ -2532,7 +2533,7 @@ int fas216_eh_device_reset(struct scsi_cmnd *SCpnt)
 		 */
 		wait_event(info->eh_wait, info->rst_dev_status);
 
-		del_timer_sync(&info->eh_timer);
+		timer_delete_sync(&info->eh_timer);
 		spin_lock_irqsave(&info->host_lock, flags);
 		info->rstSCpnt = NULL;
 
@@ -2622,7 +2623,7 @@ int fas216_eh_bus_reset(struct scsi_cmnd *SCpnt)
 	 * Wait one second for the interrupt.
 	 */
 	wait_event(info->eh_wait, info->rst_bus_status);
-	del_timer_sync(&info->eh_timer);
+	timer_delete_sync(&info->eh_timer);
 
 	fas216_log(info, LOG_ERROR, "bus reset complete: %s\n",
 		   info->rst_bus_status == 1 ? "success" : "failed");
@@ -2661,7 +2662,7 @@ int fas216_eh_host_reset(struct scsi_cmnd *SCpnt)
 {
 	FAS216_Info *info = (FAS216_Info *)SCpnt->device->host->hostdata;
 
-	spin_lock_irq(info->host->host_lock);
+	spin_lock_irq(&info->host->host_lock);
 
 	fas216_checkmagic(info);
 
@@ -2678,9 +2679,9 @@ int fas216_eh_host_reset(struct scsi_cmnd *SCpnt)
 	 * IRQs if we sleep, but we must relock and disable
 	 * IRQs after the sleep.
 	 */
-	spin_unlock_irq(info->host->host_lock);
+	spin_unlock_irq(&info->host->host_lock);
 	msleep(50 * 1000/100);
-	spin_lock_irq(info->host->host_lock);
+	spin_lock_irq(&info->host->host_lock);
 
 	/*
 	 * Release the SCSI reset.
@@ -2689,7 +2690,7 @@ int fas216_eh_host_reset(struct scsi_cmnd *SCpnt)
 
 	fas216_init_chip(info);
 
-	spin_unlock_irq(info->host->host_lock);
+	spin_unlock_irq(&info->host->host_lock);
 	return SUCCESS;
 }
 
@@ -2916,9 +2917,9 @@ int fas216_add(struct Scsi_Host *host, struct device *dev)
 	/*
 	 * scsi standard says wait 250ms
 	 */
-	spin_unlock_irq(info->host->host_lock);
+	spin_unlock_irq(&info->host->host_lock);
 	msleep(100*1000/100);
-	spin_lock_irq(info->host->host_lock);
+	spin_lock_irq(&info->host->host_lock);
 
 	fas216_writeb(info, REG_CNTL1, info->scsi.cfg[0]);
 	fas216_readb(info, REG_INST);

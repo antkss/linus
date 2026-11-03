@@ -28,19 +28,33 @@
 #include "include/irq_service_interface.h"
 #include "include/logger_interface.h"
 
+#if defined(CONFIG_DRM_AMD_DC_DCE)
 #include "dce110/irq_service_dce110.h"
+#endif
 
 #if defined(CONFIG_DRM_AMD_DC_SI)
 #include "dce60/irq_service_dce60.h"
 #endif
 
+#if defined(CONFIG_DRM_AMD_DC_DCE)
 #include "dce80/irq_service_dce80.h"
 #include "dce120/irq_service_dce120.h"
+#endif
 #include "dcn10/irq_service_dcn10.h"
 
 #include "reg_helper.h"
 #include "irq_service.h"
 
+//HPD0_DC_HPD_INT_STATUS
+#define HPD0_DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED_MASK		0x00000010L
+#define HPD0_DC_HPD_INT_CONTROL__DC_HPD_INT_POLARITY_MASK		0x00000100L
+#define HPD0_DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED__SHIFT		0x4
+#define HPD0_DC_HPD_INT_CONTROL__DC_HPD_INT_POLARITY__SHIFT     0x8
+//HPD1_DC_HPD_INT_STATUS
+#define DC_HPD1_INT_STATUS__DC_HPD1_SENSE_DELAYED_MASK			0x10
+#define DC_HPD1_INT_STATUS__DC_HPD1_SENSE_DELAYED__SHIFT		0x4
+#define DC_HPD1_INT_CONTROL__DC_HPD1_INT_POLARITY_MASK			0x100
+#define DC_HPD1_INT_CONTROL__DC_HPD1_INT_POLARITY__SHIFT		0x8
 
 
 #define CTX \
@@ -93,6 +107,30 @@ void dal_irq_service_set_generic(
 	value = (value & ~info->enable_mask) |
 		(info->enable_value[enable ? 0 : 1] & info->enable_mask);
 	dm_write_reg(irq_service->ctx, addr, value);
+}
+
+/*
+ * Base "non-implemented source" irq handlers referenced by irq_service.c and
+ * every DCN irq vtable.
+ */
+bool dal_irq_service_dummy_set(struct irq_service *irq_service,
+			       const struct irq_source_info *info,
+			       bool enable)
+{
+	(void)enable;
+	DC_LOG_ERROR("%s: called for non-implemented irq source, src_id=%u, ext_id=%u\n",
+		     __func__, info->src_id, info->ext_id);
+
+	return false;
+}
+
+bool dal_irq_service_dummy_ack(struct irq_service *irq_service,
+			       const struct irq_source_info *info)
+{
+	DC_LOG_ERROR("%s: called for non-implemented irq source, src_id=%u, ext_id=%u\n",
+		     __func__, info->src_id, info->ext_id);
+
+	return false;
 }
 
 bool dal_irq_service_set(
@@ -176,4 +214,58 @@ enum dc_irq_source dal_irq_service_to_irq_source(
 		irq_service,
 		src_id,
 		ext_id);
+}
+
+bool hpd0_ack(
+	struct irq_service *irq_service,
+	const struct irq_source_info *info)
+{
+	uint32_t addr = info->status_reg;
+	uint32_t value = dm_read_reg(irq_service->ctx, addr);
+	uint32_t current_status =
+		get_reg_field_value(
+			value,
+			HPD0_DC_HPD_INT_STATUS,
+			DC_HPD_SENSE_DELAYED);
+
+	dal_irq_service_ack_generic(irq_service, info);
+
+	value = dm_read_reg(irq_service->ctx, info->enable_reg);
+
+	set_reg_field_value(
+		value,
+		current_status ? 0 : 1,
+		HPD0_DC_HPD_INT_CONTROL,
+		DC_HPD_INT_POLARITY);
+
+	dm_write_reg(irq_service->ctx, info->enable_reg, value);
+
+	return true;
+}
+
+bool hpd1_ack(
+	struct irq_service *irq_service,
+	const struct irq_source_info *info)
+{
+	uint32_t addr = info->status_reg;
+	uint32_t value = dm_read_reg(irq_service->ctx, addr);
+	uint32_t current_status =
+		get_reg_field_value(
+			value,
+			DC_HPD1_INT_STATUS,
+			DC_HPD1_SENSE_DELAYED);
+
+	dal_irq_service_ack_generic(irq_service, info);
+
+	value = dm_read_reg(irq_service->ctx, info->enable_reg);
+
+	set_reg_field_value(
+		value,
+		current_status ? 0 : 1,
+		DC_HPD1_INT_CONTROL,
+		DC_HPD1_INT_POLARITY);
+
+	dm_write_reg(irq_service->ctx, info->enable_reg, value);
+
+	return true;
 }

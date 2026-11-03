@@ -4,6 +4,8 @@
 Min Heap API
 ============
 
+:Author: Kuan-Wei Chiu <visitorckw@gmail.com>
+
 Introduction
 ============
 
@@ -45,8 +47,8 @@ Example:
 
     #define MIN_HEAP_PREALLOCATED(_type, _name, _nr)
     struct _name {
-        int nr;         /* Number of elements in the heap */
-        int size;       /* Maximum number of elements that can be held */
+        size_t nr;         /* Number of elements in the heap */
+        size_t size;       /* Maximum number of elements that can be held */
         _type *data;    /* Pointer to the heap data */
         _type preallocated[_nr];  /* Static preallocated array */
     }
@@ -237,19 +239,6 @@ Other Utilities
 This macro returns `true` if the heap is full, otherwise `false`.
 
 **Inline Version:** min_heap_full_inline(heap)
-
-- **min_heap_empty(heap)**: Checks whether the heap is empty.
-  Complexity: **O(1)**.
-
-.. code-block:: c
-
-    bool empty = min_heap_empty(heap);
-
-- `heap`: A pointer to the min-heap to check.
-
-This macro returns `true` if the heap is empty, otherwise `false`.
-
-**Inline Version:** min_heap_empty_inline(heap)
 
 Example Usage
 =============

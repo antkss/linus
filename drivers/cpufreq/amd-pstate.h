@@ -9,10 +9,53 @@
 #define _LINUX_AMD_PSTATE_H
 
 #include <linux/pm_qos.h>
+#include <linux/platform_profile.h>
+
+#include <asm/processor.h>
+
+#if IS_MODULE(CONFIG_X86_AMD_PSTATE_UT)
+#define EXPORT_SYMBOL_FOR_PSTATE_UT(symbol) \
+	EXPORT_SYMBOL_FOR_MODULES(symbol, "amd-pstate-ut")
+#else
+#define EXPORT_SYMBOL_FOR_PSTATE_UT(symbol)
+#endif
 
 /*********************************************************************
  *                        AMD P-state INTERFACE                       *
  *********************************************************************/
+
+/**
+ * union perf_cached - A union to cache performance-related data.
+ * @highest_perf: the maximum performance an individual processor may reach,
+ *		  assuming ideal conditions
+ *		  For platforms that support the preferred core feature, the highest_perf value maybe
+ * 		  configured to any value in the range 166-255 by the firmware (because the preferred
+ * 		  core ranking is encoded in the highest_perf value). To maintain consistency across
+ * 		  all platforms, we split the highest_perf and preferred core ranking values into
+ * 		  cpudata->perf.highest_perf and cpudata->prefcore_ranking.
+ * @nominal_perf: the maximum sustained performance level of the processor,
+ *		  assuming ideal operating conditions
+ * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
+ *			   savings are achieved
+ * @lowest_perf: the absolute lowest performance level of the processor
+ * @min_limit_perf: Cached value of the performance corresponding to policy->min
+ * @max_limit_perf: Cached value of the performance corresponding to policy->max
+ * @bios_min_perf: Cached perf value corresponding to the "Requested CPU Min Frequency" BIOS option
+ * @val: Raw 64-bit value for atomic access via READ_ONCE()/WRITE_ONCE()
+ */
+union perf_cached {
+	struct {
+		u8	highest_perf;
+		u8	nominal_perf;
+		u8	lowest_nonlinear_perf;
+		u8	lowest_perf;
+		u8	min_limit_perf;
+		u8	max_limit_perf;
+		u8	bios_min_perf;
+	};
+	u64	val;
+};
+
 /**
  * struct  amd_aperf_mperf
  * @aperf: actual performance frequency clock count
@@ -30,26 +73,20 @@ struct amd_aperf_mperf {
  * @cpu: CPU number
  * @req: constraint request to apply
  * @cppc_req_cached: cached performance request hints
- * @highest_perf: the maximum performance an individual processor may reach,
- *		  assuming ideal conditions
- *		  For platforms that do not support the preferred core feature, the
- *		  highest_pef may be configured with 166 or 255, to avoid max frequency
- *		  calculated wrongly. we take the fixed value as the highest_perf.
- * @nominal_perf: the maximum sustained performance level of the processor,
- *		  assuming ideal operating conditions
- * @lowest_nonlinear_perf: the lowest performance level at which nonlinear power
- *			   savings are achieved
- * @lowest_perf: the absolute lowest performance level of the processor
+ * @cppc_req2_cached: cached value of MSR_AMD_CPPC_REQ2
+ * @perf: cached performance-related data
  * @prefcore_ranking: the preferred core ranking, the higher value indicates a higher
  * 		  priority.
- * @min_limit_perf: Cached value of the performance corresponding to policy->min
- * @max_limit_perf: Cached value of the performance corresponding to policy->max
+ * @floor_perf_cnt: Cached value of the number of distinct floor
+ *                  performance levels supported
+ * @bios_floor_perf: Cached value of the boot-time floor performance level from
+ *                   MSR_AMD_CPPC_REQ2
  * @min_limit_freq: Cached value of policy->min (in khz)
  * @max_limit_freq: Cached value of policy->max (in khz)
- * @max_freq: the frequency (in khz) that mapped to highest_perf
- * @min_freq: the frequency (in khz) that mapped to lowest_perf
  * @nominal_freq: the frequency (in khz) that mapped to nominal_perf
+ * @max_freq: in ideal conditions the maximum frequency (in khz) possible frequency
  * @lowest_nonlinear_freq: the frequency (in khz) that mapped to lowest_nonlinear_perf
+ * @floor_freq: Cached value of the user requested floor_freq
  * @cur: Difference of Aperf/Mperf/tsc count between last and current sample
  * @prev: Last Aperf/Mperf/tsc count value read from register
  * @freq: current cpu frequency value (in khz)
@@ -57,10 +94,17 @@ struct amd_aperf_mperf {
  * @hw_prefcore: check whether HW supports preferred core featue.
  * 		  Only when hw_prefcore and early prefcore param are true,
  * 		  AMD P-State driver supports preferred core featue.
- * @epp_policy: Last saved policy used to set energy-performance preference
- * @epp_cached: Cached CPPC energy-performance preference value
  * @policy: Cpufreq policy value
- * @cppc_cap1_cached Cached MSR_AMD_CPPC_CAP1 register value
+ * @suspended: If CPU core if offlined
+ * @epp_default_ac: Default EPP value for AC power source
+ * @epp_default_dc: Default EPP value for DC power source
+ * @dynamic_epp: Whether dynamic EPP is enabled
+ * @raw_epp: Whether the last EPP write was a raw numeric value rather than a
+ *	     named preference
+ * @power_nb: Notifier block for power events
+ * @current_profile: Currently selected platform profile option
+ * @ppdev: Device registered with the platform profile handler
+ * @profile_name: Name under which @ppdev is registered
  *
  * The amd_cpudata is key private data for each CPU thread in AMD P-State, and
  * represents all the attributes and goals that AMD P-State requests at runtime.
@@ -70,21 +114,19 @@ struct amd_cpudata {
 
 	struct	freq_qos_request req[2];
 	u64	cppc_req_cached;
+	u64	cppc_req2_cached;
 
-	u32	highest_perf;
-	u32	nominal_perf;
-	u32	lowest_nonlinear_perf;
-	u32	lowest_perf;
-	u32     prefcore_ranking;
-	u32     min_limit_perf;
-	u32     max_limit_perf;
-	u32     min_limit_freq;
-	u32     max_limit_freq;
+	union perf_cached perf;
 
-	u32	max_freq;
-	u32	min_freq;
+	u8	prefcore_ranking;
+	u8	floor_perf_cnt;
+	u8	bios_floor_perf;
+	u32	min_limit_freq;
+	u32	max_limit_freq;
 	u32	nominal_freq;
+	u32	max_freq;
 	u32	lowest_nonlinear_freq;
+	u32	floor_freq;
 
 	struct amd_aperf_mperf cur;
 	struct amd_aperf_mperf prev;
@@ -94,13 +136,20 @@ struct amd_cpudata {
 	bool	hw_prefcore;
 
 	/* EPP feature related attributes*/
-	s16	epp_policy;
-	s16	epp_cached;
 	u32	policy;
-	u64	cppc_cap1_cached;
 	bool	suspended;
-	s16	epp_default;
-	bool	boost_state;
+	u8	epp_default_ac;
+	u8	epp_default_dc;
+	bool	dynamic_epp;
+	bool	raw_epp;
+	struct notifier_block power_nb;
+
+	/* platform profile */
+	enum platform_profile_option current_profile;
+	struct device *ppdev;
+	char *profile_name;
+
+	enum x86_topology_cpu_type cpu_type;
 };
 
 /*
@@ -114,7 +163,74 @@ enum amd_pstate_mode {
 	AMD_PSTATE_GUIDED,
 	AMD_PSTATE_MAX,
 };
+
+/*
+ * AMD Energy Preference Performance (EPP)
+ * The EPP is used in the CCLK DPM controller to drive
+ * the frequency that a core is going to operate during
+ * short periods of activity. EPP values will be utilized for
+ * different OS profiles (balanced, performance, power savings)
+ * display strings corresponding to EPP index in the
+ * energy_perf_strings[]
+ *	index		String
+ *-------------------------------------
+ *	0		default
+ *	1		performance
+ *	2		balance_performance
+ *	3		balance_power
+ *	4		power
+ *	5		custom (for raw EPP values)
+ *	6		dynamic (platform profile driven selection)
+ */
+enum energy_perf_value_index {
+	EPP_INDEX_DEFAULT = 0,
+	EPP_INDEX_PERFORMANCE,
+	EPP_INDEX_BALANCE_PERFORMANCE,
+	EPP_INDEX_BALANCE_POWERSAVE,
+	EPP_INDEX_POWERSAVE,
+	EPP_INDEX_CUSTOM,
+	EPP_INDEX_DYNAMIC,
+	EPP_INDEX_MAX,
+};
+
+static const char * const energy_perf_strings[] = {
+	[EPP_INDEX_DEFAULT] = "default",
+	[EPP_INDEX_PERFORMANCE] = "performance",
+	[EPP_INDEX_BALANCE_PERFORMANCE] = "balance_performance",
+	[EPP_INDEX_BALANCE_POWERSAVE] = "balance_power",
+	[EPP_INDEX_POWERSAVE] = "power",
+	[EPP_INDEX_CUSTOM] = "custom",
+	[EPP_INDEX_DYNAMIC] = "dynamic",
+};
+static_assert(ARRAY_SIZE(energy_perf_strings) == EPP_INDEX_MAX);
+
+u8 *amd_pstate_cpu_epp_values(enum x86_topology_cpu_type cpu_type);
+
+static inline u8 freq_to_perf(union perf_cached perf, u32 nominal_freq, unsigned int freq_val)
+{
+	u32 perf_val = DIV_ROUND_UP_ULL((u64)freq_val * perf.nominal_perf, nominal_freq);
+
+	return (u8)clamp(perf_val, perf.lowest_perf, perf.highest_perf);
+}
+
+static inline u32 perf_to_freq(union perf_cached perf, u32 nominal_freq, u8 perf_val)
+{
+	return DIV_ROUND_UP_ULL((u64)nominal_freq * perf_val,
+				perf.nominal_perf);
+}
+
 const char *amd_pstate_get_mode_string(enum amd_pstate_mode mode);
+int amd_pstate_get_status(void);
 int amd_pstate_update_status(const char *buf, size_t size);
+ssize_t store_energy_performance_preference(struct cpufreq_policy *policy,
+				    const char *buf, size_t count);
+ssize_t show_energy_performance_preference(struct cpufreq_policy *policy, char *buf);
+void amd_pstate_clear_dynamic_epp(struct cpufreq_policy *policy);
+ssize_t store_amd_pstate_floor_freq(struct cpufreq_policy *policy, const char *buf, size_t count);
+ssize_t show_amd_pstate_floor_freq(struct cpufreq_policy *policy, char *buf);
+
+struct freq_attr;
+
+struct freq_attr **amd_pstate_get_current_attrs(void);
 
 #endif /* _LINUX_AMD_PSTATE_H */

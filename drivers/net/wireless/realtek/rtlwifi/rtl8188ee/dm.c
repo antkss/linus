@@ -879,7 +879,7 @@ static void dm_txpower_track_cb_therm(struct ieee80211_hw *hw)
 		{0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 25, 25}
 	};
 
-	/*Initilization (7 steps in total) */
+	/* Initialization (7 steps in total) */
 	rtlpriv->dm.txpower_trackinginit = true;
 	rtl_dbg(rtlpriv, COMP_POWER_TRACKING, DBG_LOUD,
 		"%s\n", __func__);
@@ -1684,7 +1684,8 @@ static void rtl88e_dm_fast_ant_training(struct ieee80211_hw *hw)
 void rtl88e_dm_fast_antenna_training_callback(struct timer_list *t)
 {
 	struct rtl_priv *rtlpriv =
-		from_timer(rtlpriv, t, works.fast_antenna_training_timer);
+		timer_container_of(rtlpriv, t,
+				   works.fast_antenna_training_timer);
 	struct ieee80211_hw *hw = rtlpriv->hw;
 
 	rtl88e_dm_fast_ant_training(hw);

@@ -1159,7 +1159,7 @@
 							};
 						};
 
-						asrc_out6_port:	port@c {
+						asrc_out6_port: port@c {
 							reg = <0xc>;
 
 							asrc_out6_ep: endpoint {
@@ -2174,6 +2174,12 @@
 			phy-names = "usb2-1", "usb2-2", "usb3-2";
 		};
 
+		cec@3960000 {
+			status = "okay";
+
+			hdmi-phandle = <&sor1>;
+		};
+
 		host1x@13e00000 {
 			display-hub@15200000 {
 				status = "okay";
@@ -2427,22 +2433,22 @@
 			};
 
 			cooling-maps {
-				cpu-critical {
+				map-critical {
 					cooling-device = <&fan 3 3>;
 					trip = <&cpu_trip_critical>;
 				};
 
-				cpu-hot {
+				map-hot {
 					cooling-device = <&fan 2 2>;
 					trip = <&cpu_trip_hot>;
 				};
 
-				cpu-active {
+				map-active {
 					cooling-device = <&fan 1 1>;
 					trip = <&cpu_trip_active>;
 				};
 
-				cpu-passive {
+				map-passive {
 					cooling-device = <&fan 0 0>;
 					trip = <&cpu_trip_passive>;
 				};

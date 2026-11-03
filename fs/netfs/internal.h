@@ -23,8 +23,19 @@
 /*
  * buffered_read.c
  */
+int netfs_read_query_cache(struct netfs_io_request *rreq,
+			   struct fscache_occupancy *occ);
+void netfs_queue_read(struct netfs_io_request *rreq,
+		      struct netfs_io_subrequest *subreq);
+void netfs_cache_read_terminated(void *priv, ssize_t transferred_or_error);
 int netfs_prefetch_for_write(struct file *file, struct folio *folio,
 			     size_t offset, size_t len);
+
+/*
+ * buffered_write.c
+ */
+void netfs_update_i_size(struct netfs_inode *ctx, struct inode *inode,
+			 uoff_t pos, size_t copied);
 
 /*
  * main.c
@@ -34,6 +45,7 @@ extern struct list_head netfs_io_requests;
 extern spinlock_t netfs_proc_lock;
 extern mempool_t netfs_request_pool;
 extern mempool_t netfs_subrequest_pool;
+extern mempool_t netfs_folioq_pool;
 
 #ifdef CONFIG_PROC_FS
 static inline void netfs_proc_add_rreq(struct netfs_io_request *rreq)
@@ -58,25 +70,34 @@ static inline void netfs_proc_del_rreq(struct netfs_io_request *rreq) {}
 /*
  * misc.c
  */
-struct folio_queue *netfs_buffer_make_space(struct netfs_io_request *rreq);
-int netfs_buffer_append_folio(struct netfs_io_request *rreq, struct folio *folio,
-			      bool needs_put);
-struct folio_queue *netfs_delete_buffer_head(struct netfs_io_request *wreq);
-void netfs_clear_buffer(struct netfs_io_request *rreq);
+struct folio_queue *netfs_buffer_make_space(struct netfs_io_request *rreq,
+					    enum netfs_folioq_trace trace);
 void netfs_reset_iter(struct netfs_io_subrequest *subreq);
+void netfs_wake_collector(struct netfs_io_request *rreq);
+void netfs_subreq_clear_in_progress(struct netfs_io_subrequest *subreq);
+void netfs_wait_for_in_progress_stream(struct netfs_io_request *rreq,
+				       struct netfs_io_stream *stream);
+ssize_t netfs_wait_for_read(struct netfs_io_request *rreq);
+ssize_t netfs_wait_for_write(struct netfs_io_request *rreq);
+void netfs_wait_for_paused_read(struct netfs_io_request *rreq);
+void netfs_wait_for_paused_write(struct netfs_io_request *rreq);
+void netfs_wait_for_put_ra_refs(struct netfs_io_request *rreq);
+int netfs_clear_stale_pre_isize(struct inode *inode, uoff_t from,
+				uoff_t to, bool nowait);
 
 /*
  * objects.c
  */
 struct netfs_io_request *netfs_alloc_request(struct address_space *mapping,
 					     struct file *file,
-					     loff_t start, size_t len,
+					     uoff_t start, size_t len,
 					     enum netfs_io_origin origin);
 void netfs_get_request(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace what);
-void netfs_clear_subrequests(struct netfs_io_request *rreq, bool was_async);
-void netfs_put_request(struct netfs_io_request *rreq, bool was_async,
-		       enum netfs_rreq_ref_trace what);
-struct netfs_io_subrequest *netfs_alloc_subrequest(struct netfs_io_request *rreq);
+void netfs_clear_subrequests(struct netfs_io_request *rreq);
+void netfs_put_request(struct netfs_io_request *rreq, enum netfs_rreq_ref_trace what);
+void netfs_put_failed_request(struct netfs_io_request *rreq);
+struct netfs_io_subrequest *netfs_alloc_subrequest(struct netfs_io_request *rreq,
+						   enum netfs_io_source source);
 
 static inline void netfs_see_request(struct netfs_io_request *rreq,
 				     enum netfs_rreq_ref_trace what)
@@ -84,21 +105,57 @@ static inline void netfs_see_request(struct netfs_io_request *rreq,
 	trace_netfs_rreq_ref(rreq->debug_id, refcount_read(&rreq->ref), what);
 }
 
+static inline void netfs_see_subrequest(struct netfs_io_subrequest *subreq,
+					enum netfs_sreq_ref_trace what)
+{
+	trace_netfs_sreq_ref(subreq->rreq->debug_id, subreq->debug_index,
+			     refcount_read(&subreq->ref), what);
+}
+
 /*
  * read_collect.c
  */
-void netfs_read_termination_worker(struct work_struct *work);
-void netfs_rreq_terminated(struct netfs_io_request *rreq, bool was_async);
+void netfs_cancel_copy_to_cache(struct netfs_io_request *rreq, struct folio *folio);
+void netfs_read_set_unlock_at(struct netfs_io_request *rreq);
+bool netfs_read_collection(struct netfs_io_request *rreq);
+void netfs_read_collection_worker(struct work_struct *work);
+void netfs_cancel_read(struct netfs_io_subrequest *subreq, int error);
+void netfs_cache_read_terminated(void *priv, ssize_t transferred_or_error);
 
 /*
  * read_pgpriv2.c
  */
-void netfs_pgpriv2_mark_copy_to_cache(struct netfs_io_subrequest *subreq,
-				      struct netfs_io_request *rreq,
-				      struct folio_queue *folioq,
-				      int slot);
-void netfs_pgpriv2_write_to_the_cache(struct netfs_io_request *rreq);
+#ifdef CONFIG_NETFS_PGPRIV2
+int netfs_prepare_pgpriv2_write_buffer(struct netfs_io_subrequest *subreq,
+				       unsigned int max_segs);
+void netfs_pgpriv2_copy_to_cache(struct netfs_io_request *rreq, struct folio *folio);
+void netfs_pgpriv2_end_copy_to_cache(struct netfs_io_request *rreq);
 bool netfs_pgpriv2_unlock_copied_folios(struct netfs_io_request *wreq);
+static inline bool netfs_using_pgpriv2(const struct netfs_io_request *rreq)
+{
+	return unlikely(test_bit(NETFS_RREQ_USE_PGPRIV2, &rreq->flags));
+}
+#else
+static inline int netfs_prepare_pgpriv2_write_buffer(struct netfs_io_subrequest *subreq,
+						     unsigned int max_segs)
+{
+	return -EIO;
+}
+static inline void netfs_pgpriv2_copy_to_cache(struct netfs_io_request *rreq, struct folio *folio)
+{
+}
+static inline void netfs_pgpriv2_end_copy_to_cache(struct netfs_io_request *rreq)
+{
+}
+static inline bool netfs_pgpriv2_unlock_copied_folios(struct netfs_io_request *wreq)
+{
+	return true;
+}
+static inline bool netfs_using_pgpriv2(const struct netfs_io_request *rreq)
+{
+	return false;
+}
+#endif
 
 /*
  * read_retry.c
@@ -113,6 +170,7 @@ void netfs_unlock_abandoned_read_pages(struct netfs_io_request *rreq);
 extern atomic_t netfs_n_rh_dio_read;
 extern atomic_t netfs_n_rh_readahead;
 extern atomic_t netfs_n_rh_read_folio;
+extern atomic_t netfs_n_rh_read_single;
 extern atomic_t netfs_n_rh_rreq;
 extern atomic_t netfs_n_rh_sreq;
 extern atomic_t netfs_n_rh_download;
@@ -129,8 +187,9 @@ extern atomic_t netfs_n_rh_write_begin;
 extern atomic_t netfs_n_rh_write_done;
 extern atomic_t netfs_n_rh_write_failed;
 extern atomic_t netfs_n_rh_write_zskip;
+extern atomic_t netfs_n_rh_retry_read_req;
+extern atomic_t netfs_n_rh_retry_read_subreq;
 extern atomic_t netfs_n_wh_buffered_write;
-extern atomic_t netfs_n_wh_writethrough;
 extern atomic_t netfs_n_wh_dio_write;
 extern atomic_t netfs_n_wh_writepages;
 extern atomic_t netfs_n_wh_copy_to_cache;
@@ -141,6 +200,8 @@ extern atomic_t netfs_n_wh_upload_failed;
 extern atomic_t netfs_n_wh_write;
 extern atomic_t netfs_n_wh_write_done;
 extern atomic_t netfs_n_wh_write_failed;
+extern atomic_t netfs_n_wh_retry_write_req;
+extern atomic_t netfs_n_wh_retry_write_subreq;
 extern atomic_t netfs_n_wb_lock_skip;
 extern atomic_t netfs_n_wb_lock_wait;
 extern atomic_t netfs_n_folioq;
@@ -166,31 +227,32 @@ static inline void netfs_stat_d(atomic_t *stat)
  * write_collect.c
  */
 int netfs_folio_written_back(struct folio *folio);
+bool netfs_write_collection(struct netfs_io_request *wreq);
 void netfs_write_collection_worker(struct work_struct *work);
-void netfs_wake_write_collector(struct netfs_io_request *wreq, bool was_async);
 
 /*
  * write_issue.c
  */
 struct netfs_io_request *netfs_create_write_req(struct address_space *mapping,
 						struct file *file,
-						loff_t start,
+						uoff_t start,
 						enum netfs_io_origin origin);
+void netfs_prepare_write(struct netfs_io_request *wreq,
+			 struct netfs_io_stream *stream,
+			 uoff_t start);
 void netfs_reissue_write(struct netfs_io_stream *stream,
 			 struct netfs_io_subrequest *subreq,
 			 struct iov_iter *source);
 void netfs_issue_write(struct netfs_io_request *wreq,
 		       struct netfs_io_stream *stream);
-int netfs_advance_write(struct netfs_io_request *wreq,
-			struct netfs_io_stream *stream,
-			loff_t start, size_t len, bool to_eof);
-struct netfs_io_request *netfs_begin_writethrough(struct kiocb *iocb, size_t len);
-int netfs_advance_writethrough(struct netfs_io_request *wreq, struct writeback_control *wbc,
-			       struct folio *folio, size_t copied, bool to_page_end,
-			       struct folio **writethrough_cache);
-int netfs_end_writethrough(struct netfs_io_request *wreq, struct writeback_control *wbc,
-			   struct folio *writethrough_cache);
-int netfs_unbuffered_write(struct netfs_io_request *wreq, bool may_wait, size_t len);
+size_t netfs_advance_write(struct netfs_io_request *wreq,
+			   struct netfs_io_stream *stream,
+			   uoff_t start, size_t len, bool to_eof);
+
+/*
+ * write_retry.c
+ */
+void netfs_retry_writes(struct netfs_io_request *wreq);
 
 /*
  * Miscellaneous functions.
@@ -202,6 +264,18 @@ static inline bool netfs_is_cache_enabled(struct netfs_inode *ctx)
 
 	return fscache_cookie_valid(cookie) && cookie->cache_priv &&
 		fscache_cookie_enabled(cookie);
+#else
+	return false;
+#endif
+}
+
+static inline bool netfs_is_cache_maybe_enabled(struct netfs_inode *ctx)
+{
+#if IS_ENABLED(CONFIG_FSCACHE)
+	struct fscache_cookie *cookie = ctx->cache;
+
+	return fscache_cookie_valid(cookie) &&
+		test_bit(FSCACHE_COOKIE_IS_CACHING, &cookie->flags);
 #else
 	return false;
 #endif
@@ -237,6 +311,59 @@ static inline void netfs_put_group_many(struct netfs_group *netfs_group, int nr)
 	    netfs_group != NETFS_FOLIO_COPY_TO_CACHE &&
 	    refcount_sub_and_test(nr, &netfs_group->ref))
 		netfs_group->free(netfs_group);
+}
+
+/*
+ * Clear and wake up a NETFS_RREQ_* flag bit on a request.
+ */
+static inline void netfs_wake_rreq_flag(struct netfs_io_request *rreq,
+					unsigned int rreq_flag,
+					enum netfs_rreq_trace trace)
+{
+	if (test_bit(rreq_flag, &rreq->flags)) {
+		clear_bit_unlock(rreq_flag, &rreq->flags);
+		smp_mb__after_atomic(); /* Set flag before task state */
+		trace_netfs_rreq(rreq, trace);
+		wake_up(&rreq->waitq);
+	}
+}
+
+/*
+ * Test the NETFS_RREQ_IN_PROGRESS flag, inserting an appropriate barrier.
+ */
+static inline bool netfs_check_rreq_in_progress(const struct netfs_io_request *rreq)
+{
+	/* Order read of flags before read of anything else, such as error. */
+	return test_bit_acquire(NETFS_RREQ_IN_PROGRESS, &rreq->flags);
+}
+
+/*
+ * Test the NETFS_SREQ_IN_PROGRESS flag, inserting an appropriate barrier.
+ */
+static inline bool netfs_check_subreq_in_progress(const struct netfs_io_subrequest *subreq)
+{
+	/* Order read of flags before read of anything else, such as error. */
+	return test_bit_acquire(NETFS_SREQ_IN_PROGRESS, &subreq->flags);
+}
+
+/*
+ * Indicate that we've generated and queued all the subrequests we're going to.
+ */
+static inline void netfs_all_subreqs_queued(struct netfs_io_request *rreq)
+{
+	smp_wmb(); /* Write lists before ALL_QUEUED. */
+	set_bit(NETFS_RREQ_ALL_QUEUED, &rreq->flags);
+	smp_mb__after_atomic();
+	trace_netfs_rreq(rreq, netfs_rreq_trace_all_queued);
+}
+
+/*
+ * Query if all subrequests are queued.
+ */
+static inline bool netfs_are_all_subreqs_queued(const struct netfs_io_request *rreq)
+{
+	/* Read lists after ALL_QUEUED. */
+	return test_bit_acquire(NETFS_RREQ_ALL_QUEUED, &rreq->flags);
 }
 
 /*
@@ -390,6 +517,32 @@ void fscache_create_volume(struct fscache_volume *volume, bool wait);
 #define kleave(FMT, ...) dbgprintk("<== %s()"FMT"", __func__, ##__VA_ARGS__)
 #define kdebug(FMT, ...) dbgprintk(FMT, ##__VA_ARGS__)
 
+#define FSCACHE_DEBUG_CACHE	0
+#define FSCACHE_DEBUG_COOKIE	1
+#define FSCACHE_DEBUG_OBJECT	2
+#define FSCACHE_DEBUG_OPERATION	3
+
+#define FSCACHE_POINT_ENTER	1
+#define FSCACHE_POINT_LEAVE	2
+#define FSCACHE_POINT_DEBUG	4
+
+#ifndef FSCACHE_DEBUG_LEVEL
+#define FSCACHE_DEBUG_LEVEL CACHE
+#endif
+
+/*
+ * Determine whether a particular optional debugging point should be logged.
+ * Three levels of indirection are needed to expand FSCACHE_DEBUG_LEVEL before
+ * joining it with its prefix.
+ */
+#define ____do_kdebug(LEVEL, POINT) \
+	unlikely(netfs_debug & \
+		 (FSCACHE_POINT_##POINT << (FSCACHE_DEBUG_ ## LEVEL * 3)))
+#define ___do_kdebug(LEVEL, POINT) \
+	____do_kdebug(LEVEL, POINT)
+#define __do_kdebug(POINT) \
+	___do_kdebug(FSCACHE_DEBUG_LEVEL, POINT)
+
 #ifdef __KDEBUG
 #define _enter(FMT, ...) kenter(FMT, ##__VA_ARGS__)
 #define _leave(FMT, ...) kleave(FMT, ##__VA_ARGS__)
@@ -398,19 +551,19 @@ void fscache_create_volume(struct fscache_volume *volume, bool wait);
 #elif defined(CONFIG_NETFS_DEBUG)
 #define _enter(FMT, ...)			\
 do {						\
-	if (netfs_debug)			\
+	if (__do_kdebug(ENTER))			\
 		kenter(FMT, ##__VA_ARGS__);	\
 } while (0)
 
 #define _leave(FMT, ...)			\
 do {						\
-	if (netfs_debug)			\
+	if (__do_kdebug(LEAVE))			\
 		kleave(FMT, ##__VA_ARGS__);	\
 } while (0)
 
 #define _debug(FMT, ...)			\
 do {						\
-	if (netfs_debug)			\
+	if (__do_kdebug(DEBUG))			\
 		kdebug(FMT, ##__VA_ARGS__);	\
 } while (0)
 

@@ -4,6 +4,58 @@
 
 #include <linux/netdevice.h>
 
+/**
+ * struct netdev_ring_config - accepted RX ring depth configuration
+ * @rx_pending:		Size of the regular RX ring.
+ * @rx_mini_pending:	Size of the RX mini ring.
+ * @rx_jumbo_pending:	Size of the RX jumbo ring.
+ *
+ * This stores only persistent configuration values. Capability fields,
+ * such as max ring sizes, are reported by drivers but are not part of the
+ * accepted configuration.
+ *
+ * These values are only used for queue-configuration validation today.
+ * Drivers which normalize ring sizes must update the struct ethtool_ringparam
+ * passed to set_ringparam() with the applied sizes.
+ */
+struct netdev_ring_config {
+	u32	rx_pending;
+	u32	rx_mini_pending;
+	u32	rx_jumbo_pending;
+};
+
+/**
+ * struct netdev_config - queue-related configuration for a netdev
+ * @hds_thresh:		HDS Threshold value.
+ * @hds_config:		HDS value from userspace.
+ * @rings:		Accepted RX ring depths.
+ *
+ * Direct values, such as @hds_thresh and @rings, hold the accepted
+ * configuration and always override callback-provided defaults, including
+ * when zero. Drivers which use @rings for queue rendering must initialize
+ * every RX ring depth before registering the netdev.
+ */
+struct netdev_config {
+	u32	hds_thresh;
+	u8	hds_config;
+
+	struct netdev_ring_config rings;
+};
+
+/**
+ * struct netdev_queue_config - rendered configuration for an RX queue
+ * @rx_page_size:	Size of one RX page-pool allocation.
+ * @rx_ring_size:	Configured size of the regular RX ring.
+ * @rx_mini_ring_size:	Configured size of the RX mini ring.
+ * @rx_jumbo_ring_size:	Configured size of the RX jumbo ring.
+ */
+struct netdev_queue_config {
+	u32	rx_page_size;
+	u32	rx_ring_size;
+	u32	rx_mini_ring_size;
+	u32	rx_jumbo_ring_size;
+};
+
 /* See the netdev.yaml spec for definition of each statistic */
 struct netdev_queue_stats_rx {
 	u64 bytes;
@@ -13,6 +65,7 @@ struct netdev_queue_stats_rx {
 	u64 hw_drops;
 	u64 hw_drop_overruns;
 
+	u64 csum_complete;
 	u64 csum_unnecessary;
 	u64 csum_none;
 	u64 csum_bad;
@@ -74,9 +127,11 @@ struct netdev_queue_stats_tx {
  * for some of the events is not maintained, and reliable "total" cannot
  * be provided).
  *
+ * Ops are called under the instance lock if netdev_need_ops_lock()
+ * returns true, otherwise under rtnl_lock.
  * Device drivers can assume that when collecting total device stats,
  * the @get_base_stats and subsequent per-queue calls are performed
- * "atomically" (without releasing the rtnl_lock).
+ * "atomically" (without releasing the relevant lock).
  *
  * Device drivers are encouraged to reset the per-queue statistics when
  * number of queues change. This is because the primary use case for
@@ -90,6 +145,17 @@ struct netdev_stat_ops {
 	void (*get_base_stats)(struct net_device *dev,
 			       struct netdev_queue_stats_rx *rx,
 			       struct netdev_queue_stats_tx *tx);
+};
+
+void netdev_stat_queue_sum(struct net_device *netdev,
+			   int rx_start, int rx_end,
+			   struct netdev_queue_stats_rx *rx_sum,
+			   int tx_start, int tx_end,
+			   struct netdev_queue_stats_tx *tx_sum);
+
+enum {
+	/* The queue checks and honours the page size qcfg parameter */
+	QCFG_RX_PAGE_SIZE	= 0x1,
 };
 
 /**
@@ -107,21 +173,68 @@ struct netdev_stat_ops {
  *
  * @ndo_queue_stop:	Stop the RX queue at the specified index. The stopped
  *			queue's memory is written at the specified address.
+ *
+ * @ndo_queue_get_dma_dev: Get dma device for zero-copy operations to be used
+ *			   for this queue. Return NULL on error.
+ *
+ * @ndo_default_qcfg:	(Optional) Populate queue config with defaults. Queue
+ *			config structs are passed to this helper before the
+ *			user-requested settings are applied. Ring depths from
+ *			dev->cfg override these defaults. Drivers which consume
+ *			them must initialize dev->cfg->rings before registering
+ *			the netdev.
+ *
+ * @ndo_validate_qcfg: (Optional) Check if queue config is supported.
+ *			Called when configuration affecting a queue may be
+ *			changing. When NIC-wide config is changed the
+ *			callback will be invoked for the defaults and all
+ *			queue overrides. Drivers which normalize device-wide
+ *			values when applying them must use the same
+ *			normalization during validation.
+ *
+ * @ndo_queue_create:	Create a new RX queue on a virtual device that will
+ *			be paired with a physical device's queue via leasing.
+ *			Return the new queue id on success, negative error
+ *			on failure.
+ *
+ * @supported_params:	Bitmask of supported parameters, see QCFG_*.
+ *
+ * Note that @ndo_queue_mem_alloc and @ndo_queue_mem_free may be called while
+ * the interface is closed. @ndo_queue_start and @ndo_queue_stop will only
+ * be called for an interface which is open.
  */
 struct netdev_queue_mgmt_ops {
-	size_t			ndo_queue_mem_size;
-	int			(*ndo_queue_mem_alloc)(struct net_device *dev,
-						       void *per_queue_mem,
-						       int idx);
-	void			(*ndo_queue_mem_free)(struct net_device *dev,
-						      void *per_queue_mem);
-	int			(*ndo_queue_start)(struct net_device *dev,
-						   void *per_queue_mem,
-						   int idx);
-	int			(*ndo_queue_stop)(struct net_device *dev,
-						  void *per_queue_mem,
-						  int idx);
+	size_t	ndo_queue_mem_size;
+	int	(*ndo_queue_mem_alloc)(struct net_device *dev,
+				       struct netdev_queue_config *qcfg,
+				       void *per_queue_mem,
+				       int idx);
+	void	(*ndo_queue_mem_free)(struct net_device *dev,
+				      void *per_queue_mem);
+	int	(*ndo_queue_start)(struct net_device *dev,
+				   struct netdev_queue_config *qcfg,
+				   void *per_queue_mem,
+				   int idx);
+	int	(*ndo_queue_stop)(struct net_device *dev,
+				  void *per_queue_mem,
+				  int idx);
+	void	(*ndo_default_qcfg)(struct net_device *dev,
+				    struct netdev_queue_config *qcfg);
+	int	(*ndo_validate_qcfg)(struct net_device *dev,
+				     struct netdev_queue_config *qcfg,
+				     struct netlink_ext_ack *extack);
+	struct device *	(*ndo_queue_get_dma_dev)(struct net_device *dev,
+						 int idx);
+	int	(*ndo_queue_create)(struct net_device *dev,
+				    struct netlink_ext_ack *extack);
+
+	unsigned int supported_params;
 };
+
+void netdev_queue_config(struct net_device *dev, int rxq,
+			 struct netdev_queue_config *qcfg);
+
+bool netif_rxq_has_unreadable_mp(struct net_device *dev, unsigned int rxq_idx);
 
 /**
  * DOC: Lockless queue stopping / waking helpers.
@@ -265,28 +378,58 @@ netdev_txq_completed_mb(struct netdev_queue *dev_queue,
 
 #define netif_subqueue_try_stop(dev, idx, get_desc, start_thrs)		\
 	({								\
-		struct netdev_queue *txq;				\
+		struct netdev_queue *_txq;				\
 									\
-		txq = netdev_get_tx_queue(dev, idx);			\
-		netif_txq_try_stop(txq, get_desc, start_thrs);		\
+		_txq = netdev_get_tx_queue(dev, idx);			\
+		netif_txq_try_stop(_txq, get_desc, start_thrs);		\
 	})
+
+static inline void netif_subqueue_sent(const struct net_device *dev,
+				       unsigned int idx, unsigned int bytes)
+{
+	struct netdev_queue *txq;
+
+	txq = netdev_get_tx_queue(dev, idx);
+	netdev_tx_sent_queue(txq, bytes);
+}
+
+static inline unsigned int netif_xmit_timeout_ms(struct netdev_queue *txq)
+{
+	unsigned long trans_start = READ_ONCE(txq->trans_start);
+
+	if (netif_xmit_stopped(txq) &&
+	    time_after(jiffies, trans_start + txq->dev->watchdog_timeo))
+		return jiffies_to_msecs(jiffies - trans_start);
+
+	return 0;
+}
 
 #define netif_subqueue_maybe_stop(dev, idx, get_desc, stop_thrs, start_thrs) \
 	({								\
-		struct netdev_queue *txq;				\
+		struct netdev_queue *_txq;				\
 									\
-		txq = netdev_get_tx_queue(dev, idx);			\
-		netif_txq_maybe_stop(txq, get_desc, stop_thrs, start_thrs); \
+		_txq = netdev_get_tx_queue(dev, idx);			\
+		netif_txq_maybe_stop(_txq, get_desc, stop_thrs, start_thrs); \
 	})
 
 #define netif_subqueue_completed_wake(dev, idx, pkts, bytes,		\
 				      get_desc, start_thrs)		\
 	({								\
-		struct netdev_queue *txq;				\
+		struct netdev_queue *_txq;				\
 									\
-		txq = netdev_get_tx_queue(dev, idx);			\
-		netif_txq_completed_wake(txq, pkts, bytes,		\
+		_txq = netdev_get_tx_queue(dev, idx);			\
+		netif_txq_completed_wake(_txq, pkts, bytes,		\
 					 get_desc, start_thrs);		\
 	})
 
-#endif
+struct device *netdev_queue_get_dma_dev(struct net_device *dev,
+					unsigned int idx,
+					enum netdev_queue_type type);
+bool netdev_can_create_queue(const struct net_device *dev,
+			     struct netlink_ext_ack *extack);
+bool netdev_can_lease_queue(const struct net_device *dev,
+			    struct netlink_ext_ack *extack);
+bool netdev_queue_busy(struct net_device *dev, unsigned int idx,
+		       enum netdev_queue_type type,
+		       struct netlink_ext_ack *extack);
+#endif /* _LINUX_NET_QUEUES_H */

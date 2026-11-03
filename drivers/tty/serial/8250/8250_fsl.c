@@ -18,6 +18,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/err.h>
 #include <linux/serial_reg.h>
 #include <linux/serial_8250.h>
 
@@ -32,7 +33,7 @@ int fsl8250_handle_irq(struct uart_port *port)
 
 	uart_port_lock_irqsave(&up->port, &flags);
 
-	iir = port->serial_in(port, UART_IIR);
+	iir = serial_port_in(port, UART_IIR);
 	if (iir & UART_IIR_NO_INT) {
 		uart_port_unlock_irqrestore(&up->port, flags);
 		return 0;
@@ -54,12 +55,12 @@ int fsl8250_handle_irq(struct uart_port *port)
 	if (unlikely((iir & UART_IIR_ID) == UART_IIR_RLSI &&
 		     (up->lsr_saved_flags & UART_LSR_BI))) {
 		up->lsr_saved_flags &= ~UART_LSR_BI;
-		port->serial_in(port, UART_RX);
+		serial_port_in(port, UART_RX);
 		uart_port_unlock_irqrestore(&up->port, flags);
 		return 1;
 	}
 
-	lsr = orig_lsr = up->port.serial_in(&up->port, UART_LSR);
+	lsr = orig_lsr = serial_port_in(port, UART_LSR);
 
 	/* Process incoming characters first */
 	if ((lsr & (UART_LSR_DR | UART_LSR_BI)) &&
@@ -71,7 +72,7 @@ int fsl8250_handle_irq(struct uart_port *port)
 	if ((orig_lsr & UART_LSR_OE) && (up->overrun_backoff_time_ms > 0)) {
 		unsigned long delay;
 
-		up->ier = port->serial_in(port, UART_IER);
+		up->ier = serial_port_in(port, UART_IER);
 		if (up->ier & (UART_IER_RLSI | UART_IER_RDI)) {
 			port->ops->stop_rx(port);
 		} else {
@@ -99,14 +100,9 @@ int fsl8250_handle_irq(struct uart_port *port)
 EXPORT_SYMBOL_GPL(fsl8250_handle_irq);
 
 #ifdef CONFIG_ACPI
-struct fsl8250_data {
-	int	line;
-};
-
 static int fsl8250_acpi_probe(struct platform_device *pdev)
 {
-	struct fsl8250_data *data;
-	struct uart_8250_port port8250;
+	struct uart_8250_port *uport, port8250;
 	struct device *dev = &pdev->dev;
 	struct resource *regs;
 
@@ -148,23 +144,19 @@ static int fsl8250_acpi_probe(struct platform_device *pdev)
 	if (!port8250.port.membase)
 		return -ENOMEM;
 
-	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
-	if (!data)
-		return -ENOMEM;
+	uport = serial8250_register_8250_port(&port8250);
+	if (IS_ERR(uport))
+		return PTR_ERR(uport);
 
-	data->line = serial8250_register_8250_port(&port8250);
-	if (data->line < 0)
-		return data->line;
-
-	platform_set_drvdata(pdev, data);
+	platform_set_drvdata(pdev, uport);
 	return 0;
 }
 
 static void fsl8250_acpi_remove(struct platform_device *pdev)
 {
-	struct fsl8250_data *data = platform_get_drvdata(pdev);
+	struct uart_8250_port *uport = platform_get_drvdata(pdev);
 
-	serial8250_unregister_port(data->line);
+	serial8250_unregister_port(uport);
 }
 
 static const struct acpi_device_id fsl_8250_acpi_id[] = {

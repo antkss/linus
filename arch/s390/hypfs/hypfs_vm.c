@@ -11,6 +11,7 @@
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <asm/extable.h>
+#include <asm/machine.h>
 #include <asm/diag.h>
 #include <asm/ebcdic.h>
 #include <asm/timex.h>
@@ -41,9 +42,9 @@ static int diag2fc(int size, char* query, void *addr)
 
 	diag_stat_inc(DIAG_STAT_X2FC);
 	asm volatile(
-		"	diag    %0,%1,0x2fc\n"
-		"0:	nopr	%%r7\n"
-		EX_TABLE(0b,0b)
+		"0:	diag    %0,%1,0x2fc\n"
+		"1:\n"
+		EX_TABLE_INSN(0b, 1b)
 		: "=d" (residual_cnt), "+d" (rc) : "0" (&parm_list) : "memory");
 
 	if ((rc != 0 ) && (rc != -2))
@@ -121,7 +122,7 @@ static struct hypfs_dbfs_file dbfs_file_2fc = {
 
 int hypfs_vm_init(void)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return 0;
 	if (diag2fc(0, all_guests, NULL) > 0)
 		diag2fc_guest_query = all_guests;
@@ -135,7 +136,7 @@ int hypfs_vm_init(void)
 
 void hypfs_vm_exit(void)
 {
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return;
 	hypfs_dbfs_remove_file(&dbfs_file_2fc);
 }

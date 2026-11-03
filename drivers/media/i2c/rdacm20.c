@@ -16,10 +16,10 @@
  */
 
 #include <linux/delay.h>
-#include <linux/fwnode.h>
 #include <linux/init.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/videodev2.h>
 
@@ -442,7 +442,6 @@ static const struct v4l2_subdev_video_ops rdacm20_video_ops = {
 static const struct v4l2_subdev_pad_ops rdacm20_subdev_pad_ops = {
 	.enum_mbus_code = rdacm20_enum_mbus_code,
 	.get_fmt	= rdacm20_get_fmt,
-	.set_fmt	= rdacm20_get_fmt,
 };
 
 static const struct v4l2_subdev_ops rdacm20_subdev_ops = {
@@ -575,10 +574,9 @@ static int rdacm20_probe(struct i2c_client *client)
 	dev->dev = &client->dev;
 	dev->serializer.client = client;
 
-	ret = of_property_read_u32_array(client->dev.of_node, "reg",
-					 dev->addrs, 2);
+	ret = device_property_read_u32_array(dev->dev, "reg", dev->addrs, 2);
 	if (ret < 0) {
-		dev_err(dev->dev, "Invalid DT reg property: %d\n", ret);
+		dev_err(dev->dev, "Invalid FW reg property: %d\n", ret);
 		return -EINVAL;
 	}
 

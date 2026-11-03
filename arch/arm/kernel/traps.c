@@ -258,13 +258,6 @@ void show_stack(struct task_struct *tsk, unsigned long *sp, const char *loglvl)
 	barrier();
 }
 
-#ifdef CONFIG_PREEMPT
-#define S_PREEMPT " PREEMPT"
-#elif defined(CONFIG_PREEMPT_RT)
-#define S_PREEMPT " PREEMPT_RT"
-#else
-#define S_PREEMPT ""
-#endif
 #ifdef CONFIG_SMP
 #define S_SMP " SMP"
 #else
@@ -282,8 +275,8 @@ static int __die(const char *str, int err, struct pt_regs *regs)
 	static int die_counter;
 	int ret;
 
-	pr_emerg("Internal error: %s: %x [#%d]" S_PREEMPT S_SMP S_ISA "\n",
-	         str, err, ++die_counter);
+	pr_emerg("Internal error: %s: %x [#%d]" S_SMP S_ISA "\n",
+		 str, err, ++die_counter);
 
 	/* trap and error numbers are mostly meaningless on ARM */
 	ret = notify_die(DIE_OOPS, str, regs, err, tsk->thread.trap_no, SIGSEGV);
@@ -759,23 +752,6 @@ void __readwrite_bug(const char *fn)
 	BUG();
 }
 EXPORT_SYMBOL(__readwrite_bug);
-
-#ifdef CONFIG_MMU
-void __pte_error(const char *file, int line, pte_t pte)
-{
-	pr_err("%s:%d: bad pte %08llx.\n", file, line, (long long)pte_val(pte));
-}
-
-void __pmd_error(const char *file, int line, pmd_t pmd)
-{
-	pr_err("%s:%d: bad pmd %08llx.\n", file, line, (long long)pmd_val(pmd));
-}
-
-void __pgd_error(const char *file, int line, pgd_t pgd)
-{
-	pr_err("%s:%d: bad pgd %08llx.\n", file, line, (long long)pgd_val(pgd));
-}
-#endif
 
 asmlinkage void __div0(void)
 {

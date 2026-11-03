@@ -13,11 +13,13 @@
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
+#include <linux/hex.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
+#include <linux/stringify.h>
 #include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/usb/ch9.h>
@@ -76,31 +78,31 @@ static unsigned int num_ModemOption;
 module_param(altsetting, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(altsetting,
 		"Alternative setting for data interface (bulk_default: "
-		__MODULE_STRING(DEFAULT_BULK_ALTSETTING) "; isoc_default: "
-		__MODULE_STRING(DEFAULT_ISOC_ALTSETTING) ")");
+		__stringify(DEFAULT_BULK_ALTSETTING) "; isoc_default: "
+		__stringify(DEFAULT_ISOC_ALTSETTING) ")");
 
 module_param(dl_512_first, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(dl_512_first,
 		 "Read 512 bytes before sending firmware (default: "
-		 __MODULE_STRING(DEFAULT_DL_512_FIRST) ")");
+		 __stringify(DEFAULT_DL_512_FIRST) ")");
 
 module_param(enable_isoc, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(enable_isoc,
 		"Use isochronous transfers if available (default: "
-		__MODULE_STRING(DEFAULT_ENABLE_ISOC) ")");
+		__stringify(DEFAULT_ENABLE_ISOC) ")");
 
 module_param(sw_buffering, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(sw_buffering,
 		 "Enable software buffering (default: "
-		 __MODULE_STRING(DEFAULT_SW_BUFFERING) ")");
+		 __stringify(DEFAULT_SW_BUFFERING) ")");
 
 module_param(BMaxDSL, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(BMaxDSL,
-		"default: " __MODULE_STRING(DEFAULT_B_MAX_DSL));
+		"default: " __stringify(DEFAULT_B_MAX_DSL));
 
 module_param(ModemMode, byte, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(ModemMode,
-		"default: " __MODULE_STRING(DEFAULT_MODEM_MODE));
+		"default: " __stringify(DEFAULT_MODEM_MODE));
 
 module_param_array(ModemOption, byte, &num_ModemOption, S_IRUGO);
 MODULE_PARM_DESC(ModemOption, "default: 0x10,0x00,0x00,0x00,0x20");
@@ -240,7 +242,7 @@ static int speedtch_upload_firmware(struct speedtch_instance_data *instance,
 
 	usb_dbg(usbatm, "%s entered\n", __func__);
 
-	buffer = (unsigned char *)__get_free_page(GFP_KERNEL);
+	buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!buffer) {
 		ret = -ENOMEM;
 		usb_dbg(usbatm, "%s: no memory for buffer!\n", __func__);
@@ -339,7 +341,7 @@ static int speedtch_upload_firmware(struct speedtch_instance_data *instance,
 	ret = 0;
 
 out_free:
-	free_page((unsigned long)buffer);
+	kfree(buffer);
 out:
 	return ret;
 }
@@ -356,15 +358,15 @@ static int speedtch_find_firmware(struct usbatm_data *usbatm, struct usb_interfa
 	sprintf(buf, "speedtch-%d.bin.%x.%02x", phase, major_revision, minor_revision);
 	usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
 
-	if (request_firmware(fw_p, buf, dev)) {
+	if (request_firmware_direct(fw_p, buf, dev)) {
 		sprintf(buf, "speedtch-%d.bin.%x", phase, major_revision);
 		usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
 
-		if (request_firmware(fw_p, buf, dev)) {
+		if (request_firmware_direct(fw_p, buf, dev)) {
 			sprintf(buf, "speedtch-%d.bin", phase);
 			usb_dbg(usbatm, "%s: looking for %s\n", __func__, buf);
 
-			if (request_firmware(fw_p, buf, dev)) {
+			if (request_firmware_direct(fw_p, buf, dev)) {
 				usb_err(usbatm, "%s: no stage %d firmware found!\n", __func__, phase);
 				return -ENOENT;
 			}
@@ -559,8 +561,9 @@ static void speedtch_check_status(struct work_struct *work)
 
 static void speedtch_status_poll(struct timer_list *t)
 {
-	struct speedtch_instance_data *instance = from_timer(instance, t,
-						             status_check_timer);
+	struct speedtch_instance_data *instance = timer_container_of(instance,
+								     t,
+								     status_check_timer);
 
 	schedule_work(&instance->status_check_work);
 
@@ -573,8 +576,9 @@ static void speedtch_status_poll(struct timer_list *t)
 
 static void speedtch_resubmit_int(struct timer_list *t)
 {
-	struct speedtch_instance_data *instance = from_timer(instance, t,
-							     resubmit_timer);
+	struct speedtch_instance_data *instance = timer_container_of(instance,
+								     t,
+								     resubmit_timer);
 	struct urb *int_urb = instance->int_urb;
 	int ret;
 
@@ -612,7 +616,7 @@ static void speedtch_handle_int(struct urb *int_urb)
 	}
 
 	if ((count == 6) && !memcmp(up_int, instance->int_data, 6)) {
-		del_timer(&instance->status_check_timer);
+		timer_delete(&instance->status_check_timer);
 		atm_info(usbatm, "DSL line goes up\n");
 	} else if ((count == 6) && !memcmp(down_int, instance->int_data, 6)) {
 		atm_info(usbatm, "DSL line goes down\n");
@@ -688,7 +692,7 @@ static void speedtch_atm_stop(struct usbatm_data *usbatm, struct atm_dev *atm_de
 
 	atm_dbg(usbatm, "%s entered\n", __func__);
 
-	del_timer_sync(&instance->status_check_timer);
+	timer_delete_sync(&instance->status_check_timer);
 
 	/*
 	 * Since resubmit_timer and int_urb can schedule themselves and
@@ -697,14 +701,14 @@ static void speedtch_atm_stop(struct usbatm_data *usbatm, struct atm_dev *atm_de
 	instance->int_urb = NULL; /* signal shutdown */
 	mb();
 	usb_kill_urb(int_urb);
-	del_timer_sync(&instance->resubmit_timer);
+	timer_delete_sync(&instance->resubmit_timer);
 	/*
 	 * At this point, speedtch_handle_int and speedtch_resubmit_int
 	 * can run or be running, but instance->int_urb == NULL means that
 	 * they will not reschedule
 	 */
 	usb_kill_urb(int_urb);
-	del_timer_sync(&instance->resubmit_timer);
+	timer_delete_sync(&instance->resubmit_timer);
 	usb_free_urb(int_urb);
 
 	flush_work(&instance->status_check_work);
@@ -801,7 +805,7 @@ static int speedtch_bind(struct usbatm_data *usbatm,
 		}
 	}
 
-	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	instance = kzalloc_obj(*instance);
 
 	if (!instance) {
 		ret = -ENOMEM;

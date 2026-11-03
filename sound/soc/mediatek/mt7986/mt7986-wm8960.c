@@ -63,7 +63,7 @@ static struct snd_soc_dai_link mt7986_wm8960_dai_links[] = {
 		.no_pcm = 1,
 		.dai_fmt = SND_SOC_DAIFMT_I2S |
 			SND_SOC_DAIFMT_NB_NF |
-			SND_SOC_DAIFMT_CBS_CFS |
+			SND_SOC_DAIFMT_CBC_CFC |
 			SND_SOC_DAIFMT_GATED,
 		SND_SOC_DAILINK_REG(codec),
 	},
@@ -135,10 +135,8 @@ static int mt7986_wm8960_machine_probe(struct platform_device *pdev)
 	}
 
 	ret = snd_soc_of_parse_audio_routing(card, "audio-routing");
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to parse audio-routing: %d\n", ret);
+	if (ret)
 		goto err_of_node_put;
-	}
 
 	ret = devm_snd_soc_register_card(&pdev->dev, card);
 	if (ret) {

@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "../../builtin.h"
-#include "../../perf.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include "../../util/util.h" // perf_exe()
 #include "../util.h"
+#include "../../util/evlist.h"
 #include "../../util/hist.h"
 #include "../../util/debug.h"
+#include "../../util/session.h"
 #include "../../util/symbol.h"
 #include "../browser.h"
+#include "../keysyms.h"
 #include "../libslang.h"
 #include "config.h"
+#include <linux/err.h>
 #include <linux/string.h>
 #include <linux/zalloc.h>
-#include <stdlib.h>
+#include <subcmd/exec-cmd.h>
 
 #define SCRIPT_NAMELEN	128
 #define SCRIPT_MAX_NO	64
@@ -78,6 +87,76 @@ static int scripts_config(const char *var, const char *value, void *data)
 }
 
 /*
+ * Return -1 if none is found, otherwise the actual scripts number.
+ *
+ * Currently the only user of this function is the script browser, which
+ * will list all statically runnable scripts, select one, execute it and
+ * show the output in a perf browser.
+ */
+static int find_scripts(char **scripts_array __maybe_unused,
+		 char **scripts_path_array __maybe_unused, int num __maybe_unused,
+		 int pathlen __maybe_unused)
+{
+	int i = 0;
+
+#ifdef HAVE_PYTHON_MODULE_SUPPORT
+	{
+		int namelen;
+		struct dirent *script_dirent;
+		char *temp;
+		const char *exec_path = get_argv_exec_path();
+		char py_scripts_path[PATH_MAX];
+		int py_scripts_dir_fd;
+		DIR *py_scripts_dir;
+		int len;
+
+		snprintf(py_scripts_path, sizeof(py_scripts_path), "%s/python", exec_path);
+		py_scripts_dir_fd = open(py_scripts_path, O_DIRECTORY);
+		if (py_scripts_dir_fd != -1) {
+			py_scripts_dir = fdopendir(py_scripts_dir_fd);
+			if (py_scripts_dir) {
+				while ((script_dirent = readdir(py_scripts_dir)) != NULL) {
+					if (script_dirent->d_type == DT_DIR)
+						continue;
+					if (script_dirent->d_type == DT_UNKNOWN &&
+					    is_directory_at(py_scripts_dir_fd,
+						    script_dirent->d_name))
+						continue;
+					/* Skip those real time scripts: xxxtop.p[yl] */
+					if (strstr(script_dirent->d_name, "top."))
+						continue;
+					if (i >= num)
+						break;
+					len = strlen(script_dirent->d_name);
+					if (len <= 3 ||
+					    strcmp(script_dirent->d_name + len - 3, ".py"))
+						continue;
+
+					scnprintf(scripts_path_array[i], pathlen, "%s/python/%s",
+						exec_path,
+						script_dirent->d_name);
+					temp = strrchr(script_dirent->d_name, '.');
+					namelen = temp ? (int)(temp - script_dirent->d_name)
+							       : (int)strlen(script_dirent->d_name);
+
+					if (namelen >= SCRIPT_NAMELEN)
+						namelen = SCRIPT_NAMELEN - 1;
+					snprintf(scripts_array[i], namelen + 1, "%s",
+						 script_dirent->d_name);
+
+					i++;
+				}
+				closedir(py_scripts_dir);
+			} else {
+				close(py_scripts_dir_fd);
+			}
+		}
+	}
+#endif
+	return i;
+}
+
+/*
  * When success, will copy the full path of the selected script
  * into  the buffer pointed by script_name, and return 0.
  * Return -1 on failure.
@@ -90,7 +169,7 @@ static int list_scripts(char *script_name, bool *custom,
 	int ret = 0;
 	int max_std, custom_perf;
 	char pbuf[256];
-	const char *perf = perf_exe(pbuf, sizeof pbuf);
+	const char *perf = perf_exe(pbuf, sizeof(pbuf));
 	struct script_config scriptc = {
 		.names = (const char **)names,
 		.paths = paths,
@@ -180,7 +259,7 @@ int script_browse(const char *script_opt, struct evsel *evsel)
 		return -1;
 
 	if (asprintf(&cmd, "%s%s %s %s%s 2>&1 | less",
-			custom ? "perf script -s " : "",
+			custom ? "perf script " : "",
 			script_name,
 			script_opt ? script_opt : "",
 			input_name ? "-i " : "",

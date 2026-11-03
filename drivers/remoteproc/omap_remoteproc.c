@@ -37,6 +37,10 @@
 
 #include <linux/platform_data/dmtimer-omap.h>
 
+#ifdef CONFIG_ARM_DMA_USE_IOMMU
+#include <asm/dma-iommu.h>
+#endif
+
 #include "omap_remoteproc.h"
 #include "remoteproc_internal.h"
 
@@ -495,7 +499,7 @@ static void omap_rproc_mbox_callback(struct mbox_client *client, void *data)
 						client);
 	struct device *dev = oproc->rproc->dev.parent;
 	const char *name = oproc->rproc->name;
-	u32 msg = (u32)data;
+	mbox_msg_t msg = omap_mbox_from_message(data);
 
 	dev_dbg(dev, "mbox msg: 0x%x\n", msg);
 
@@ -546,12 +550,11 @@ static void omap_rproc_kick(struct rproc *rproc, int vqid)
 	}
 
 	/* send the index of the triggered virtqueue in the mailbox payload */
-	ret = mbox_send_message(oproc->mbox, (void *)vqid);
+	ret = mbox_send_message(oproc->mbox, omap_mbox_to_message(vqid));
 	if (ret < 0)
 		dev_err(dev, "failed to send mailbox message, status = %d\n",
 			ret);
 
-	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 }
 
@@ -625,7 +628,7 @@ static int omap_rproc_start(struct rproc *rproc)
 	 * Note that the reply will _not_ arrive immediately: this message
 	 * will wait in the mailbox fifo until the remote processor is booted.
 	 */
-	ret = mbox_send_message(oproc->mbox, (void *)RP_MBOX_ECHO_REQUEST);
+	ret = mbox_send_message(oproc->mbox, omap_mbox_to_message(RP_MBOX_ECHO_REQUEST));
 	if (ret < 0) {
 		dev_err(dev, "mbox_send_message failed: %d\n", ret);
 		goto put_mbox;
@@ -652,7 +655,6 @@ static int omap_rproc_start(struct rproc *rproc)
 	pm_runtime_use_autosuspend(dev);
 	pm_runtime_get_noresume(dev);
 	pm_runtime_enable(dev);
-	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 
 	return 0;
@@ -710,7 +712,6 @@ enable_device:
 	reset_control_deassert(oproc->reset);
 out:
 	/* schedule the next auto-suspend */
-	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 	return ret;
 }
@@ -720,6 +721,7 @@ out:
  * @rproc: remote processor to apply the address translation for
  * @da: device address to translate
  * @len: length of the memory buffer
+ * @is_iomem: pointer filled in to indicate if @da is iomapped memory
  *
  * Custom function implementing the rproc .da_to_va ops to provide address
  * translation (device address to kernel virtual address) for internal RAMs
@@ -775,13 +777,13 @@ static int _omap_rproc_suspend(struct rproc *rproc, bool auto_suspend)
 	struct omap_rproc *oproc = rproc->priv;
 	unsigned long to = msecs_to_jiffies(DEF_SUSPEND_TIMEOUT);
 	unsigned long ta = jiffies + to;
-	u32 suspend_msg = auto_suspend ?
+	mbox_msg_t suspend_msg = auto_suspend ?
 				RP_MBOX_SUSPEND_AUTO : RP_MBOX_SUSPEND_SYSTEM;
 	int ret;
 
 	reinit_completion(&oproc->pm_comp);
 	oproc->suspend_acked = false;
-	ret = mbox_send_message(oproc->mbox, (void *)suspend_msg);
+	ret = mbox_send_message(oproc->mbox, omap_mbox_to_message(suspend_msg));
 	if (ret < 0) {
 		dev_err(dev, "PM mbox_send_message failed: %d\n", ret);
 		return ret;
@@ -1133,13 +1135,12 @@ static int omap_rproc_get_boot_data(struct platform_device *pdev,
 	struct device_node *np = pdev->dev.of_node;
 	struct omap_rproc *oproc = rproc->priv;
 	const struct omap_rproc_dev_data *data;
-	int ret;
 
 	data = of_device_get_match_data(&pdev->dev);
 	if (!data)
 		return -ENODEV;
 
-	if (!of_property_read_bool(np, "ti,bootreg"))
+	if (!of_property_present(np, "ti,bootreg"))
 		return 0;
 
 	oproc->boot_data = devm_kzalloc(&pdev->dev, sizeof(*oproc->boot_data),
@@ -1149,10 +1150,8 @@ static int omap_rproc_get_boot_data(struct platform_device *pdev,
 
 	oproc->boot_data->syscon =
 			syscon_regmap_lookup_by_phandle(np, "ti,bootreg");
-	if (IS_ERR(oproc->boot_data->syscon)) {
-		ret = PTR_ERR(oproc->boot_data->syscon);
-		return ret;
-	}
+	if (IS_ERR(oproc->boot_data->syscon))
+		return PTR_ERR(oproc->boot_data->syscon);
 
 	if (of_property_read_u32_index(np, "ti,bootreg", 1,
 				       &oproc->boot_data->boot_reg)) {
@@ -1209,7 +1208,7 @@ static int omap_rproc_of_get_internal_memories(struct platform_device *pdev,
 		oproc->mem[i].dev_addr = data->mems[i].dev_addr;
 		oproc->mem[i].size = resource_size(res);
 
-		dev_dbg(dev, "memory %8s: bus addr %pa size 0x%x va %pK da 0x%x\n",
+		dev_dbg(dev, "memory %8s: bus addr %pa size 0x%zx va %p da 0x%x\n",
 			data->mems[i].name, &oproc->mem[i].bus_addr,
 			oproc->mem[i].size, oproc->mem[i].cpu_addr,
 			oproc->mem[i].dev_addr);
@@ -1322,6 +1321,19 @@ static int omap_rproc_probe(struct platform_device *pdev)
 	oproc->reset = reset;
 	/* All existing OMAP IPU and DSP processors have an MMU */
 	rproc->has_iommu = true;
+
+#ifdef CONFIG_ARM_DMA_USE_IOMMU
+	/*
+	 * Throw away the ARM DMA mapping that we'll never use, so it doesn't
+	 * interfere with the core rproc->domain and we get the right DMA ops.
+	 */
+	if (pdev->dev.archdata.mapping) {
+		struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(&pdev->dev);
+
+		arm_iommu_detach_device(&pdev->dev);
+		arm_iommu_release_mapping(mapping);
+	}
+#endif
 
 	ret = omap_rproc_of_get_internal_memories(pdev, rproc);
 	if (ret)

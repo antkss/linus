@@ -6,7 +6,6 @@
  */
 
 #include <crypto/algapi.h>
-#include <crypto/internal/simd.h>
 #include <linux/crypto.h>
 #include <linux/err.h>
 #include <linux/module.h>
@@ -69,10 +68,9 @@ static int cbc_decrypt(struct skcipher_request *req)
 
 static struct skcipher_alg camellia_algs[] = {
 	{
-		.base.cra_name		= "__ecb(camellia)",
-		.base.cra_driver_name	= "__ecb-camellia-aesni-avx2",
+		.base.cra_name		= "ecb(camellia)",
+		.base.cra_driver_name	= "ecb-camellia-aesni-avx2",
 		.base.cra_priority	= 500,
-		.base.cra_flags		= CRYPTO_ALG_INTERNAL,
 		.base.cra_blocksize	= CAMELLIA_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct camellia_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -82,10 +80,9 @@ static struct skcipher_alg camellia_algs[] = {
 		.encrypt		= ecb_encrypt,
 		.decrypt		= ecb_decrypt,
 	}, {
-		.base.cra_name		= "__cbc(camellia)",
-		.base.cra_driver_name	= "__cbc-camellia-aesni-avx2",
+		.base.cra_name		= "cbc(camellia)",
+		.base.cra_driver_name	= "cbc-camellia-aesni-avx2",
 		.base.cra_priority	= 500,
-		.base.cra_flags		= CRYPTO_ALG_INTERNAL,
 		.base.cra_blocksize	= CAMELLIA_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct camellia_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -98,35 +95,22 @@ static struct skcipher_alg camellia_algs[] = {
 	},
 };
 
-static struct simd_skcipher_alg *camellia_simd_algs[ARRAY_SIZE(camellia_algs)];
-
 static int __init camellia_aesni_init(void)
 {
-	const char *feature_name;
-
 	if (!boot_cpu_has(X86_FEATURE_AVX) ||
 	    !boot_cpu_has(X86_FEATURE_AVX2) ||
-	    !boot_cpu_has(X86_FEATURE_AES) ||
-	    !boot_cpu_has(X86_FEATURE_OSXSAVE)) {
+	    !boot_cpu_has(X86_FEATURE_AES)) {
 		pr_info("AVX2 or AES-NI instructions are not detected.\n");
 		return -ENODEV;
 	}
 
-	if (!cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM,
-				&feature_name)) {
-		pr_info("CPU feature '%s' is not supported.\n", feature_name);
-		return -ENODEV;
-	}
-
-	return simd_register_skciphers_compat(camellia_algs,
-					      ARRAY_SIZE(camellia_algs),
-					      camellia_simd_algs);
+	return crypto_register_skciphers(camellia_algs,
+					 ARRAY_SIZE(camellia_algs));
 }
 
 static void __exit camellia_aesni_fini(void)
 {
-	simd_unregister_skciphers(camellia_algs, ARRAY_SIZE(camellia_algs),
-				  camellia_simd_algs);
+	crypto_unregister_skciphers(camellia_algs, ARRAY_SIZE(camellia_algs));
 }
 
 module_init(camellia_aesni_init);

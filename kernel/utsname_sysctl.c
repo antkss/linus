@@ -13,7 +13,7 @@
 #include <linux/wait.h>
 #include <linux/rwsem.h>
 
-#ifdef CONFIG_PROC_SYSCTL
+#ifdef CONFIG_SYSCTL
 
 static void *get_uts(const struct ctl_table *table)
 {
@@ -75,7 +75,7 @@ static DEFINE_CTL_TABLE_POLL(hostname_poll);
 static DEFINE_CTL_TABLE_POLL(domainname_poll);
 
 // Note: update 'enum uts_proc' to match any changes to this table
-static struct ctl_table uts_kern_table[] = {
+static const struct ctl_table uts_kern_table[] = {
 	{
 		.procname	= "arch",
 		.data		= init_uts_ns.name.machine,
@@ -122,14 +122,14 @@ static struct ctl_table uts_kern_table[] = {
 	},
 };
 
-#ifdef CONFIG_PROC_SYSCTL
+#ifdef CONFIG_SYSCTL
 /*
  * Notify userspace about a change in a certain entry of uts_kern_table,
  * identified by the parameter proc.
  */
 void uts_proc_notify(enum uts_proc proc)
 {
-	struct ctl_table *table = &uts_kern_table[proc];
+	const struct ctl_table *table = &uts_kern_table[proc];
 
 	proc_sys_poll_notify(table->poll);
 }

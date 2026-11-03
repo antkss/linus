@@ -2,7 +2,7 @@
 /******************************************************************************
  *
  * Copyright(c) 2008 - 2014 Intel Corporation. All rights reserved.
- * Copyright (C) 2018 Intel Corporation
+ * Copyright (C) 2018, 2025-2026 Intel Corporation
  *****************************************************************************/
 
 #include <linux/slab.h>
@@ -14,7 +14,6 @@
 
 #include "iwl-debug.h"
 #include "iwl-trans.h"
-#include "iwl-io.h"
 #include "dev.h"
 #include "agn.h"
 
@@ -1788,7 +1787,7 @@ static ssize_t iwl_dbgfs_power_save_status_read(struct file *file,
 	const size_t bufsz = sizeof(buf);
 	u32 pwrsave_status;
 
-	pwrsave_status = iwl_read32(priv->trans, CSR_GP_CNTRL) &
+	pwrsave_status = iwl_trans_read32(priv->trans, CSR_GP_CNTRL) &
 			CSR_GP_REG_POWER_SAVE_STATUS_MSK;
 
 	pos += scnprintf(buf + pos, bufsz - pos, "Power Save Status: ");
@@ -1870,7 +1869,7 @@ static ssize_t iwl_dbgfs_ucode_tracing_write(struct file *file,
 		}
 	} else {
 		priv->event_log.ucode_trace = false;
-		del_timer_sync(&priv->ucode_trace);
+		timer_delete_sync(&priv->ucode_trace);
 	}
 
 	return count;
@@ -2097,7 +2096,8 @@ static ssize_t iwl_dbgfs_protection_mode_read(struct file *file,
 	char buf[40];
 	const size_t bufsz = sizeof(buf);
 
-	if (priv->cfg->ht_params)
+	/* HT devices also have at least one HT40 band */
+	if (priv->cfg->ht_params.ht40_bands)
 		pos += scnprintf(buf + pos, bufsz - pos,
 			 "use %s for aggregation\n",
 			 (priv->hw_params.use_rts_for_aggregation) ?
@@ -2117,7 +2117,8 @@ static ssize_t iwl_dbgfs_protection_mode_write(struct file *file,
 	int buf_size;
 	int rts;
 
-	if (!priv->cfg->ht_params)
+	/* HT devices also have at least one HT40 band */
+	if (!priv->cfg->ht_params.ht40_bands)
 		return -EINVAL;
 
 	memset(buf, 0, sizeof(buf));

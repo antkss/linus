@@ -13,6 +13,7 @@
 #include <linux/kernel.h>
 #include <linux/kexec.h>
 #include <linux/module.h>
+#include <linux/export.h>
 #include <linux/extable.h>
 #include <linux/mm.h>
 #include <linux/sched/mm.h>
@@ -106,6 +107,12 @@ static void show_stacktrace(struct task_struct *task,
 	unsigned long stackdata;
 	unsigned long *sp = (unsigned long *)regs->regs[3];
 
+	if (!task)
+		task = current;
+
+	if (!try_get_task_stack(task))
+		return;
+
 	printk("%sStack :", loglvl);
 	i = 0;
 	while ((unsigned long) sp & (PAGE_SIZE - 1)) {
@@ -128,6 +135,8 @@ static void show_stacktrace(struct task_struct *task,
 	}
 	pr_cont("\n");
 	show_backtrace(task, regs, loglvl, user);
+
+	put_task_stack(task);
 }
 
 void show_stack(struct task_struct *task, unsigned long *sp, const char *loglvl)
@@ -534,10 +543,15 @@ out:
 asmlinkage void noinstr do_ade(struct pt_regs *regs)
 {
 	irqentry_state_t state = irqentry_enter(regs);
+	unsigned int esubcode = FIELD_GET(CSR_ESTAT_ESUBCODE, regs->csr_estat);
+
+	if ((esubcode == EXSUBCODE_ADEM) && fixup_exception(regs))
+		goto out;
 
 	die_if_kernel("Kernel ade access", regs);
 	force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *)regs->csr_badvaddr);
 
+out:
 	irqentry_exit(regs, state);
 }
 
@@ -553,9 +567,10 @@ asmlinkage void noinstr do_ale(struct pt_regs *regs)
 	die_if_kernel("Kernel ale access", regs);
 	force_sig_fault(SIGBUS, BUS_ADRALN, (void __user *)regs->csr_badvaddr);
 #else
+	bool pie = regs_irqs_disabled(regs);
 	unsigned int *pc;
 
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_enable();
 
 	perf_sw_event(PERF_COUNT_SW_ALIGNMENT_FAULTS, 1, regs, regs->csr_badvaddr);
@@ -582,7 +597,7 @@ sigbus:
 	die_if_kernel("Kernel ale access", regs);
 	force_sig_fault(SIGBUS, BUS_ADRALN, (void __user *)regs->csr_badvaddr);
 out:
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_disable();
 #endif
 	irqentry_exit(regs, state);
@@ -597,29 +612,37 @@ int is_valid_bugaddr(unsigned long addr)
 
 static void bug_handler(struct pt_regs *regs)
 {
+	if (user_mode(regs)) {
+		force_sig(SIGTRAP);
+		return;
+	}
+
 	switch (report_bug(regs->csr_era, regs)) {
 	case BUG_TRAP_TYPE_BUG:
-	case BUG_TRAP_TYPE_NONE:
-		die_if_kernel("Oops - BUG", regs);
-		force_sig(SIGTRAP);
+		die("Oops - BUG", regs);
 		break;
 
 	case BUG_TRAP_TYPE_WARN:
 		/* Skip the BUG instruction and continue */
 		regs->csr_era += LOONGARCH_INSN_SIZE;
 		break;
+
+	default:
+		if (!fixup_exception(regs))
+			die("Oops - BUG", regs);
 	}
 }
 
 asmlinkage void noinstr do_bce(struct pt_regs *regs)
 {
 	bool user = user_mode(regs);
+	bool pie = regs_irqs_disabled(regs);
 	unsigned long era = exception_era(regs);
-	u64 badv = 0, lower = 0, upper = ULONG_MAX;
+	unsigned long badv = 0, lower = 0, upper = ULONG_MAX;
 	union loongarch_instruction insn;
 	irqentry_state_t state = irqentry_enter(regs);
 
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_enable();
 
 	current->thread.trap_nr = read_csr_excode();
@@ -685,7 +708,7 @@ asmlinkage void noinstr do_bce(struct pt_regs *regs)
 	force_sig_bnderr((void __user *)badv, (void __user *)lower, (void __user *)upper);
 
 out:
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_disable();
 
 	irqentry_exit(regs, state);
@@ -703,11 +726,12 @@ bad_era:
 asmlinkage void noinstr do_bp(struct pt_regs *regs)
 {
 	bool user = user_mode(regs);
+	bool pie = regs_irqs_disabled(regs);
 	unsigned int opcode, bcode;
 	unsigned long era = exception_era(regs);
 	irqentry_state_t state = irqentry_enter(regs);
 
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_enable();
 
 	if (__get_inst(&opcode, (u32 *)era, user))
@@ -773,7 +797,7 @@ asmlinkage void noinstr do_bp(struct pt_regs *regs)
 	}
 
 out:
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_disable();
 
 	irqentry_exit(regs, state);
@@ -791,6 +815,8 @@ asmlinkage void noinstr do_watch(struct pt_regs *regs)
 #ifndef CONFIG_HAVE_HW_BREAKPOINT
 	pr_warn("Hardware watch point handler not implemented!\n");
 #else
+	bool need_sigtrap = !!current->ptrace;
+
 	if (kgdb_breakpoint_handler(regs))
 		goto out;
 
@@ -805,7 +831,7 @@ asmlinkage void noinstr do_watch(struct pt_regs *regs)
 			 * instruction. So don't clear llbit and reset CSR.FWPS.Skip until
 			 * the llsc execution is completed.
 			 */
-			csr_write32(CSR_FWPC_SKIP, LOONGARCH_CSR_FWPS);
+			csr_write32(CSR_FWPS_SKIP, LOONGARCH_CSR_FWPS);
 			csr_write32(CSR_LLBCTL_KLO, LOONGARCH_CSR_LLBCTL);
 			goto out;
 		}
@@ -822,16 +848,17 @@ asmlinkage void noinstr do_watch(struct pt_regs *regs)
 				 * current pc, If yes, then we should not set the CSR.FWPS.SKIP
 				 * bit to break the original instruction stream.
 				 */
-				csr_write32(CSR_FWPC_SKIP, LOONGARCH_CSR_FWPS);
+				csr_write32(CSR_FWPS_SKIP, LOONGARCH_CSR_FWPS);
 				goto out;
 			}
 		}
 	} else {
-		breakpoint_handler(regs);
-		watchpoint_handler(regs);
+		need_sigtrap |= breakpoint_handler(regs);
+		need_sigtrap |= watchpoint_handler(regs);
 	}
 
-	force_sig(SIGTRAP);
+	if (need_sigtrap)
+		force_sig(SIGTRAP);
 out:
 #endif
 	irqentry_exit(regs, state);
@@ -1008,6 +1035,7 @@ static void init_restore_lbt(void)
 
 asmlinkage void noinstr do_lbt(struct pt_regs *regs)
 {
+	bool pie = regs_irqs_disabled(regs);
 	irqentry_state_t state = irqentry_enter(regs);
 
 	/*
@@ -1017,7 +1045,7 @@ asmlinkage void noinstr do_lbt(struct pt_regs *regs)
 	 * (including the user using 'MOVGR2GCSR' to turn on TM, which
 	 * will not trigger the BTE), we need to check PRMD first.
 	 */
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_enable();
 
 	if (!cpu_has_lbt) {
@@ -1031,7 +1059,7 @@ asmlinkage void noinstr do_lbt(struct pt_regs *regs)
 	preempt_enable();
 
 out:
-	if (regs->csr_prmd & CSR_PRMD_PIE)
+	if (!pie)
 		local_irq_disable();
 
 	irqentry_exit(regs, state);
@@ -1058,10 +1086,13 @@ asmlinkage void noinstr do_reserved(struct pt_regs *regs)
 
 asmlinkage void cache_parity_error(void)
 {
+	u32 merrctl = csr_read32(LOONGARCH_CSR_MERRCTL);
+	unsigned long merrera = csr_read(LOONGARCH_CSR_MERRERA);
+
 	/* For the moment, report the problem and hang. */
 	pr_err("Cache error exception:\n");
-	pr_err("csr_merrctl == %08x\n", csr_read32(LOONGARCH_CSR_MERRCTL));
-	pr_err("csr_merrera == %016lx\n", csr_read64(LOONGARCH_CSR_MERRERA));
+	pr_err("csr_merrctl == %08x\n", merrctl);
+	pr_err("csr_merrera == %016lx\n", merrera);
 	panic("Can't handle the cache error!");
 }
 
@@ -1118,9 +1149,9 @@ static void configure_exception_vector(void)
 	eentry    = (unsigned long)exception_handlers;
 	tlbrentry = (unsigned long)exception_handlers + 80*VECSIZE;
 
-	csr_write64(eentry, LOONGARCH_CSR_EENTRY);
-	csr_write64(eentry, LOONGARCH_CSR_MERRENTRY);
-	csr_write64(tlbrentry, LOONGARCH_CSR_TLBRENTRY);
+	csr_write(eentry, LOONGARCH_CSR_EENTRY);
+	csr_write(__pa(eentry), LOONGARCH_CSR_MERRENTRY);
+	csr_write(__pa(tlbrentry), LOONGARCH_CSR_TLBRENTRY);
 }
 
 void per_cpu_trap_init(int cpu)

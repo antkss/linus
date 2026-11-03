@@ -5,6 +5,7 @@ comment "Linux Kernel Configuration for Hexagon"
 config HEXAGON
 	def_bool y
 	select ARCH_32BIT_OFF_T
+	select ARCH_HAS_DELAY_TIMER
 	select ARCH_HAS_SYNC_DMA_FOR_DEVICE
 	select ARCH_NO_PREEMPT
 	select ARCH_WANT_FRAME_POINTERS
@@ -20,7 +21,6 @@ config HEXAGON
 	# select ARCH_HAS_CPU_IDLE_WAIT
 	# select GPIOLIB
 	# select HAVE_CLK
-	# select GENERIC_PENDING_IRQ if SMP
 	select GENERIC_ATOMIC64
 	select HAVE_PERF_EVENTS
 	# GENERIC_ALLOCATOR is used by dma_alloc_coherent()

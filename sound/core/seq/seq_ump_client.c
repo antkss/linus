@@ -38,6 +38,10 @@ struct seq_ump_client {
 	int seq_client;			/* sequencer client id */
 	int opened[2];			/* current opens for each direction */
 	struct snd_rawmidi_file out_rfile; /* rawmidi for output */
+	/* RCU-protected shadow of out_rfile.output for the delivery hot path;
+	 * out_rfile itself is only touched by open/close under open_mutex
+	 */
+	struct snd_rawmidi_substream __rcu *out_substream;
 	struct seq_ump_input_buffer input; /* input parser context */
 	void *ump_info[SNDRV_UMP_MAX_BLOCKS + 1]; /* shadow of seq client ump_info */
 	struct work_struct group_notify_work; /* FB change notification */
@@ -88,7 +92,8 @@ static int seq_ump_process_event(struct snd_seq_event *ev, int direct,
 	unsigned char type;
 	int len;
 
-	substream = client->out_rfile.output;
+	guard(rcu)();
+	substream = rcu_dereference(client->out_substream);
 	if (!substream)
 		return -ENODEV;
 	if (!snd_seq_ev_is_ump(ev))
@@ -110,12 +115,18 @@ static int seq_ump_client_open(struct seq_ump_client *client, int dir)
 
 	guard(mutex)(&ump->open_mutex);
 	if (dir == STR_OUT && !client->opened[dir]) {
+		/* out_rfile is only accessed under open_mutex; the delivery
+		 * path reads out_substream via RCU, so open into out_rfile
+		 * directly and publish the substream afterwards
+		 */
 		err = snd_rawmidi_kernel_open(&ump->core, 0,
 					      SNDRV_RAWMIDI_LFLG_OUTPUT |
 					      SNDRV_RAWMIDI_LFLG_APPEND,
 					      &client->out_rfile);
 		if (err < 0)
 			return err;
+		rcu_assign_pointer(client->out_substream,
+				   client->out_rfile.output);
 	}
 	client->opened[dir]++;
 	return 0;
@@ -127,9 +138,18 @@ static int seq_ump_client_close(struct seq_ump_client *client, int dir)
 	struct snd_ump_endpoint *ump = client->ump;
 
 	guard(mutex)(&ump->open_mutex);
-	if (!--client->opened[dir])
-		if (dir == STR_OUT)
+	if (!--client->opened[dir]) {
+		if (dir == STR_OUT && client->out_rfile.rmidi) {
+			rcu_assign_pointer(client->out_substream, NULL);
+			/* wait for a grace period so that no reader in the
+			 * delivery path is still writing to the substream
+			 * before it is released
+			 */
+			synchronize_rcu();
 			snd_rawmidi_kernel_release(&client->out_rfile);
+			client->out_rfile = (struct snd_rawmidi_file){};
+		}
+	}
 	return 0;
 }
 
@@ -214,13 +234,13 @@ static bool skip_group(struct seq_ump_client *client, struct snd_ump_group *grou
 static int seq_ump_group_init(struct seq_ump_client *client, int group_index)
 {
 	struct snd_ump_group *group = &client->ump->groups[group_index];
-	struct snd_seq_port_info *port __free(kfree) = NULL;
 	struct snd_seq_port_callback pcallbacks;
 
 	if (skip_group(client, group))
 		return 0;
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	struct snd_seq_port_info *port __free(kfree) =
+		kzalloc_obj(*port);
 	if (!port)
 		return -ENOMEM;
 
@@ -243,12 +263,12 @@ static int seq_ump_group_init(struct seq_ump_client *client, int group_index)
 /* update the sequencer ports; called from notify_fb_change callback */
 static void update_port_infos(struct seq_ump_client *client)
 {
-	struct snd_seq_port_info *old __free(kfree) = NULL;
-	struct snd_seq_port_info *new __free(kfree) = NULL;
 	int i, err;
 
-	old = kzalloc(sizeof(*old), GFP_KERNEL);
-	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	struct snd_seq_port_info *old __free(kfree) =
+		kzalloc_obj(*old);
+	struct snd_seq_port_info *new __free(kfree) =
+		kzalloc_obj(*new);
 	if (!old || !new)
 		return;
 
@@ -272,20 +292,18 @@ static void update_port_infos(struct seq_ump_client *client)
 						new);
 		if (err < 0)
 			continue;
-		/* notify to system port */
-		snd_seq_system_client_ev_port_change(client->seq_client, i);
 	}
 }
 
 /* create a UMP Endpoint port */
 static int create_ump_endpoint_port(struct seq_ump_client *client)
 {
-	struct snd_seq_port_info *port __free(kfree) = NULL;
 	struct snd_seq_port_callback pcallbacks;
 	unsigned int rawmidi_info = client->ump->core.info_flags;
 	int err;
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	struct snd_seq_port_info *port __free(kfree) =
+		kzalloc_obj(*port);
 	if (!port)
 		return -ENOMEM;
 
@@ -312,7 +330,7 @@ static int create_ump_endpoint_port(struct seq_ump_client *client)
 		SNDRV_SEQ_PORT_TYPE_HARDWARE |
 		SNDRV_SEQ_PORT_TYPE_PORT;
 	port->midi_channels = 16;
-	strcpy(port->name, "MIDI 2.0");
+	strscpy(port->name, "MIDI 2.0");
 	memset(&pcallbacks, 0, sizeof(pcallbacks));
 	pcallbacks.owner = THIS_MODULE;
 	pcallbacks.private_data = client;
@@ -335,12 +353,12 @@ static int create_ump_endpoint_port(struct seq_ump_client *client)
 /* release the client resources */
 static void seq_ump_client_free(struct seq_ump_client *client)
 {
+	snd_ump_detach_seq(client->ump);
 	cancel_work_sync(&client->group_notify_work);
 
 	if (client->seq_client >= 0)
 		snd_seq_delete_kernel_client(client->seq_client);
 
-	client->ump->seq_ops = NULL;
 	client->ump->seq_client = NULL;
 
 	kfree(client);
@@ -371,7 +389,7 @@ static void setup_client_group_filter(struct seq_ump_client *client)
 	cptr = snd_seq_kernel_client_get(client->seq_client);
 	if (!cptr)
 		return;
-	filter = ~(1U << 0); /* always allow groupless messages */
+	filter = SND_SEQ_GROUP_FILTER_GROUPS; /* always allow groupless messages */
 	for (p = 0; p < SNDRV_UMP_MAX_GROUPS; p++) {
 		if (client->ump->groups[p].active)
 			filter &= ~(1U << (p + 1));
@@ -390,6 +408,33 @@ static void handle_group_notify(struct work_struct *work)
 	setup_client_group_filter(client);
 }
 
+/* UMP EP change notification */
+static int seq_ump_notify_ep_change(struct snd_ump_endpoint *ump)
+{
+	struct seq_ump_client *client = ump->seq_client;
+	struct snd_seq_client *cptr;
+	int client_id;
+
+	if (!client)
+		return -ENODEV;
+	client_id = client->seq_client;
+	cptr = snd_seq_kernel_client_get(client_id);
+	if (!cptr)
+		return -ENODEV;
+
+	snd_seq_system_ump_notify(client_id, 0, SNDRV_SEQ_EVENT_UMP_EP_CHANGE,
+				  true);
+
+	/* update sequencer client name if needed */
+	if (*ump->core.name && strcmp(ump->core.name, cptr->name)) {
+		strscpy(cptr->name, ump->core.name, sizeof(cptr->name));
+		snd_seq_system_client_ev_client_change(client_id);
+	}
+
+	snd_seq_kernel_client_put(cptr);
+	return 0;
+}
+
 /* UMP FB change notification */
 static int seq_ump_notify_fb_change(struct snd_ump_endpoint *ump,
 				    struct snd_ump_block *fb)
@@ -399,28 +444,36 @@ static int seq_ump_notify_fb_change(struct snd_ump_endpoint *ump,
 	if (!client)
 		return -ENODEV;
 	schedule_work(&client->group_notify_work);
+	snd_seq_system_ump_notify(client->seq_client, fb->info.block_id,
+				  SNDRV_SEQ_EVENT_UMP_BLOCK_CHANGE,
+				  true);
 	return 0;
 }
 
 /* UMP protocol change notification; just update the midi_version field */
 static int seq_ump_switch_protocol(struct snd_ump_endpoint *ump)
 {
-	if (!ump->seq_client)
+	struct seq_ump_client *client = ump->seq_client;
+
+	if (!client)
 		return -ENODEV;
-	setup_client_midi_version(ump->seq_client);
+	setup_client_midi_version(client);
+	snd_seq_system_ump_notify(client->seq_client, 0,
+				  SNDRV_SEQ_EVENT_UMP_EP_CHANGE,
+				  true);
 	return 0;
 }
 
 static const struct snd_seq_ump_ops seq_ump_ops = {
 	.input_receive = seq_ump_input_receive,
+	.notify_ep_change = seq_ump_notify_ep_change,
 	.notify_fb_change = seq_ump_notify_fb_change,
 	.switch_protocol = seq_ump_switch_protocol,
 };
 
 /* create a sequencer client and ports for the given UMP endpoint */
-static int snd_seq_ump_probe(struct device *_dev)
+static int snd_seq_ump_probe(struct snd_seq_device *dev)
 {
-	struct snd_seq_device *dev = to_seq_dev(_dev);
 	struct snd_ump_endpoint *ump = dev->private_data;
 	struct snd_card *card = dev->card;
 	struct seq_ump_client *client;
@@ -428,7 +481,7 @@ static int snd_seq_ump_probe(struct device *_dev)
 	struct snd_seq_client *cptr;
 	int p, err;
 
-	client = kzalloc(sizeof(*client), GFP_KERNEL);
+	client = kzalloc_obj(*client);
 	if (!client)
 		return -ENOMEM;
 
@@ -470,7 +523,8 @@ static int snd_seq_ump_probe(struct device *_dev)
 	snd_seq_kernel_client_put(cptr);
 
 	ump->seq_client = client;
-	ump->seq_ops = &seq_ump_ops;
+	/* Publish the initialized client before callbacks can observe seq_ops. */
+	smp_store_release(&ump->seq_ops, &seq_ump_ops);
 	return 0;
 
  error:
@@ -479,21 +533,19 @@ static int snd_seq_ump_probe(struct device *_dev)
 }
 
 /* remove a sequencer client */
-static int snd_seq_ump_remove(struct device *_dev)
+static void snd_seq_ump_remove(struct snd_seq_device *dev)
 {
-	struct snd_seq_device *dev = to_seq_dev(_dev);
 	struct snd_ump_endpoint *ump = dev->private_data;
 
 	if (ump->seq_client)
 		seq_ump_client_free(ump->seq_client);
-	return 0;
 }
 
 static struct snd_seq_driver seq_ump_driver = {
+	.probe = snd_seq_ump_probe,
+	.remove = snd_seq_ump_remove,
 	.driver = {
 		.name = KBUILD_MODNAME,
-		.probe = snd_seq_ump_probe,
-		.remove = snd_seq_ump_remove,
 	},
 	.id = SNDRV_SEQ_DEV_ID_UMP,
 	.argsize = 0,

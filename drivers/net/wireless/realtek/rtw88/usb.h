@@ -38,6 +38,7 @@
 #define RTW_USB_RXAGG_TIMEOUT		10
 
 #define RTW_USB_RXCB_NUM		4
+#define RTW_USB_RX_SKB_NUM		8
 
 #define RTW_USB_EP_MAX			4
 
@@ -74,6 +75,11 @@ struct rtw_usb {
 	u8 out_ep[RTW_USB_EP_MAX];
 	int qsel_to_ep[TX_DESC_QSEL_MAX];
 
+	/* protects hiq_budget and hiq_refill */
+	spinlock_t hiq_lock;
+	u32 hiq_budget;
+	unsigned long hiq_refill;
+
 	struct workqueue_struct *txwq, *rxwq;
 
 	struct sk_buff_head tx_queue[RTW_USB_EP_MAX];
@@ -81,7 +87,9 @@ struct rtw_usb {
 
 	struct rx_usb_ctrl_block rx_cb[RTW_USB_RXCB_NUM];
 	struct sk_buff_head rx_queue;
+	struct sk_buff_head rx_free_queue;
 	struct work_struct rx_work;
+	struct work_struct rx_urb_work;
 };
 
 static inline struct rtw_usb_tx_data *rtw_usb_get_tx_data(struct sk_buff *skb)

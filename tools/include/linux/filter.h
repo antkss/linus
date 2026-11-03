@@ -6,6 +6,7 @@
 #define __TOOLS_LINUX_FILTER_H
 
 #include <linux/bpf.h>
+#include <uapi/linux/filter.h>
 
 /* ArgX, context and stack frame pointer register positions. Note,
  * Arg1, Arg2, Arg3, etc are used as argument mappings of function
@@ -272,6 +273,16 @@
 		.src_reg = 0,					\
 		.off   = OFF,					\
 		.imm   = 0 })
+
+/* Unconditional jumps, gotol pc + imm32 */
+
+#define BPF_JMP32_A(IMM)					\
+	((struct bpf_insn) {					\
+		.code  = BPF_JMP32 | BPF_JA,			\
+		.dst_reg = 0,					\
+		.src_reg = 0,					\
+		.off   = 0,					\
+		.imm   = IMM })
 
 /* Function call */
 

@@ -9,9 +9,8 @@
  * Copyright (c) 2012-2017 Mentor Graphics Inc.
  */
 #include <linux/delay.h>
-#include <linux/interrupt.h>
 #include <linux/module.h>
-#include <linux/sched.h>
+#include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
@@ -295,7 +294,7 @@ static irqreturn_t prp_nfb4eof_interrupt(int irq, void *dev_id)
  */
 static void prp_eof_timeout(struct timer_list *t)
 {
-	struct prp_priv *priv = from_timer(priv, t, eof_timeout_timer);
+	struct prp_priv *priv = timer_container_of(priv, t, eof_timeout_timer);
 	struct imx_media_video_dev *vdev = priv->vdev;
 	struct imx_ic_priv *ic_priv = priv->ic_priv;
 
@@ -781,7 +780,7 @@ static void prp_stop(struct prp_priv *priv)
 	imx_media_free_dma_buf(ic_priv->ipu_dev, &priv->underrun_buf);
 
 	/* cancel the EOF timeout timer */
-	del_timer_sync(&priv->eof_timeout_timer);
+	timer_delete_sync(&priv->eof_timeout_timer);
 
 	prp_put_ipu_resources(priv);
 }
@@ -919,6 +918,7 @@ static void prp_try_fmt(struct prp_priv *priv,
 }
 
 static int prp_set_fmt(struct v4l2_subdev *sd,
+		       const struct v4l2_subdev_client_info *ci,
 		       struct v4l2_subdev_state *sd_state,
 		       struct v4l2_subdev_format *sdformat)
 {

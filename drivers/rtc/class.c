@@ -72,12 +72,14 @@ static void rtc_hctosys(struct rtc_device *rtc)
 
 	tv64.tv_sec = rtc_tm_to_time64(&tm);
 
-#if BITS_PER_LONG == 32
-	if (tv64.tv_sec > INT_MAX) {
+	if (IS_ENABLED(CONFIG_RTC_HCTOSYS_TIME32_LIMIT) &&
+	    tv64.tv_sec > INT_MAX) {
+		dev_warn(rtc->dev.parent,
+			 "hctosys: rejecting %ptR UTC due to CONFIG_RTC_HCTOSYS_TIME32_LIMIT=y\n",
+			 &tm);
 		err = -ERANGE;
 		goto err_read;
 	}
-#endif
 
 	err = do_settimeofday64(&tv64);
 
@@ -208,7 +210,7 @@ static struct rtc_device *rtc_allocate_device(void)
 {
 	struct rtc_device *rtc;
 
-	rtc = kzalloc(sizeof(*rtc), GFP_KERNEL);
+	rtc = kzalloc_obj(*rtc);
 	if (!rtc)
 		return NULL;
 
@@ -240,8 +242,7 @@ static struct rtc_device *rtc_allocate_device(void)
 	/* Init uie timer */
 	rtc_timer_init(&rtc->uie_rtctimer, rtc_uie_update_irq, rtc);
 	/* Init pie timer */
-	hrtimer_init(&rtc->pie_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	rtc->pie_timer.function = rtc_pie_update_irq;
+	hrtimer_setup(&rtc->pie_timer, rtc_pie_update_irq, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	rtc->pie_enabled = 0;
 
 	set_bit(RTC_FEATURE_ALARM, rtc->features);
@@ -327,7 +328,7 @@ static void rtc_device_get_offset(struct rtc_device *rtc)
 	 *
 	 * Otherwise the offset seconds should be 0.
 	 */
-	if (rtc->start_secs > rtc->range_max ||
+	if ((rtc->start_secs >= 0 && rtc->start_secs > rtc->range_max) ||
 	    rtc->start_secs + range_secs - 1 < rtc->range_min)
 		rtc->offset_secs = rtc->start_secs - rtc->range_min;
 	else if (rtc->start_secs > rtc->range_min)
@@ -411,7 +412,7 @@ int __devm_rtc_register_device(struct module *owner, struct rtc_device *rtc)
 
 	/* Check to see if there is an ALARM already set in hw */
 	err = __rtc_read_alarm(rtc, &alrm);
-	if (!err && !rtc_valid_tm(&alrm.time))
+	if (!err)
 		rtc_initialize_alarm(rtc, &alrm);
 
 	rtc_dev_prepare(rtc);

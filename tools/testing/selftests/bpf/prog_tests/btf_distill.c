@@ -385,7 +385,7 @@ static void test_distilled_base_missing_err(void)
 		"[2] INT 'int' size=8 bits_offset=0 nr_bits=64 encoding=SIGNED");
 	btf5 = btf__new_empty();
 	if (!ASSERT_OK_PTR(btf5, "empty_reloc_btf"))
-		return;
+		goto cleanup;
 	btf__add_int(btf5, "int", 4, BTF_INT_SIGNED);   /* [1] int */
 	VALIDATE_RAW_BTF(
 		btf5,
@@ -478,7 +478,7 @@ static void test_distilled_base_multi_err2(void)
 		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED");
 	btf5 = btf__new_empty();
 	if (!ASSERT_OK_PTR(btf5, "empty_reloc_btf"))
-		return;
+		goto cleanup;
 	btf__add_int(btf5, "int", 4, BTF_INT_SIGNED);   /* [1] int */
 	btf__add_int(btf5, "int", 4, BTF_INT_SIGNED);   /* [2] int */
 	VALIDATE_RAW_BTF(
@@ -601,6 +601,180 @@ cleanup:
 	btf__free(base);
 }
 
+/* If a needed composite type, which is the member of composite type
+ * in the split BTF, has a different size in the base BTF we wish to
+ * relocate with, btf__relocate() should error out.
+ */
+static void test_distilled_base_embedded_err(void)
+{
+	struct btf *btf1 = NULL, *btf2 = NULL, *btf3 = NULL, *btf4 = NULL, *btf5 = NULL;
+
+	btf1 = btf__new_empty();
+	if (!ASSERT_OK_PTR(btf1, "empty_main_btf"))
+		return;
+
+	btf__add_int(btf1, "int", 4, BTF_INT_SIGNED);   /* [1] int */
+	btf__add_struct(btf1, "s1", 4);                 /* [2] struct s1 { */
+	btf__add_field(btf1, "f1", 1, 0, 0);            /*      int f1; */
+							/* } */
+	VALIDATE_RAW_BTF(
+		btf1,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		"[2] STRUCT 's1' size=4 vlen=1\n"
+		"\t'f1' type_id=1 bits_offset=0");
+
+	btf2 = btf__new_empty_split(btf1);
+	if (!ASSERT_OK_PTR(btf2, "empty_split_btf"))
+		goto cleanup;
+
+	btf__add_struct(btf2, "with_embedded", 8);      /* [3] struct with_embedded { */
+	btf__add_field(btf2, "e1", 2, 0, 0);		/*      struct s1 e1; */
+							/* } */
+
+	VALIDATE_RAW_BTF(
+		btf2,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		"[2] STRUCT 's1' size=4 vlen=1\n"
+		"\t'f1' type_id=1 bits_offset=0",
+		"[3] STRUCT 'with_embedded' size=8 vlen=1\n"
+		"\t'e1' type_id=2 bits_offset=0");
+
+	if (!ASSERT_EQ(0, btf__distill_base(btf2, &btf3, &btf4),
+		       "distilled_base") ||
+	    !ASSERT_OK_PTR(btf3, "distilled_base") ||
+	    !ASSERT_OK_PTR(btf4, "distilled_split") ||
+	    !ASSERT_EQ(2, btf__type_cnt(btf3), "distilled_base_type_cnt"))
+		goto cleanup;
+
+	VALIDATE_RAW_BTF(
+		btf4,
+		"[1] STRUCT 's1' size=4 vlen=0",
+		"[2] STRUCT 'with_embedded' size=8 vlen=1\n"
+		"\t'e1' type_id=1 bits_offset=0");
+
+	btf5 = btf__new_empty();
+	if (!ASSERT_OK_PTR(btf5, "empty_reloc_btf"))
+		goto cleanup;
+
+	btf__add_int(btf5, "int", 4, BTF_INT_SIGNED);   /* [1] int */
+	/* struct with the same name but different size */
+	btf__add_struct(btf5, "s1", 8);                 /* [2] struct s1 { */
+	btf__add_field(btf5, "f1", 1, 0, 0);            /*      int f1; */
+							/* } */
+
+	ASSERT_EQ(btf__relocate(btf4, btf5), -EINVAL, "relocate_split");
+cleanup:
+	btf__free(btf5);
+	btf__free(btf4);
+	btf__free(btf3);
+	btf__free(btf2);
+	btf__free(btf1);
+}
+
+/* LOC_PARAM, LOC_PROTO should be added to split BTF. */
+static void test_distilled_loc(void)
+{
+	struct btf *btf1 = NULL, *btf2 = NULL, *btf3 = NULL;
+	struct btf *btf4 = NULL, *btf5 = NULL;
+
+	btf1 = btf__new_empty();
+	if (!ASSERT_OK_PTR(btf1, "empty_main_btf"))
+		return;
+
+	btf__add_int(btf1, "int", 4, BTF_INT_SIGNED);	/* [1] int */
+	btf__add_func_proto(btf1, 1);                   /* [2] int (*)(int); */
+	btf__add_func_param(btf1, "p1", 1);
+	btf__add_func(btf1, "foo", BTF_FUNC_STATIC, 2);	/* [3] int foo(int); */
+	btf__add_loc_param(btf1, 4, BTF_LOC_PARAM_SIGNED | BTF_LOC_PARAM_CONST);
+	btf__add_loc_param_value(btf1, -1);		/* [4] loc value */
+	btf__add_loc_proto(btf1);			/* [5] loc proto */
+	btf__add_loc_proto_param(btf1, 4);		/*  param value */
+	btf__add_int(btf1, "unsigned int", 4, 0);	/* [6] unsigned int */
+
+	VALIDATE_RAW_BTF(
+		btf1,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		"[2] FUNC_PROTO '(anon)' ret_type_id=1 vlen=1\n"
+		"\t'p1' type_id=1",
+		"[3] FUNC 'foo' type_id=2 linkage=static",
+		"[4] LOC_PARAM '(anon)' size=4 flags=0x3 vlen=1\n"
+		"\tvalue=-1",
+		"[5] LOC_PROTO '(anon)' vlen=1\n"
+		"\ttype_id=4",
+		"[6] INT 'unsigned int' size=4 bits_offset=0 nr_bits=32 encoding=(none)");
+
+	btf2 = btf__new_empty_split(btf1);
+	if (!ASSERT_OK_PTR(btf2, "empty_split_btf"))
+		goto cleanup;
+
+	btf__add_locsec(btf2, "inline.text");		/* [6] locsec */
+	btf__add_locsec_loc(btf2, 3, 5, 256);		/* "foo" offset 256 */
+	VALIDATE_RAW_BTF(
+		btf2,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		"[2] FUNC_PROTO '(anon)' ret_type_id=1 vlen=1\n"
+		"\t'p1' type_id=1",
+		"[3] FUNC 'foo' type_id=2 linkage=static",
+		"[4] LOC_PARAM '(anon)' size=4 flags=0x3 vlen=1\n"
+		"\tvalue=-1",
+		"[5] LOC_PROTO '(anon)' vlen=1\n"
+		"\ttype_id=4",
+		"[6] INT 'unsigned int' size=4 bits_offset=0 nr_bits=32 encoding=(none)",
+		"[7] LOCSEC 'inline.text' vlen=1\n"
+		"\tfunc_type_id=3 loc_proto_type_id=5 offset=256");
+
+	if (!ASSERT_EQ(0, btf__distill_base(btf2, &btf3, &btf4),
+		       "distilled_base") ||
+	    !ASSERT_OK_PTR(btf3, "distilled_base") ||
+	    !ASSERT_OK_PTR(btf4, "distilled_split") ||
+	    !ASSERT_EQ(2, btf__type_cnt(btf3), "distilled_base_type_cnt"))
+		goto cleanup;
+
+	VALIDATE_RAW_BTF(
+		btf4,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		/* remainder is split BTF */
+		"[2] LOCSEC 'inline.text' vlen=1\n"
+		"\tfunc_type_id=4 loc_proto_type_id=6 offset=256",
+		"[3] FUNC_PROTO '(anon)' ret_type_id=1 vlen=1\n"
+		"\t'p1' type_id=1",
+		"[4] FUNC 'foo' type_id=3 linkage=static",
+		"[5] LOC_PARAM '(anon)' size=4 flags=0x3 vlen=1\n"
+		"\tvalue=-1",
+		"[6] LOC_PROTO '(anon)' vlen=1\n"
+		"\ttype_id=5");
+
+	btf5 = btf__new_empty();
+	if (!ASSERT_OK_PTR(btf5, "empty_reloc_btf"))
+		goto cleanup;
+	btf__add_int(btf5, "int", 4, BTF_INT_SIGNED);	/* [1] int */
+	btf__add_int(btf5, "char", 1, 0);		/* [2] char */
+
+	if (!ASSERT_EQ(btf__relocate(btf4, btf5), 0, "relocate_split"))
+		goto cleanup;
+	VALIDATE_RAW_BTF(
+		btf4,
+		"[1] INT 'int' size=4 bits_offset=0 nr_bits=32 encoding=SIGNED",
+		"[2] INT 'char' size=1 bits_offset=0 nr_bits=8 encoding=(none)",
+		/* remainder is split BTF */
+		"[3] LOCSEC 'inline.text' vlen=1\n"
+		"\tfunc_type_id=5 loc_proto_type_id=7 offset=256",
+		"[4] FUNC_PROTO '(anon)' ret_type_id=1 vlen=1\n"
+		"\t'p1' type_id=1",
+		"[5] FUNC 'foo' type_id=4 linkage=static",
+		"[6] LOC_PARAM '(anon)' size=4 flags=0x3 vlen=1\n"
+		"\tvalue=-1",
+		"[7] LOC_PROTO '(anon)' vlen=1\n"
+		"\ttype_id=6");
+
+cleanup:
+	btf__free(btf5);
+	btf__free(btf4);
+	btf__free(btf3);
+	btf__free(btf2);
+	btf__free(btf1);
+}
+
 void test_btf_distill(void)
 {
 	if (test__start_subtest("distilled_base"))
@@ -613,8 +787,12 @@ void test_btf_distill(void)
 		test_distilled_base_multi_err();
 	if (test__start_subtest("distilled_base_multi_err2"))
 		test_distilled_base_multi_err2();
+	if (test__start_subtest("distilled_base_embedded_err"))
+		test_distilled_base_embedded_err();
 	if (test__start_subtest("distilled_base_vmlinux"))
 		test_distilled_base_vmlinux();
 	if (test__start_subtest("distilled_endianness"))
 		test_distilled_endianness();
+	if (test__start_subtest("distilled_loc"))
+		test_distilled_loc();
 }

@@ -96,7 +96,7 @@ static unsigned int fq_pie_classify(struct sk_buff *skb, struct Qdisc *sch,
 		return fq_pie_hash(q, skb) + 1;
 
 	*qerr = NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
-	result = tcf_classify(skb, NULL, filter, &res, false);
+	result = tcf_classify_qdisc(skb, filter, &res, false);
 	if (result >= 0) {
 #ifdef CONFIG_NET_CLS_ACT
 		switch (result) {
@@ -130,6 +130,7 @@ static inline void flow_queue_add(struct fq_pie_flow *flow,
 static int fq_pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 				struct sk_buff **to_free)
 {
+	enum qdisc_drop_reason reason = QDISC_DROP_OVERLIMIT;
 	struct fq_pie_sched_data *q = qdisc_priv(sch);
 	struct fq_pie_flow *sel_flow;
 	int ret;
@@ -161,6 +162,8 @@ static int fq_pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		q->overmemory++;
 	}
 
+	reason = QDISC_DROP_CONGESTED;
+
 	if (!pie_drop_early(sch, &q->p_params, &sel_flow->vars,
 			    sel_flow->backlog, skb->len)) {
 		enqueue = true;
@@ -181,8 +184,8 @@ static int fq_pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 		pkt_len = qdisc_pkt_len(skb);
 		q->stats.packets_in++;
 		q->memory_usage += skb->truesize;
-		sch->qstats.backlog += pkt_len;
-		sch->q.qlen++;
+		qstats_backlog_add(sch, pkt_len);
+		qdisc_qlen_inc(sch);
 		flow_queue_add(sel_flow, skb);
 		if (list_empty(&sel_flow->flowchain)) {
 			list_add_tail(&sel_flow->flowchain, &q->new_flows);
@@ -198,8 +201,7 @@ static int fq_pie_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 out:
 	q->stats.dropped++;
 	sel_flow->vars.accu_prob = 0;
-	__qdisc_drop(skb, to_free);
-	qdisc_qstats_drop(sch);
+	qdisc_drop_reason(skb, sch, to_free, reason);
 	return NET_XMIT_CN;
 }
 
@@ -260,8 +262,8 @@ begin:
 	if (flow->head) {
 		skb = dequeue_head(flow);
 		pkt_len = qdisc_pkt_len(skb);
-		sch->qstats.backlog -= pkt_len;
-		sch->q.qlen--;
+		qstats_backlog_sub(sch, pkt_len);
+		qdisc_qlen_dec(sch);
 		qdisc_bstats_update(sch, skb);
 	}
 
@@ -285,10 +287,9 @@ begin:
 static int fq_pie_change(struct Qdisc *sch, struct nlattr *opt,
 			 struct netlink_ext_ack *extack)
 {
+	unsigned int dropped_pkts = 0, dropped_bytes = 0;
 	struct fq_pie_sched_data *q = qdisc_priv(sch);
 	struct nlattr *tb[TCA_FQ_PIE_MAX + 1];
-	unsigned int len_dropped = 0;
-	unsigned int num_dropped = 0;
 	int err;
 
 	err = nla_parse_nested(tb, TCA_FQ_PIE_MAX, opt, fq_pie_policy, extack);
@@ -340,7 +341,8 @@ static int fq_pie_change(struct Qdisc *sch, struct nlattr *opt,
 			   nla_get_u32(tb[TCA_FQ_PIE_BETA]));
 
 	if (tb[TCA_FQ_PIE_QUANTUM])
-		WRITE_ONCE(q->quantum, nla_get_u32(tb[TCA_FQ_PIE_QUANTUM]));
+		WRITE_ONCE(q->quantum,
+			   max(256U, nla_get_u32(tb[TCA_FQ_PIE_QUANTUM])));
 
 	if (tb[TCA_FQ_PIE_MEMORY_LIMIT])
 		WRITE_ONCE(q->memory_limit,
@@ -364,13 +366,16 @@ static int fq_pie_change(struct Qdisc *sch, struct nlattr *opt,
 
 	/* Drop excess packets if new limit is lower */
 	while (sch->q.qlen > sch->limit) {
-		struct sk_buff *skb = fq_pie_qdisc_dequeue(sch);
+		struct sk_buff *skb = qdisc_dequeue_internal(sch, false);
 
-		len_dropped += qdisc_pkt_len(skb);
-		num_dropped += 1;
+		if (!skb)
+			break;
+
+		dropped_pkts++;
+		dropped_bytes += qdisc_pkt_len(skb);
 		rtnl_kfree_skbs(skb, skb);
 	}
-	qdisc_tree_reduce_backlog(sch, num_dropped, len_dropped);
+	qdisc_tree_reduce_backlog(sch, dropped_pkts, dropped_bytes);
 
 	sch_tree_unlock(sch);
 	return 0;
@@ -382,7 +387,7 @@ flow_error:
 
 static void fq_pie_timer(struct timer_list *t)
 {
-	struct fq_pie_sched_data *q = from_timer(q, t, adapt_timer);
+	struct fq_pie_sched_data *q = timer_container_of(q, t, adapt_timer);
 	unsigned long next, tupdate;
 	struct Qdisc *sch = q->sch;
 	spinlock_t *root_lock; /* to lock qdisc for probability calculations */
@@ -423,7 +428,8 @@ static int fq_pie_init(struct Qdisc *sch, struct nlattr *opt,
 	pie_params_init(&q->p_params);
 	sch->limit = 10 * 1024;
 	q->p_params.limit = sch->limit;
-	q->quantum = psched_mtu(qdisc_dev(sch));
+	q->quantum = clamp_t(u32, psched_mtu(qdisc_dev(sch)),
+			     256, 1 << 20);
 	q->sch = sch;
 	q->ecn_prob = 10;
 	q->flows_cnt = 1024;
@@ -444,8 +450,7 @@ static int fq_pie_init(struct Qdisc *sch, struct nlattr *opt,
 	if (err)
 		goto init_failure;
 
-	q->flows = kvcalloc(q->flows_cnt, sizeof(struct fq_pie_flow),
-			    GFP_KERNEL);
+	q->flows = kvzalloc_objs(struct fq_pie_flow, q->flows_cnt);
 	if (!q->flows) {
 		err = -ENOMEM;
 		goto init_failure;
@@ -506,18 +511,19 @@ nla_put_failure:
 static int fq_pie_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 {
 	struct fq_pie_sched_data *q = qdisc_priv(sch);
-	struct tc_fq_pie_xstats st = {
-		.packets_in	= q->stats.packets_in,
-		.overlimit	= q->stats.overlimit,
-		.overmemory	= q->overmemory,
-		.dropped	= q->stats.dropped,
-		.ecn_mark	= q->stats.ecn_mark,
-		.new_flow_count = q->new_flow_count,
-		.memory_usage   = q->memory_usage,
-	};
+	struct tc_fq_pie_xstats st = { 0 };
 	struct list_head *pos;
 
 	sch_tree_lock(sch);
+
+	st.packets_in	= q->stats.packets_in;
+	st.overlimit	= q->stats.overlimit;
+	st.overmemory	= q->overmemory;
+	st.dropped	= q->stats.dropped;
+	st.ecn_mark	= q->stats.ecn_mark;
+	st.new_flow_count = q->new_flow_count;
+	st.memory_usage   = q->memory_usage;
+
 	list_for_each(pos, &q->new_flows)
 		st.new_flows_len++;
 
@@ -553,7 +559,7 @@ static void fq_pie_destroy(struct Qdisc *sch)
 
 	tcf_block_put(q->block);
 	q->p_params.tupdate = 0;
-	del_timer_sync(&q->adapt_timer);
+	timer_delete_sync(&q->adapt_timer);
 	kvfree(q->flows);
 }
 

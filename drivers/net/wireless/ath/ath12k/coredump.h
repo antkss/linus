@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /*
  * Copyright (c) 2020 The Linux Foundation. All rights reserved.
- * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #ifndef _ATH12K_COREDUMP_H_
 #define _ATH12K_COREDUMP_H_
@@ -15,6 +15,7 @@ enum ath12k_fw_crash_dump_type {
 	FW_CRASH_DUMP_PAGEABLE_DATA,
 	FW_CRASH_DUMP_M3_DUMP,
 	FW_CRASH_DUMP_NONE,
+	FW_CRASH_DUMP_MLO_GLOBAL_DATA,
 
 	/* keep last */
 	FW_CRASH_DUMP_TYPE_MAX,

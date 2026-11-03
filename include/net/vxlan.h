@@ -185,7 +185,8 @@ struct vxlan_metadata {
 /* per UDP socket information */
 struct vxlan_sock {
 	struct hlist_node hlist;
-	struct socket	 *sock;
+	struct sock	  *sk;
+	struct rcu_head	  rcu;
 	struct hlist_head vni_list[VNI_HASH_SIZE];
 	refcount_t	  refcnt;
 	u32		  flags;
@@ -203,7 +204,6 @@ struct vxlan_rdst {
 	u8			 offloaded:1;
 	__be32			 remote_vni;
 	u32			 remote_ifindex;
-	struct net_device	 *remote_dev;
 	struct list_head	 list;
 	struct rcu_head		 rcu;
 	struct dst_cache	 dst_cache;
@@ -227,6 +227,8 @@ struct vxlan_config {
 	unsigned int			addrmax;
 	bool				no_share;
 	enum ifla_vxlan_df		df;
+	struct vxlanhdr			reserved_bits;
+	struct rcu_head			rcu;
 };
 
 enum {
@@ -292,22 +294,28 @@ struct vxlan_dev {
 #endif
 	struct net_device *dev;
 	struct net	  *net;		/* netns for packet i/o */
-	struct vxlan_rdst default_dst;	/* default destination */
+	struct net_device *lowerdev;
 
 	struct timer_list age_timer;
-	spinlock_t	  hash_lock[FDB_HASH_SIZE];
+	spinlock_t	  hash_lock;
 	unsigned int	  addrcnt;
 	struct gro_cells  gro_cells;
+	unsigned long	  flags;
 
-	struct vxlan_config	cfg;
+	struct vxlan_config __rcu	*cfg;
 
 	struct vxlan_vni_group  __rcu *vnigrp;
 
-	struct hlist_head fdb_head[FDB_HASH_SIZE];
+	struct rhashtable fdb_hash_tbl;
 
 	struct rhashtable mdb_tbl;
+	struct hlist_head fdb_list;
 	struct hlist_head mdb_list;
 	unsigned int mdb_seq;
+};
+
+enum vxlan_dev_flags {
+	VXLAN_DEV_F_MDB,
 };
 
 #define VXLAN_F_LEARN			0x01
@@ -328,8 +336,8 @@ struct vxlan_dev {
 #define VXLAN_F_IPV6_LINKLOCAL		0x8000
 #define VXLAN_F_TTL_INHERIT		0x10000
 #define VXLAN_F_VNIFILTER               0x20000
-#define VXLAN_F_MDB			0x40000
 #define VXLAN_F_LOCALBYPASS		0x80000
+#define VXLAN_F_MC_ROUTE		0x100000
 
 /* Flags that are used in the receive path. These flags must match in
  * order for a socket to be shareable
@@ -351,10 +359,9 @@ struct vxlan_dev {
 					 VXLAN_F_UDP_ZERO_CSUM6_RX |	\
 					 VXLAN_F_COLLECT_METADATA  |	\
 					 VXLAN_F_VNIFILTER         |    \
-					 VXLAN_F_LOCALBYPASS)
-
-struct net_device *vxlan_dev_create(struct net *net, const char *name,
-				    u8 name_assign_type, struct vxlan_config *conf);
+					 VXLAN_F_LOCALBYPASS       |	\
+					 VXLAN_F_MC_ROUTE          |	\
+					 0)
 
 static inline netdev_features_t vxlan_features_check(struct sk_buff *skb,
 						     netdev_features_t features)
@@ -443,7 +450,7 @@ static inline __be32 vxlan_compute_rco(unsigned int start, unsigned int offset)
 
 static inline unsigned short vxlan_get_sk_family(struct vxlan_sock *vs)
 {
-	return vs->sock->sk->sk_family;
+	return vs->sk->sk_family;
 }
 
 #if IS_ENABLED(CONFIG_IPV6)
@@ -561,8 +568,9 @@ static inline bool vxlan_fdb_nh_path_select(struct nexthop *nh,
 					    struct vxlan_rdst *rdst)
 {
 	struct fib_nh_common *nhc;
+	__be16 dst_port = 0;
 
-	nhc = nexthop_path_fdb_result(nh, hash >> 1);
+	nhc = nexthop_path_fdb_result(nh, hash >> 1, &dst_port);
 	if (unlikely(!nhc))
 		return false;
 
@@ -576,6 +584,8 @@ static inline bool vxlan_fdb_nh_path_select(struct nexthop *nh,
 		rdst->remote_ip.sa.sa_family = AF_INET6;
 		break;
 	}
+
+	rdst->remote_port = dst_port;
 
 	return true;
 }

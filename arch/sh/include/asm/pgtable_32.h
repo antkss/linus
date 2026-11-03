@@ -170,7 +170,7 @@ static inline unsigned long copy_ptea_attributes(unsigned long x)
 	(PTE_MASK | _PAGE_ACCESSED | _PAGE_CACHABLE | \
 	 _PAGE_DIRTY | _PAGE_SPECIAL)
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 #if defined(CONFIG_X2TLB) /* SH-X2 TLB */
 #define PAGE_NONE	__pgprot(_PAGE_PROTNONE | _PAGE_CACHABLE | \
@@ -287,9 +287,9 @@ static inline unsigned long copy_ptea_attributes(unsigned long x)
 				__pgprot(0)
 #endif
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 
 /*
  * Certain architectures need to do special things when PTEs
@@ -380,14 +380,6 @@ PTE_BIT_FUNC(low, mkspecial, |= _PAGE_SPECIAL);
 
 #define pgprot_noncached	 pgprot_writecombine
 
-/*
- * Conversion functions: convert a page and protection to a page entry,
- * and a page entry and page directory to the page they refer to.
- *
- * extern pte_t mk_pte(struct page *page, pgprot_t pgprot)
- */
-#define mk_pte(page, pgprot)	pfn_pte(page_to_pfn(page), (pgprot))
-
 static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
 {
 	pte.pte_low &= _PAGE_CHG_MASK;
@@ -407,19 +399,6 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 
 #define pmd_pfn(pmd)		(__pa(pmd_val(pmd)) >> PAGE_SHIFT)
 #define pmd_page(pmd)		(virt_to_page(pmd_val(pmd)))
-
-#ifdef CONFIG_X2TLB
-#define pte_ERROR(e) \
-	printk("%s:%d: bad pte %p(%08lx%08lx).\n", __FILE__, __LINE__, \
-	       &(e), (e).pte_high, (e).pte_low)
-#define pgd_ERROR(e) \
-	printk("%s:%d: bad pgd %016llx.\n", __FILE__, __LINE__, pgd_val(e))
-#else
-#define pte_ERROR(e) \
-	printk("%s:%d: bad pte %08lx.\n", __FILE__, __LINE__, pte_val(e))
-#define pgd_ERROR(e) \
-	printk("%s:%d: bad pgd %08lx.\n", __FILE__, __LINE__, pgd_val(e))
-#endif
 
 /*
  * Encode/decode swap entries and swap PTEs. Swap PTEs are all PTEs that
@@ -478,7 +457,7 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 /* In both cases, we borrow bit 6 to store the exclusive marker in swap PTEs. */
 #define _PAGE_SWP_EXCLUSIVE	_PAGE_USER
 
-static inline int pte_swp_exclusive(pte_t pte)
+static inline bool pte_swp_exclusive(pte_t pte)
 {
 	return pte.pte_low & _PAGE_SWP_EXCLUSIVE;
 }
@@ -486,5 +465,5 @@ static inline int pte_swp_exclusive(pte_t pte)
 PTE_BIT_FUNC(low, swp_mkexclusive, |= _PAGE_SWP_EXCLUSIVE);
 PTE_BIT_FUNC(low, swp_clear_exclusive, &= ~_PAGE_SWP_EXCLUSIVE);
 
-#endif /* __ASSEMBLY__ */
+#endif /* __ASSEMBLER__ */
 #endif /* __ASM_SH_PGTABLE_32_H */

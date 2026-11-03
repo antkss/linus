@@ -294,6 +294,11 @@ static void spmmc_set_bus_timing(struct spmmc_host *host, unsigned int timing)
 		value = readl(host->base + SPMMC_SD_CONFIG0_REG);
 		value |= SPMMC_SD_DDR_MODE;
 		writel(value, host->base + SPMMC_SD_CONFIG0_REG);
+		/* DDR mode needs rd_crc_dly=1 */
+		value = readl(host->base + SPMMC_SD_TIMING_CONFIG0_REG);
+		value &= ~SPMMC_SD_READ_CRC_DELAY;
+		value |= FIELD_PREP(SPMMC_SD_READ_CRC_DELAY, 1);
+		writel(value, host->base + SPMMC_SD_TIMING_CONFIG0_REG);
 	} else {
 		value = readl(host->base + SPMMC_SD_CONFIG0_REG);
 		value &= ~SPMMC_SD_DDR_MODE;
@@ -791,7 +796,7 @@ static int spmmc_get_cd(struct mmc_host *mmc)
 {
 	int ret = 0;
 
-	if (mmc_can_gpio_cd(mmc))
+	if (mmc_host_can_gpio_cd(mmc))
 		ret = mmc_gpio_get_cd(mmc);
 
 	if (ret < 0)

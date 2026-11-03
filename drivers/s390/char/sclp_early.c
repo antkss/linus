@@ -5,9 +5,9 @@
  * Copyright IBM Corp. 2013
  */
 
-#define KMSG_COMPONENT "sclp_early"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "sclp_early: " fmt
 
+#include <linux/export.h>
 #include <linux/errno.h>
 #include <linux/memblock.h>
 #include <asm/ctlreg.h>
@@ -50,11 +50,8 @@ static void __init sclp_early_facilities_detect(void)
 	sclp.has_aeni = !!(sccb->fac118 & 0x20);
 	sclp.has_aisi = !!(sccb->fac118 & 0x10);
 	sclp.has_zpci_lsi = !!(sccb->fac118 & 0x01);
-	if (sccb->fac85 & 0x02)
-		get_lowcore()->machine_flags |= MACHINE_FLAG_ESOP;
-	if (sccb->fac91 & 0x40)
-		get_lowcore()->machine_flags |= MACHINE_FLAG_TLB_GUEST;
 	sclp.has_diag204_bif = !!(sccb->fac98 & 0x80);
+	sclp.has_diag310 = !!(sccb->fac91 & 0x80);
 	if (sccb->cpuoff > 134) {
 		sclp.has_diag318 = !!(sccb->byte_134 & 0x80);
 		sclp.has_diag320 = !!(sccb->byte_134 & 0x04);
@@ -63,6 +60,10 @@ static void __init sclp_early_facilities_detect(void)
 	if (sccb->cpuoff > 137) {
 		sclp.has_sipl = !!(sccb->cbl & 0x4000);
 		sclp.has_sipl_eckd = !!(sccb->cbl & 0x2000);
+	}
+	if (sccb->cpuoff > 139) {
+		sclp.has_diag324 = !!(sccb->byte_139 & 0x80);
+		sclp.has_astfleie2 = !!(sccb->byte_139 & 0x40);
 	}
 	sclp.rnmax = sccb->rnmax ? sccb->rnmax : sccb->rnmax2;
 	sclp.rzm = sccb->rnsize ? sccb->rnsize : sccb->rnsize2;
@@ -75,7 +76,7 @@ static void __init sclp_early_facilities_detect(void)
 		sclp.hamax = U64_MAX;
 
 	if (!sccb->hcpua) {
-		if (MACHINE_IS_VM)
+		if (machine_is_vm())
 			sclp.max_cores = 64;
 		else
 			sclp.max_cores = sccb->ncpurl;
@@ -95,6 +96,7 @@ static void __init sclp_early_facilities_detect(void)
 		sclp.has_ib = cpue->ib;
 		sclp.has_cei = cpue->cei;
 		sclp.has_skey = cpue->skey;
+		sclp.has_aef = cpue->aef;
 		break;
 	}
 
@@ -137,7 +139,6 @@ int __init sclp_early_get_core_info(struct sclp_core_info *info)
 	if (!sccb)
 		return -ENOMEM;
 
-	memset(sccb, 0, length);
 	sccb->header.length = length;
 	sccb->header.control_mask[2] = 0x80;
 	if (sclp_early_cmd(SCLP_CMDW_READ_CPU_INFO, sccb)) {

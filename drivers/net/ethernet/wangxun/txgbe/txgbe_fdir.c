@@ -307,6 +307,7 @@ void txgbe_atr(struct wx_ring *ring, struct wx_tx_buffer *first, u8 ptype)
 int txgbe_fdir_set_input_mask(struct wx *wx, union txgbe_atr_input *input_mask)
 {
 	u32 fdirm = 0, fdirtcpm = 0, flex = 0;
+	int index, offset;
 
 	/* Program the relevant mask registers. If src/dst_port or src/dst_addr
 	 * are zero, then assume a full mask for that field.  Also assume that
@@ -352,15 +353,17 @@ int txgbe_fdir_set_input_mask(struct wx *wx, union txgbe_atr_input *input_mask)
 	/* Now mask VM pool and destination IPv6 - bits 5 and 2 */
 	wr32(wx, TXGBE_RDB_FDIR_OTHER_MSK, fdirm);
 
-	flex = rd32(wx, TXGBE_RDB_FDIR_FLEX_CFG(0));
-	flex &= ~TXGBE_RDB_FDIR_FLEX_CFG_FIELD0;
+	index = VMDQ_P(0) / 4;
+	offset = VMDQ_P(0) % 4;
+	flex = rd32(wx, TXGBE_RDB_FDIR_FLEX_CFG(index));
+	flex &= ~(TXGBE_RDB_FDIR_FLEX_CFG_FIELD0 << (offset * 8));
 	flex |= (TXGBE_RDB_FDIR_FLEX_CFG_BASE_MAC |
-		 TXGBE_RDB_FDIR_FLEX_CFG_OFST(0x6));
+		 TXGBE_RDB_FDIR_FLEX_CFG_OFST(0x6)) << (offset * 8);
 
 	switch ((__force u16)input_mask->formatted.flex_bytes & 0xFFFF) {
 	case 0x0000:
 		/* Mask Flex Bytes */
-		flex |= TXGBE_RDB_FDIR_FLEX_CFG_MSK;
+		flex |= TXGBE_RDB_FDIR_FLEX_CFG_MSK << (offset * 8);
 		break;
 	case 0xFFFF:
 		break;
@@ -368,7 +371,7 @@ int txgbe_fdir_set_input_mask(struct wx *wx, union txgbe_atr_input *input_mask)
 		wx_err(wx, "Error on flexible byte mask\n");
 		return -EINVAL;
 	}
-	wr32(wx, TXGBE_RDB_FDIR_FLEX_CFG(0), flex);
+	wr32(wx, TXGBE_RDB_FDIR_FLEX_CFG(index), flex);
 
 	/* store the TCP/UDP port masks, bit reversed from port layout */
 	fdirtcpm = ntohs(input_mask->formatted.dst_port);
@@ -516,14 +519,16 @@ static void txgbe_fdir_enable(struct wx *wx, u32 fdirctrl)
 static void txgbe_init_fdir_signature(struct wx *wx)
 {
 	u32 fdirctrl = TXGBE_FDIR_PBALLOC_64K;
+	int index = VMDQ_P(0) / 4;
+	int offset = VMDQ_P(0) % 4;
 	u32 flex = 0;
 
-	flex = rd32(wx, TXGBE_RDB_FDIR_FLEX_CFG(0));
-	flex &= ~TXGBE_RDB_FDIR_FLEX_CFG_FIELD0;
+	flex = rd32(wx, TXGBE_RDB_FDIR_FLEX_CFG(index));
+	flex &= ~(TXGBE_RDB_FDIR_FLEX_CFG_FIELD0 << (offset * 8));
 
 	flex |= (TXGBE_RDB_FDIR_FLEX_CFG_BASE_MAC |
-		 TXGBE_RDB_FDIR_FLEX_CFG_OFST(0x6));
-	wr32(wx, TXGBE_RDB_FDIR_FLEX_CFG(0), flex);
+		 TXGBE_RDB_FDIR_FLEX_CFG_OFST(0x6)) << (offset * 8);
+	wr32(wx, TXGBE_RDB_FDIR_FLEX_CFG(index), flex);
 
 	/* Continue setup of fdirctrl register bits:
 	 *  Move the flexible bytes to use the ethertype - shift 6 words
@@ -586,15 +591,24 @@ static void txgbe_fdir_filter_restore(struct wx *wx)
 			queue = TXGBE_RDB_FDIR_DROP_QUEUE;
 		} else {
 			u32 ring = ethtool_get_flow_spec_ring(filter->action);
+			u8 vf = ethtool_get_flow_spec_ring_vf(filter->action);
 
-			if (ring >= wx->num_rx_queues) {
+			if (!vf && ring >= wx->num_rx_queues) {
 				wx_err(wx, "FDIR restore failed, ring:%u\n",
 				       ring);
+				continue;
+			} else if (vf && (vf > wx->num_vfs ||
+				  ring >= wx->num_rx_queues_per_pool)) {
+				wx_err(wx, "FDIR restore failed, vf:%u, ring:%u\n",
+				       vf, ring);
 				continue;
 			}
 
 			/* Map the ring onto the absolute queue index */
-			queue = wx->rx_ring[ring]->reg_idx;
+			if (!vf)
+				queue = wx->rx_ring[ring]->reg_idx;
+			else
+				queue = ((vf - 1) * wx->num_rx_queues_per_pool) + ring;
 		}
 
 		ret = txgbe_fdir_write_perfect_filter(wx,

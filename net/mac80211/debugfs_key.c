@@ -4,7 +4,7 @@
  * Copyright (c) 2006	Jiri Benc <jbenc@suse.cz>
  * Copyright 2007	Johannes Berg <johannes@sipsolutions.net>
  * Copyright (C) 2015	Intel Deutschland GmbH
- * Copyright (C) 2021-2023   Intel Corporation
+ * Copyright (C) 2021-2023, 2026 Intel Corporation
  */
 
 #include <linux/kobject.h>
@@ -42,9 +42,10 @@ static const struct debugfs_short_fops key_ ##name## _ops = {		\
 		 KEY_READ_##format(name)				\
 		 KEY_OPS(name)
 
-#define KEY_CONF_READ(name, format_string)				\
-	KEY_READ(conf_##name, conf.name, format_string)
-#define KEY_CONF_READ_D(name) KEY_CONF_READ(name, "%d\n")
+#define KEY_CONF_READ(name, val, format_string)				\
+	KEY_READ(conf_##name, conf.val, format_string)
+#define KEY_CONF_READ_D(name, val) KEY_CONF_READ(name, val, "%d\n")
+#define KEY_CONF_READ_X(name, val) KEY_CONF_READ(name, val, "0x%x\n")
 
 #define KEY_CONF_OPS(name)						\
 static const struct debugfs_short_fops key_ ##name## _ops = {		\
@@ -53,13 +54,18 @@ static const struct debugfs_short_fops key_ ##name## _ops = {		\
 }
 
 #define KEY_CONF_FILE(name, format)					\
-		 KEY_CONF_READ_##format(name)				\
+		 KEY_CONF_READ_##format(name, name)			\
+		 KEY_CONF_OPS(name)
+#define KEY_CONF_FILE_NAMED(name, val, format)				\
+		 KEY_CONF_READ_##format(name, val)			\
 		 KEY_CONF_OPS(name)
 
 KEY_CONF_FILE(keylen, D);
 KEY_CONF_FILE(keyidx, D);
 KEY_CONF_FILE(hw_key_idx, D);
+KEY_CONF_FILE_NAMED(conf_flags, flags, X);
 KEY_FILE(flags, X);
+KEY_CONF_FILE(link_id, D);
 KEY_READ(ifindex, sdata->name, "%s\n");
 KEY_OPS(ifindex);
 
@@ -356,6 +362,8 @@ void ieee80211_debugfs_key_add(struct ieee80211_key *key)
 	DEBUGFS_ADD(mic_failures);
 	DEBUGFS_ADD(key);
 	DEBUGFS_ADD(ifindex);
+	DEBUGFS_ADD(conf_flags);
+	DEBUGFS_ADD(link_id);
 };
 
 void ieee80211_debugfs_key_remove(struct ieee80211_key *key)
@@ -402,25 +410,6 @@ void ieee80211_debugfs_key_update_default(struct ieee80211_sub_if_data *sdata)
 	}
 }
 
-void ieee80211_debugfs_key_add_mgmt_default(struct ieee80211_sub_if_data *sdata)
-{
-	char buf[50];
-	struct ieee80211_key *key;
-
-	if (!sdata->vif.debugfs_dir)
-		return;
-
-	key = wiphy_dereference(sdata->local->hw.wiphy,
-				sdata->deflink.default_mgmt_key);
-	if (key) {
-		sprintf(buf, "../keys/%d", key->debugfs.cnt);
-		sdata->debugfs.default_mgmt_key =
-			debugfs_create_symlink("default_mgmt_key",
-					       sdata->vif.debugfs_dir, buf);
-	} else
-		ieee80211_debugfs_key_remove_mgmt_default(sdata);
-}
-
 void ieee80211_debugfs_key_remove_mgmt_default(struct ieee80211_sub_if_data *sdata)
 {
 	if (!sdata)
@@ -431,27 +420,6 @@ void ieee80211_debugfs_key_remove_mgmt_default(struct ieee80211_sub_if_data *sda
 }
 
 void
-ieee80211_debugfs_key_add_beacon_default(struct ieee80211_sub_if_data *sdata)
-{
-	char buf[50];
-	struct ieee80211_key *key;
-
-	if (!sdata->vif.debugfs_dir)
-		return;
-
-	key = wiphy_dereference(sdata->local->hw.wiphy,
-				sdata->deflink.default_beacon_key);
-	if (key) {
-		sprintf(buf, "../keys/%d", key->debugfs.cnt);
-		sdata->debugfs.default_beacon_key =
-			debugfs_create_symlink("default_beacon_key",
-					       sdata->vif.debugfs_dir, buf);
-	} else {
-		ieee80211_debugfs_key_remove_beacon_default(sdata);
-	}
-}
-
-void
 ieee80211_debugfs_key_remove_beacon_default(struct ieee80211_sub_if_data *sdata)
 {
 	if (!sdata)
@@ -459,11 +427,4 @@ ieee80211_debugfs_key_remove_beacon_default(struct ieee80211_sub_if_data *sdata)
 
 	debugfs_remove(sdata->debugfs.default_beacon_key);
 	sdata->debugfs.default_beacon_key = NULL;
-}
-
-void ieee80211_debugfs_key_sta_del(struct ieee80211_key *key,
-				   struct sta_info *sta)
-{
-	debugfs_remove(key->debugfs.stalink);
-	key->debugfs.stalink = NULL;
 }

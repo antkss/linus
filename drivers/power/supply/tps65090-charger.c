@@ -259,7 +259,7 @@ static int tps65090_charger_probe(struct platform_device *pdev)
 
 	psy_cfg.supplied_to		= pdata->supplied_to;
 	psy_cfg.num_supplicants		= pdata->num_supplicants;
-	psy_cfg.of_node			= pdev->dev.of_node;
+	psy_cfg.fwnode			= dev_fwnode(&pdev->dev);
 	psy_cfg.drv_data		= cdata;
 
 	cdata->ac = devm_power_supply_register(&pdev->dev, &tps65090_charger_desc,
@@ -302,12 +302,8 @@ static int tps65090_charger_probe(struct platform_device *pdev)
 	if (irq != -ENXIO) {
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 			tps65090_charger_isr, IRQF_ONESHOT, "tps65090-charger", cdata);
-		if (ret) {
-			dev_err(cdata->dev,
-				"Unable to register irq %d err %d\n", irq,
-				ret);
+		if (ret)
 			return ret;
-		}
 	} else {
 		cdata->poll_task = kthread_run(tps65090_charger_poll_task,
 					      cdata, "ktps65090charger");

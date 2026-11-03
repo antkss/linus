@@ -13,6 +13,7 @@
 #include <linux/ptrace.h>
 #include <linux/preempt.h>
 #include <linux/stop_machine.h>
+#include <linux/cpufeature.h>
 #include <linux/kdebug.h>
 #include <linux/uaccess.h>
 #include <linux/extable.h>
@@ -84,6 +85,9 @@ static bool can_probe(unsigned long paddr)
 	if (!kallsyms_lookup_size_offset(paddr, NULL, &offset))
 		return false;
 
+	if (s390_search_extables(paddr))
+		return false;
+
 	/* Decode instructions */
 	addr = paddr - offset;
 	while (addr < paddr) {
@@ -153,7 +157,7 @@ void arch_arm_kprobe(struct kprobe *p)
 {
 	struct swap_insn_args args = {.p = p, .arm_kprobe = 1};
 
-	if (MACHINE_HAS_SEQ_INSN) {
+	if (cpu_has_seq_insn()) {
 		swap_instruction(&args);
 		text_poke_sync();
 	} else {
@@ -166,7 +170,7 @@ void arch_disarm_kprobe(struct kprobe *p)
 {
 	struct swap_insn_args args = {.p = p, .arm_kprobe = 0};
 
-	if (MACHINE_HAS_SEQ_INSN) {
+	if (cpu_has_seq_insn()) {
 		swap_instruction(&args);
 		text_poke_sync();
 	} else {

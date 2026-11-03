@@ -123,6 +123,7 @@ int atomisp_csi2_set_ffmt(struct v4l2_subdev *sd,
  * return -EINVAL or zero on success
  */
 static int csi2_set_format(struct v4l2_subdev *sd,
+			   const struct v4l2_subdev_client_info *ci,
 			   struct v4l2_subdev_state *sd_state,
 			   struct v4l2_subdev_format *fmt)
 {
@@ -298,7 +299,7 @@ static void atomisp_csi2_configure_isp2401(struct atomisp_sub_device *asd)
 
 	ctrl.id = V4L2_CID_LINK_FREQ;
 	if (v4l2_g_ctrl
-	    (isp->inputs[asd->input_curr].camera->ctrl_handler, &ctrl) == 0)
+	    (isp->inputs[asd->input_curr].sensor->ctrl_handler, &ctrl) == 0)
 		mipi_freq = ctrl.value;
 
 	clk_termen = atomisp_csi2_configure_calc(coeff_clk_termen, mipi_freq,

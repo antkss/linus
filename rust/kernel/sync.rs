@@ -5,65 +5,39 @@
 //! This module contains the kernel APIs related to synchronisation that have been ported or
 //! wrapped for usage by Rust code in the kernel.
 
-use crate::types::Opaque;
-
 mod arc;
+pub mod aref;
+pub mod atomic;
+pub mod barrier;
+pub mod completion;
 mod condvar;
 pub mod lock;
+pub mod lockdep;
 mod locked_by;
 pub mod poll;
+pub mod rcu;
+mod refcount;
+mod set_once;
+pub mod srcu;
 
 pub use arc::{Arc, ArcBorrow, UniqueArc};
+pub use completion::Completion;
 pub use condvar::{new_condvar, CondVar, CondVarTimeoutResult};
 pub use lock::global::{global_lock, GlobalGuard, GlobalLock, GlobalLockBackend, GlobalLockedBy};
-pub use lock::mutex::{new_mutex, Mutex};
-pub use lock::spinlock::{new_spinlock, SpinLock};
+pub use lock::mutex::{new_mutex, Mutex, MutexGuard};
+pub use lock::spinlock::{
+    new_spinlock,
+    new_spinlock_irq,
+    SpinLock,
+    SpinLockGuard,
+    SpinLockIrq,
+    SpinLockIrqGuard, //
+};
+pub use lockdep::{
+    static_lock_class,
+    LockClassKey, //
+};
 pub use locked_by::LockedBy;
-
-/// Represents a lockdep class. It's a wrapper around C's `lock_class_key`.
-#[repr(transparent)]
-pub struct LockClassKey(Opaque<bindings::lock_class_key>);
-
-// SAFETY: `bindings::lock_class_key` is designed to be used concurrently from multiple threads and
-// provides its own synchronization.
-unsafe impl Sync for LockClassKey {}
-
-impl LockClassKey {
-    /// Creates a new lock class key.
-    pub const fn new() -> Self {
-        Self(Opaque::uninit())
-    }
-
-    pub(crate) fn as_ptr(&self) -> *mut bindings::lock_class_key {
-        self.0.get()
-    }
-}
-
-impl Default for LockClassKey {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Defines a new static lock class and returns a pointer to it.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! static_lock_class {
-    () => {{
-        static CLASS: $crate::sync::LockClassKey = $crate::sync::LockClassKey::new();
-        &CLASS
-    }};
-}
-
-/// Returns the given string, if one is provided, otherwise generates one based on the source code
-/// location.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! optional_name {
-    () => {
-        $crate::c_str!(::core::concat!(::core::file!(), ":", ::core::line!()))
-    };
-    ($name:literal) => {
-        $crate::c_str!($name)
-    };
-}
+pub use refcount::Refcount;
+pub use set_once::SetOnce;
+pub use srcu::Srcu;

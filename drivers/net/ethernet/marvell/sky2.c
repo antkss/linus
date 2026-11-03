@@ -1601,8 +1601,7 @@ static int sky2_alloc_buffers(struct sky2_port *sky2)
 	if (!sky2->tx_le)
 		goto nomem;
 
-	sky2->tx_ring = kcalloc(sky2->tx_ring_size, sizeof(struct tx_ring_info),
-				GFP_KERNEL);
+	sky2->tx_ring = kzalloc_objs(struct tx_ring_info, sky2->tx_ring_size);
 	if (!sky2->tx_ring)
 		goto nomem;
 
@@ -1611,8 +1610,7 @@ static int sky2_alloc_buffers(struct sky2_port *sky2)
 	if (!sky2->rx_le)
 		goto nomem;
 
-	sky2->rx_ring = kcalloc(sky2->rx_pending, sizeof(struct rx_ring_info),
-				GFP_KERNEL);
+	sky2->rx_ring = kzalloc_objs(struct rx_ring_info, sky2->rx_pending);
 	if (!sky2->rx_ring)
 		goto nomem;
 
@@ -2503,7 +2501,7 @@ static void skb_put_frags(struct sk_buff *skb, unsigned int hdr_space,
 
 		if (length == 0) {
 			/* don't need this page */
-			__skb_frag_unref(frag, false);
+			skb_frag_unref(skb, i);
 			--skb_shinfo(skb)->nr_frags;
 		} else {
 			size = min(length, (unsigned) PAGE_SIZE);
@@ -2961,7 +2959,7 @@ static int sky2_rx_hung(struct net_device *dev)
 
 static void sky2_watchdog(struct timer_list *t)
 {
-	struct sky2_hw *hw = from_timer(hw, t, watchdog_timer);
+	struct sky2_hw *hw = timer_container_of(hw, t, watchdog_timer);
 
 	/* Check for lost IRQ once a second */
 	if (sky2_read32(hw, B0_ISRC)) {
@@ -4494,10 +4492,7 @@ static int sky2_device_event(struct notifier_block *unused,
 
 	switch (event) {
 	case NETDEV_CHANGENAME:
-		if (sky2->debugfs) {
-			sky2->debugfs = debugfs_rename(sky2_debug, sky2->debugfs,
-						       sky2_debug, dev->name);
-		}
+		debugfs_change_name(sky2->debugfs, "%s", dev->name);
 		break;
 
 	case NETDEV_GOING_DOWN:
@@ -5055,7 +5050,7 @@ static int sky2_suspend(struct device *dev)
 	if (!hw)
 		return 0;
 
-	del_timer_sync(&hw->watchdog_timer);
+	timer_delete_sync(&hw->watchdog_timer);
 	cancel_work_sync(&hw->restart_work);
 
 	rtnl_lock();

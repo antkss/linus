@@ -700,7 +700,7 @@ static void fimc_capture_try_selection(struct fimc_ctx *ctx,
 	r->top  = clamp_t(u32, r->top, 0, sink->f_height - r->height);
 	r->left = round_down(r->left, var->hor_offs_align);
 
-	dbg("target %#x: (%d,%d)/%dx%d, sink fmt: %dx%d",
+	dbg("target %#x: (%d,%d)/%ux%u, sink fmt: %dx%d",
 	    target, r->left, r->top, r->width, r->height,
 	    sink->f_width, sink->f_height);
 }
@@ -796,7 +796,8 @@ static int fimc_pipeline_try_format(struct fimc_ctx *ctx,
 			sd = media_entity_to_v4l2_subdev(me);
 
 			sfmt.pad = 0;
-			ret = v4l2_subdev_call(sd, pad, set_fmt, NULL, &sfmt);
+			ret = v4l2_subdev_call(sd, pad, set_fmt, NULL, NULL,
+					       &sfmt);
 			if (ret)
 				return ret;
 
@@ -804,7 +805,7 @@ static int fimc_pipeline_try_format(struct fimc_ctx *ctx,
 				sfmt.pad = me->num_pads - 1;
 				mf->code = tfmt->code;
 				ret = v4l2_subdev_call(sd, pad, set_fmt, NULL,
-									&sfmt);
+						       NULL, &sfmt);
 				if (ret)
 					return ret;
 			}
@@ -1509,6 +1510,7 @@ static int fimc_subdev_get_fmt(struct v4l2_subdev *sd,
 }
 
 static int fimc_subdev_set_fmt(struct v4l2_subdev *sd,
+			       const struct v4l2_subdev_client_info *ci,
 			       struct v4l2_subdev_state *sd_state,
 			       struct v4l2_subdev_format *fmt)
 {
@@ -1575,6 +1577,7 @@ static int fimc_subdev_set_fmt(struct v4l2_subdev *sd,
 }
 
 static int fimc_subdev_get_selection(struct v4l2_subdev *sd,
+				     const struct v4l2_subdev_client_info *ci,
 				     struct v4l2_subdev_state *sd_state,
 				     struct v4l2_subdev_selection *sel)
 {
@@ -1622,7 +1625,7 @@ static int fimc_subdev_get_selection(struct v4l2_subdev *sd,
 		r->height = f->height;
 	}
 
-	dbg("target %#x: l:%d, t:%d, %dx%d, f_w: %d, f_h: %d",
+	dbg("target %#x: (%d,%d)/%ux%u, f_w: %d, f_h: %d",
 	    sel->pad, r->left, r->top, r->width, r->height,
 	    f->f_width, f->f_height);
 
@@ -1631,6 +1634,7 @@ static int fimc_subdev_get_selection(struct v4l2_subdev *sd,
 }
 
 static int fimc_subdev_set_selection(struct v4l2_subdev *sd,
+				     const struct v4l2_subdev_client_info *ci,
 				     struct v4l2_subdev_state *sd_state,
 				     struct v4l2_subdev_selection *sel)
 {
@@ -1671,7 +1675,7 @@ static int fimc_subdev_set_selection(struct v4l2_subdev *sd,
 		spin_unlock_irqrestore(&fimc->slock, flags);
 	}
 
-	dbg("target %#x: (%d,%d)/%dx%d", sel->target, r->left, r->top,
+	dbg("target %#x: (%d,%d)/%ux%u", sel->target, r->left, r->top,
 	    r->width, r->height);
 
 	mutex_unlock(&fimc->lock);
@@ -1718,7 +1722,7 @@ static int fimc_register_capture_device(struct fimc_dev *fimc,
 	struct fimc_ctx *ctx;
 	int ret = -ENOMEM;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return -ENOMEM;
 

@@ -159,6 +159,16 @@ struct dc_link_settings {
 	uint8_t link_rate_set;
 };
 
+struct dc_tunnel_settings {
+	bool should_enable_dp_tunneling;
+	bool should_use_dp_bw_allocation;
+	uint8_t cm_id;
+	uint8_t group_id;
+	uint32_t bw_granularity;
+	uint32_t estimated_bw;
+	uint32_t allocated_bw;
+};
+
 union dc_dp_ffe_preset {
 	struct {
 		uint8_t level		: 4;
@@ -193,6 +203,7 @@ struct dc_link_training_overrides {
 	bool *enhanced_framing;
 	bool *mst_enable;
 	bool *fec_enable;
+	bool skip_link_bw_clear;
 };
 
 union payload_table_update_status {
@@ -296,6 +307,19 @@ union lane_align_status_updated {
 		uint8_t RESERVED:1;
 		uint8_t DOWNSTREAM_PORT_STATUS_CHANGED:1;
 		uint8_t LINK_STATUS_UPDATED:1;
+	} bits;
+	uint8_t raw;
+};
+
+union link_service_irq_vector_esi0 {
+	struct {
+		uint8_t DP_LINK_RX_CAP_CHANGED:1;
+		uint8_t DP_LINK_STATUS_CHANGED:1;
+		uint8_t DP_LINK_STREAM_STATUS_CHANGED:1;
+		uint8_t DP_LINK_HDMI_LINK_STATUS_CHANGED:1;
+		uint8_t DP_LINK_CONNECTED_OFF_ENTRY_REQUESTED:1;
+		uint8_t DP_LINK_TUNNELING_IRQ:1;
+		uint8_t reserved:2;
 	} bits;
 	uint8_t raw;
 };
@@ -410,14 +434,6 @@ union dwnstream_port_caps_byte3_hdmi {
 	uint8_t raw;
 };
 
-union hdmi_sink_encoded_link_bw_support {
-	struct {
-		uint8_t HDMI_SINK_ENCODED_LINK_BW_SUPPORT:3;
-		uint8_t RESERVED:5;
-	} bits;
-	uint8_t raw;
-};
-
 union hdmi_encoded_link_bw {
 	struct {
 		uint8_t FRL_MODE:1; // Bit 0
@@ -427,7 +443,28 @@ union hdmi_encoded_link_bw {
 		uint8_t BW_32Gbps:1;
 		uint8_t BW_40Gbps:1;
 		uint8_t BW_48Gbps:1;
-		uint8_t RESERVED:1; // Bit 7
+		uint8_t FRL_LINK_TRAINING_FINISHED:1; // Bit 7
+	} bits;
+	uint8_t raw;
+};
+
+union hdmi_tx_link_status {
+	struct {
+		uint8_t HDMI_TX_LINK_ACTIVE_STATUS:1;
+		uint8_t HDMI_TX_READY_STATUS:1;
+		uint8_t RESERVED:6;
+	} bits;
+	uint8_t raw;
+};
+
+union autonomous_mode_and_frl_link_status {
+	struct {
+		uint8_t FRL_LT_IN_PROGRESS_STATUS:1;
+		uint8_t FRL_LT_LINK_CONFIG_IN_PROGRESS:3;
+		uint8_t RESERVED:1;
+		uint8_t FALLBACK_POLICY:1;
+		uint8_t FALLBACK_POLICY_VALID:1;
+		uint8_t REGULATED_AUTONOMOUS_MODE_SUPPORTED:1;
 	} bits;
 	uint8_t raw;
 };
@@ -470,8 +507,10 @@ union sink_status {
 	uint8_t raw;
 };
 
-/*6-byte structure corresponding to 6 registers (200h-205h)
-read during handling of HPD-IRQ*/
+/* 7-byte structure corresponding to 6 registers (200h-205h)
+ * and LINK_SERVICE_IRQ_ESI0 (2005h) for tunneling IRQ
+ * read during handling of HPD-IRQ
+ */
 union hpd_irq_data {
 	struct {
 		union sink_count sink_cnt;/* 200h */
@@ -479,9 +518,10 @@ union hpd_irq_data {
 		union lane_status lane01_status;/* 202h */
 		union lane_status lane23_status;/* 203h */
 		union lane_align_status_updated lane_status_updated;/* 204h */
-		union sink_status sink_status;
+		union sink_status sink_status;/* 205h */
+		union link_service_irq_vector_esi0 link_service_irq_esi0;/* 2005h */
 	} bytes;
-	uint8_t raw[6];
+	uint8_t raw[7];
 };
 
 union down_stream_port_count {
@@ -908,8 +948,26 @@ union dp_tun_cap_support {
 /* DPCD[0xE000E] DP_IN_ADAPTER_INFO register. */
 union dpia_info {
 	struct {
-		uint8_t dpia_num :5;
-		uint8_t rsvd :3;
+		uint8_t dpia_num :6;
+		uint8_t rsvd :2;
+	} bits;
+	uint8_t raw;
+};
+
+/* DPCD[0xE0020] USB4_DRIVER_BW_CAPABILITY register. */
+union usb4_driver_bw_cap {
+	struct {
+		uint8_t rsvd :7;
+		uint8_t driver_bw_alloc_support :1;
+	} bits;
+	uint8_t raw;
+};
+
+/* DPCD[0xE0021] DP_IN_ADAPTER_TUNNEL_INFORMATION register. */
+union dpia_tunnel_info {
+	struct {
+		uint8_t group_id :3;
+		uint8_t rsvd :5;
 	} bits;
 	uint8_t raw;
 };
@@ -918,6 +976,8 @@ union dpia_info {
 struct dpcd_usb4_dp_tunneling_info {
 	union dp_tun_cap_support dp_tun_cap;
 	union dpia_info dpia_info;
+	union usb4_driver_bw_cap driver_bw_cap;
+	union dpia_tunnel_info dpia_tunnel_info;
 	uint8_t usb4_driver_id;
 	uint8_t usb4_topology_id[DPCD_USB4_TOPOLOGY_ID_LEN];
 };
@@ -959,6 +1019,15 @@ union dp_128b_132b_supported_lttpr_link_rates {
 	uint8_t raw;
 };
 
+union dp_alpm_lttpr_cap {
+	struct {
+		uint8_t AUX_LESS_ALPM_SUPPORTED	:1;
+		uint8_t ASSR_SUPPORTED			:1;
+		uint8_t RESERVED			:6;
+	} bits;
+	uint8_t raw;
+};
+
 union dp_sink_video_fallback_formats {
 	struct {
 		uint8_t dp_1024x768_60Hz_24bpp_support	:1;
@@ -967,6 +1036,21 @@ union dp_sink_video_fallback_formats {
 		uint8_t RESERVED			:5;
 	} bits;
 	uint8_t raw;
+};
+
+union dp_receive_port0_cap {
+	struct {
+		uint8_t RESERVED					:1;
+		uint8_t LOCAL_EDID_PRESENT			:1;
+		uint8_t ASSOCIATED_TO_PRECEDING_PORT:1;
+		uint8_t HBLANK_EXPANSION_CAPABLE	:1;
+		uint8_t BUFFER_SIZE_UNIT			:1;
+		uint8_t BUFFER_SIZE_PER_PORT		:1;
+		uint8_t HBLANK_REDUCTION_CAPABLE	:1;
+		uint8_t RESERVED2:1;
+		uint8_t BUFFER_SIZE:8;
+	} bits;
+	uint8_t raw[2];
 };
 
 union dpcd_max_uncompressed_pixel_rate_cap {
@@ -1037,10 +1121,11 @@ union dp_128b_132b_training_aux_rd_interval {
 
 union edp_alpm_caps {
 	struct {
-		uint8_t AUX_WAKE_ALPM_CAP       :1;
-		uint8_t PM_STATE_2A_SUPPORT     :1;
-		uint8_t AUX_LESS_ALPM_CAP       :1;
-		uint8_t RESERVED                :5;
+		uint8_t AUX_WAKE_ALPM_CAP                               :1;
+		uint8_t PM_STATE_2A_SUPPORT                             :1;
+		uint8_t AUX_LESS_ALPM_CAP                               :1;
+		uint8_t AUX_LESS_ALPM_ML_PHY_SLEEP_STATUS_SUPPORTED     :1;
+		uint8_t RESERVED                                        :4;
 	} bits;
 	uint8_t raw;
 };
@@ -1062,6 +1147,7 @@ struct edp_psr_info {
 	union edp_psr_dpcd_caps psr_dpcd_caps;
 	uint8_t psr2_su_y_granularity_cap;
 	uint8_t force_psrsu_cap;
+	uint8_t psr_active_vtotal_control_cap;
 };
 
 struct replay_info {
@@ -1071,6 +1157,35 @@ struct replay_info {
 
 struct dprx_states {
 	bool cable_id_written;
+};
+
+union dpcd_panel_replay_capability_supported {
+	struct {
+		unsigned char PANEL_REPLAY_SUPPORT          :1;
+		unsigned char SELECTIVE_UPDATE_SUPPORT      :1;
+		unsigned char EARLY_TRANSPORT_SUPPORT       :1;
+		unsigned char RESERVED				        :5;
+	} bits;
+	unsigned char raw;
+};
+
+union dpcd_panel_replay_capability {
+	struct {
+		unsigned char RESERVED								:2;
+		unsigned char DSC_DECODE_NOT_SUPPORTED				:1;
+		unsigned char ASYNC_VIDEO_TIMING_NOT_SUPPORTED		:1;
+		unsigned char DSC_CRC_OF_MULTI_SU_SUPPORTED			:1;
+		unsigned char PR_SU_GRANULARITY_NEEDED				:1;
+		unsigned char SU_Y_GRANULARITY_EXT_CAP_SUPPORTED	:1;
+		unsigned char LINK_OFF_SUPPORTED_IN_PR_ACTIVE		:1;
+	} bits;
+	unsigned char raw;
+};
+
+struct dpcd_panel_replay_selective_update_info {
+	uint16_t pr_su_x_granularity;
+	uint8_t pr_su_y_granularity;
+	uint16_t pr_su_y_granularity_extended_caps;
 };
 
 enum dpcd_downstream_port_max_bpc {
@@ -1103,7 +1218,10 @@ struct dc_lttpr_caps {
 	uint8_t max_ext_timeout;
 	union dp_main_link_channel_coding_lttpr_cap main_link_channel_coding;
 	union dp_128b_132b_supported_lttpr_link_rates supported_128b_132b_rates;
-	uint8_t aux_rd_interval[MAX_REPEATER_CNT - 1];
+	union dp_alpm_lttpr_cap alpm;
+	uint8_t aux_rd_interval[MAX_REPEATER_CNT];
+	uint8_t lttpr_ieee_oui[3]; // Always read from closest LTTPR to host
+	uint8_t lttpr_device_id[6]; // Always read from closest LTTPR to host
 };
 
 struct dc_dongle_dfp_cap_ext {
@@ -1132,6 +1250,7 @@ struct dc_dongle_caps {
 	uint32_t dp_hdmi_max_bpc;
 	uint32_t dp_hdmi_max_pixel_clk_in_khz;
 	uint32_t dp_hdmi_frl_max_link_bw_in_kbps;
+	uint32_t dp_hdmi_regulated_autonomous_mode_support;
 	struct dc_dongle_dfp_cap_ext dfp_cap_ext;
 };
 
@@ -1192,7 +1311,15 @@ struct dpcd_caps {
 	struct edp_psr_info psr_info;
 
 	struct replay_info pr_info;
+	union dpcd_panel_replay_capability_supported vesa_replay_caps_supported;
+	union dpcd_panel_replay_capability vesa_replay_caps;
+	struct dpcd_panel_replay_selective_update_info vesa_replay_su_info;
 	uint16_t edp_oled_emission_rate;
+	union dp_receive_port0_cap receive_port0_cap;
+	/* Indicates the number of SST links supported by MSO (Multi-Stream Output) */
+	uint8_t mso_cap_sst_links_supported;
+	uint8_t dp_edp_general_cap_2;
+	uint16_t drr_granularity;
 };
 
 union dpcd_sink_ext_caps {
@@ -1238,7 +1365,10 @@ union replay_enable_and_configuration {
 		unsigned char FREESYNC_PANEL_REPLAY_MODE              :1;
 		unsigned char TIMING_DESYNC_ERROR_VERIFICATION        :1;
 		unsigned char STATE_TRANSITION_ERROR_DETECTION        :1;
-		unsigned char RESERVED                                :5;
+		unsigned char FSFT_ENABLED                            :1;
+		unsigned char FRAME_SKIPPING_ERROR_DETECTION          :1;
+		unsigned char FRAME_SKIPPING_ENABLE                   :1;
+		unsigned char RESERVED                                :2;
 	} bits;
 	unsigned char raw;
 };
@@ -1249,7 +1379,32 @@ union dpcd_replay_configuration {
 		unsigned char DESYNC_ERROR_STATUS              : 1;
 		unsigned char SINK_DEVICE_REPLAY_STATUS        : 3;
 		unsigned char SINK_FRAME_LOCKED                : 2;
-		unsigned char RESERVED                         : 1;
+		unsigned char FRAME_SKIPPING_ERROR_STATUS      : 1;
+	} bits;
+	unsigned char raw;
+};
+
+union panel_replay_enable_and_configuration_1 {
+	struct {
+		unsigned char PANEL_REPLAY_ENABLE                     :1;
+		unsigned char PANEL_REPLAY_CRC_ENABLE                 :1;
+		unsigned char IRQ_HPD_ASSDP_MISSING                   :1;
+		unsigned char IRQ_HPD_VSCSDP_UNCORRECTABLE_ERROR      :1;
+		unsigned char IRQ_HPD_RFB_ERROR                       :1;
+		unsigned char IRQ_HPD_ACTIVE_FRAME_CRC_ERROR          :1;
+		unsigned char PANEL_REPLAY_SELECTIVE_UPDATE_ENABLE    :1;
+		unsigned char PANEL_REPLAY_EARLY_TRANSPORT_ENABLE     :1;
+	} bits;
+	unsigned char raw;
+};
+
+union panel_replay_enable_and_configuration_2 {
+	struct {
+		unsigned char SINK_REFRESH_RATE_UNLOCK_GRANTED        :1;
+		unsigned char RESERVED                                :1;
+		unsigned char SU_Y_GRANULARITY_EXT_VALUE_ENABLED      :1;
+		unsigned char SU_Y_GRANULARITY_EXT_VALUE              :4;
+		unsigned char SU_REGION_SCAN_LINE_CAPTURE_INDICATION  :1;
 	} bits;
 	unsigned char raw;
 };
@@ -1258,7 +1413,9 @@ union dpcd_alpm_configuration {
 	struct {
 		unsigned char ENABLE                    : 1;
 		unsigned char IRQ_HPD_ENABLE            : 1;
-		unsigned char RESERVED                  : 6;
+		unsigned char ALPM_MODE_SEL             : 1;
+		unsigned char ACDS_PERIOD_DURATION      : 1;
+		unsigned char RESERVED                  : 4;
 	} bits;
 	unsigned char raw;
 };
@@ -1267,6 +1424,17 @@ union dpcd_sink_active_vtotal_control_mode {
 	struct {
 		unsigned char ENABLE                    : 1;
 		unsigned char RESERVED                  : 7;
+	} bits;
+	unsigned char raw;
+};
+
+union pr_error_status {
+	struct {
+		unsigned char LINK_CRC_ERROR        :1;
+		unsigned char RFB_STORAGE_ERROR     :1;
+		unsigned char VSC_SDP_ERROR         :1;
+		unsigned char ASSDP_MISSING_ERROR   :1;
+		unsigned char RESERVED              :4;
 	} bits;
 	unsigned char raw;
 };
@@ -1354,6 +1522,12 @@ struct dp_trace {
 #ifndef DPCD_MAX_UNCOMPRESSED_PIXEL_RATE_CAP
 #define DPCD_MAX_UNCOMPRESSED_PIXEL_RATE_CAP    0x221c
 #endif
+#ifndef DP_LTTPR_ALPM_CAPABILITIES
+#define DP_LTTPR_ALPM_CAPABILITIES              0xF0009
+#endif
+#ifndef DP_REGULATED_AUTONOMOUS_MODE_SUPPORTED_AND_HDMI_LINK_TRAINING_STATUS
+#define DP_REGULATED_AUTONOMOUS_MODE_SUPPORTED_AND_HDMI_LINK_TRAINING_STATUS	0x303C
+#endif
 #ifndef DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE
 #define DP_REPEATER_CONFIGURATION_AND_STATUS_SIZE	0x50
 #endif
@@ -1362,6 +1536,12 @@ struct dp_trace {
 #endif
 #ifndef DP_BRANCH_VENDOR_SPECIFIC_START
 #define DP_BRANCH_VENDOR_SPECIFIC_START     0x50C
+#endif
+#ifndef DP_LTTPR_IEEE_OUI
+#define DP_LTTPR_IEEE_OUI 0xF003D
+#endif
+#ifndef DP_LTTPR_DEVICE_ID
+#define DP_LTTPR_DEVICE_ID 0xF0040
 #endif
 /** USB4 DPCD BW Allocation Registers Chapter 10.7 **/
 #ifndef DP_TUNNELING_CAPABILITIES
@@ -1400,4 +1580,26 @@ struct dp_trace {
 #ifndef REQUESTED_BW
 #define REQUESTED_BW					0xE0031 /* 1.4a */
 #endif
+# ifndef DP_TUNNELING_BW_ALLOC_BITS_MASK
+# define DP_TUNNELING_BW_ALLOC_BITS_MASK		(0x0F << 0)
+# endif
+# ifndef DP_TUNNELING_BW_REQUEST_FAILED
+# define DP_TUNNELING_BW_REQUEST_FAILED			(1 << 0)
+# endif
+# ifndef DP_TUNNELING_BW_REQUEST_SUCCEEDED
+# define DP_TUNNELING_BW_REQUEST_SUCCEEDED		(1 << 1)
+# endif
+# ifndef DP_TUNNELING_ESTIMATED_BW_CHANGED
+# define DP_TUNNELING_ESTIMATED_BW_CHANGED		(1 << 2)
+# endif
+# ifndef DP_TUNNELING_BW_ALLOC_CAP_CHANGED
+# define DP_TUNNELING_BW_ALLOC_CAP_CHANGED		(1 << 3)
+# endif
+# ifndef DPTX_BW_ALLOC_UNMASK_IRQ
+# define DPTX_BW_ALLOC_UNMASK_IRQ			(1 << 6)
+# endif
+# ifndef DPTX_BW_ALLOC_MODE_ENABLE
+# define DPTX_BW_ALLOC_MODE_ENABLE			(1 << 7)
+# endif
+
 #endif /* DC_DP_TYPES_H */

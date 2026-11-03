@@ -162,7 +162,7 @@ static int zl38_fw_send_xaddr(struct regmap *regmap, const void *data)
 static int zl38_load_firmware(struct device *dev, struct regmap *regmap)
 {
 	const struct ihex_binrec *rec;
-	const struct firmware *fw;
+	const struct firmware *fw __free(firmware) = NULL;
 	u32 addr;
 	u16 len;
 	int err;
@@ -180,7 +180,7 @@ static int zl38_load_firmware(struct device *dev, struct regmap *regmap)
 		return err;
 	err = zl38_fw_enter_boot_mode(regmap);
 	if (err)
-		goto out;
+		return err;
 	rec = (const struct ihex_binrec *)fw->data;
 	while (rec) {
 		addr = be32_to_cpu(rec->addr);
@@ -195,15 +195,12 @@ static int zl38_load_firmware(struct device *dev, struct regmap *regmap)
 			err = -EINVAL;
 		}
 		if (err)
-			goto out;
+			return err;
 		/* next ! */
 		rec = ihex_next_binrec(rec);
 	}
-	err = zl38_fw_go(regmap);
 
-out:
-	release_firmware(fw);
-	return err;
+	return zl38_fw_go(regmap);
 }
 
 
@@ -337,10 +334,16 @@ static const struct reg_sequence cp_config_stereo_bypass[] = {
 	{ 0x0202, 0x000F },	/* enable I2S1 + DAC   */
 };
 
+static const u64 zl38_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF;
+
 static const struct snd_soc_dai_ops zl38_dai_ops = {
 	.set_fmt = zl38_set_fmt,
 	.hw_params = zl38_hw_params,
 	.hw_free = zl38_hw_free,
+	.auto_selectable_formats = &zl38_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver zl38_dai = {
@@ -387,12 +390,12 @@ static const struct snd_soc_component_driver zl38_component_dev = {
 	.endianness		= 1,
 };
 
-static void chip_gpio_set(struct gpio_chip *c, unsigned int offset, int val)
+static int chip_gpio_set(struct gpio_chip *c, unsigned int offset, int val)
 {
 	struct regmap *regmap = gpiochip_get_data(c);
 	unsigned int mask = BIT(offset);
 
-	regmap_update_bits(regmap, REG_GPIO_DAT, mask, val ? mask : 0);
+	return regmap_update_bits(regmap, REG_GPIO_DAT, mask, val ? mask : 0);
 }
 
 static int chip_gpio_get(struct gpio_chip *c, unsigned int offset)
@@ -422,8 +425,12 @@ chip_direction_output(struct gpio_chip *c, unsigned int offset, int val)
 {
 	struct regmap *regmap = gpiochip_get_data(c);
 	unsigned int mask = BIT(offset);
+	int ret;
 
-	chip_gpio_set(c, offset, val);
+	ret = chip_gpio_set(c, offset, val);
+	if (ret)
+		return ret;
+
 	return regmap_update_bits(regmap, REG_GPIO_DIR, mask, mask);
 }
 

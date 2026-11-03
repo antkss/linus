@@ -3,6 +3,8 @@
 #ifndef _PKEYS_POWERPC_H
 #define _PKEYS_POWERPC_H
 
+#include <sys/stat.h>
+
 #ifndef SYS_pkey_alloc
 # define SYS_pkey_alloc		384
 # define SYS_pkey_free		385
@@ -91,7 +93,7 @@ static inline int get_arch_reserved_keys(void)
 			return NR_RESERVED_PKEYS_64K_3KEYS;
 }
 
-void expect_fault_on_read_execonly_key(void *p1, int pkey)
+static inline void expect_fault_on_read_execonly_key(void *p1, int pkey)
 {
 	/*
 	 * powerpc does not allow userspace to change permissions of exec-only
@@ -102,10 +104,20 @@ void expect_fault_on_read_execonly_key(void *p1, int pkey)
 	return;
 }
 
-/* 4-byte instructions * 16384 = 64K page */
-#define __page_o_noops() asm(".rept 16384 ; nop; .endr")
+#define REPEAT_8(s) s s s s s s s s
+#define REPEAT_64(s) REPEAT_8(s) REPEAT_8(s) REPEAT_8(s) REPEAT_8(s) \
+		     REPEAT_8(s) REPEAT_8(s) REPEAT_8(s) REPEAT_8(s)
+#define REPEAT_512(s) REPEAT_64(s) REPEAT_64(s) REPEAT_64(s) REPEAT_64(s) \
+		      REPEAT_64(s) REPEAT_64(s) REPEAT_64(s) REPEAT_64(s)
+#define REPEAT_4096(s) REPEAT_512(s) REPEAT_512(s) REPEAT_512(s) REPEAT_512(s) \
+		       REPEAT_512(s) REPEAT_512(s) REPEAT_512(s) REPEAT_512(s)
+#define REPEAT_16384(s) REPEAT_4096(s) REPEAT_4096(s) \
+			REPEAT_4096(s) REPEAT_4096(s)
 
-void *malloc_pkey_with_mprotect_subpage(long size, int prot, u16 pkey)
+/* 4-byte instructions * 16384 = 64K page */
+#define __page_o_noops() asm(REPEAT_16384("nop\n"))
+
+static inline void *malloc_pkey_with_mprotect_subpage(long size, int prot, u16 pkey)
 {
 	void *ptr;
 	int ret;
@@ -114,7 +126,7 @@ void *malloc_pkey_with_mprotect_subpage(long size, int prot, u16 pkey)
 			size, prot, pkey);
 	pkey_assert(pkey < NR_PKEYS);
 	ptr = mmap(NULL, size, prot, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-	pkey_assert(ptr != (void *)-1);
+	pkey_assert(ptr != MAP_FAILED);
 
 	ret = syscall(__NR_subpage_prot, ptr, size, NULL);
 	if (ret) {

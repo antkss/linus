@@ -16,14 +16,11 @@ ifeq ($(CONFIG_RELOCATABLE), y)
 # Pass --no-apply-dynamic-relocs to restore pre-binutils-2.27 behaviour
 # for relative relocs, since this leads to better Image compression
 # with the relocation offsets always being zero.
-LDFLAGS_vmlinux		+= -shared -Bsymbolic -z notext \
-			$(call ld-option, --no-apply-dynamic-relocs)
+LDFLAGS_vmlinux	+= -shared -Bsymbolic -z notext --no-apply-dynamic-relocs
 endif
 
 ifeq ($(CONFIG_ARM64_ERRATUM_843419),y)
-  ifeq ($(CONFIG_ARM64_LD_HAS_FIX_ERRATUM_843419),y)
 LDFLAGS_vmlinux	+= --fix-cortex-a53-843419
-  endif
 endif
 
 cc_has_k_constraint := $(call try-run,echo				\
@@ -48,7 +45,14 @@ KBUILD_CFLAGS	+= $(CC_FLAGS_NO_FPU) \
 KBUILD_CFLAGS	+= $(call cc-disable-warning, psabi)
 KBUILD_AFLAGS	+= $(compat_vdso)
 
+# Enable all code shared to s390
+KBUILD_CPPFLAGS	+= -DARM64_S390_COMMON=1
+
+ifeq ($(call rustc-min-version, 108500),y)
+KBUILD_RUSTFLAGS += --target=aarch64-unknown-none-softfloat
+else
 KBUILD_RUSTFLAGS += --target=aarch64-unknown-none -Ctarget-feature="-neon"
+endif
 
 KBUILD_CFLAGS	+= $(call cc-option,-mabi=lp64)
 KBUILD_AFLAGS	+= $(call cc-option,-mabi=lp64)
@@ -62,6 +66,9 @@ else
 KBUILD_CFLAGS	+= -fasynchronous-unwind-tables
 KBUILD_AFLAGS	+= -fasynchronous-unwind-tables
 KBUILD_RUSTFLAGS += -Cforce-unwind-tables=y -Zuse-sync-unwind=n
+# Work around rustc bug on compilers without
+# https://github.com/rust-lang/rust/pull/156973.
+KBUILD_RUSTFLAGS += $(if $(call rustc-min-version,109800),,-Zllvm_module_flag=uwtable:u32:2:max)
 endif
 
 ifeq ($(CONFIG_STACKPROTECTOR_PER_TASK),y)
@@ -101,12 +108,8 @@ endif
 # hardware.
 ifeq ($(CONFIG_AS_HAS_ARMV8_5), y)
   asm-arch := armv8.5-a
-else ifeq ($(CONFIG_AS_HAS_ARMV8_4), y)
+else
   asm-arch := armv8.4-a
-else ifeq ($(CONFIG_AS_HAS_ARMV8_3), y)
-  asm-arch := armv8.3-a
-else ifeq ($(CONFIG_AS_HAS_ARMV8_2), y)
-  asm-arch := armv8.2-a
 endif
 
 ifdef asm-arch
@@ -119,20 +122,12 @@ KBUILD_CFLAGS	+= -ffixed-x18
 KBUILD_RUSTFLAGS += -Zfixed-x18
 endif
 
-ifeq ($(CONFIG_CPU_BIG_ENDIAN), y)
-KBUILD_CPPFLAGS	+= -mbig-endian
-CHECKFLAGS	+= -D__AARCH64EB__
-# Prefer the baremetal ELF build target, but not all toolchains include
-# it so fall back to the standard linux version if needed.
-KBUILD_LDFLAGS	+= -EB $(call ld-option, -maarch64elfb, -maarch64linuxb -z norelro)
-UTS_MACHINE	:= aarch64_be
-else
 KBUILD_CPPFLAGS	+= -mlittle-endian
 CHECKFLAGS	+= -D__AARCH64EL__
-# Same as above, prefer ELF but fall back to linux target if needed.
+# Prefer the baremetal ELF build target, but not all toolchains include
+# it so fall back to the standard linux version if needed.
 KBUILD_LDFLAGS	+= -EL $(call ld-option, -maarch64elf, -maarch64linux -z norelro)
 UTS_MACHINE	:= aarch64
-endif
 
 ifeq ($(CONFIG_LD_IS_LLD), y)
 KBUILD_LDFLAGS	+= -z norelro
@@ -197,16 +192,6 @@ install zinstall:
 
 archprepare:
 	$(Q)$(MAKE) $(build)=arch/arm64/tools kapi
-ifeq ($(CONFIG_ARM64_ERRATUM_843419),y)
-  ifneq ($(CONFIG_ARM64_LD_HAS_FIX_ERRATUM_843419),y)
-	@echo "warning: ld does not support --fix-cortex-a53-843419; kernel may be susceptible to erratum" >&2
-  endif
-endif
-ifeq ($(CONFIG_ARM64_USE_LSE_ATOMICS),y)
-  ifneq ($(CONFIG_ARM64_LSE_ATOMICS),y)
-	@echo "warning: LSE atomics not supported by binutils" >&2
-  endif
-endif
 
 ifeq ($(KBUILD_EXTMOD),)
 # We need to generate vdso-offsets.h before compiling certain files in kernel/.

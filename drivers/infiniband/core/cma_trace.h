@@ -55,12 +55,13 @@ DECLARE_EVENT_CLASS(cma_fsm_class,
 
 DEFINE_CMA_FSM_EVENT(send_rtu);
 DEFINE_CMA_FSM_EVENT(send_rej);
-DEFINE_CMA_FSM_EVENT(send_mra);
+DEFINE_CMA_FSM_EVENT(prepare_mra);
 DEFINE_CMA_FSM_EVENT(send_sidr_req);
 DEFINE_CMA_FSM_EVENT(send_sidr_rep);
 DEFINE_CMA_FSM_EVENT(disconnect);
 DEFINE_CMA_FSM_EVENT(sent_drep);
 DEFINE_CMA_FSM_EVENT(sent_dreq);
+DEFINE_CMA_FSM_EVENT(force_disconnect);
 DEFINE_CMA_FSM_EVENT(id_destroy);
 
 TRACE_EVENT(cm_id_attach,

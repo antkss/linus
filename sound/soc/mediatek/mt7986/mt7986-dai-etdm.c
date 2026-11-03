@@ -124,7 +124,7 @@ static int mtk_dai_etdm_startup(struct snd_pcm_substream *substream,
 
 	ret = clk_bulk_prepare_enable(afe_priv->num_clks, afe_priv->clks);
 	if (ret)
-		return dev_err_probe(afe->dev, ret, "Failed to enable clocks\n");
+		return ret;
 
 	regmap_update_bits(afe->regmap, AUDIO_TOP_CON2, CLK_OUT5_PDN_MASK, 0);
 	regmap_update_bits(afe->regmap, AUDIO_TOP_CON2, CLK_IN5_PDN_MASK, 0);
@@ -348,10 +348,10 @@ static int mtk_dai_etdm_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	}
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		etdm_data->slave_mode = true;
 		break;
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		etdm_data->slave_mode = false;
 		break;
 	default:

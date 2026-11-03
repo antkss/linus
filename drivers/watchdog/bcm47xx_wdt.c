@@ -21,6 +21,7 @@
 #include <linux/watchdog.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
+#include <linux/stringify.h>
 
 #define DRV_NAME		"bcm47xx_wdt"
 
@@ -33,12 +34,12 @@ static bool nowayout = WATCHDOG_NOWAYOUT;
 
 module_param(timeout, int, 0);
 MODULE_PARM_DESC(timeout, "Watchdog time in seconds. (default="
-				__MODULE_STRING(WDT_DEFAULT_TIME) ")");
+				__stringify(WDT_DEFAULT_TIME) ")");
 
 module_param(nowayout, bool, 0);
 MODULE_PARM_DESC(nowayout,
 		"Watchdog cannot be stopped once started (default="
-				__MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
+				__stringify(WATCHDOG_NOWAYOUT) ")");
 
 static inline struct bcm47xx_wdt *bcm47xx_wdt_get(struct watchdog_device *wdd)
 {
@@ -105,7 +106,7 @@ static const struct watchdog_ops bcm47xx_wdt_hard_ops = {
 
 static void bcm47xx_wdt_soft_timer_tick(struct timer_list *t)
 {
-	struct bcm47xx_wdt *wdt = from_timer(wdt, t, soft_timer);
+	struct bcm47xx_wdt *wdt = timer_container_of(wdt, t, soft_timer);
 	u32 next_tick = min(wdt->wdd.timeout * 1000, wdt->max_timer_ms);
 
 	if (!atomic_dec_and_test(&wdt->soft_ticks)) {
@@ -139,7 +140,7 @@ static int bcm47xx_wdt_soft_stop(struct watchdog_device *wdd)
 {
 	struct bcm47xx_wdt *wdt = bcm47xx_wdt_get(wdd);
 
-	del_timer_sync(&wdt->soft_timer);
+	timer_delete_sync(&wdt->soft_timer);
 	wdt->timer_set(wdt, 0);
 
 	return 0;
@@ -213,7 +214,7 @@ static int bcm47xx_wdt_probe(struct platform_device *pdev)
 
 err_timer:
 	if (soft)
-		del_timer_sync(&wdt->soft_timer);
+		timer_delete_sync(&wdt->soft_timer);
 
 	return ret;
 }

@@ -22,7 +22,7 @@
 #include <linux/security.h>
 #include <asm/mman.h>
 #include <asm/mmu.h>
-#include <asm/copro.h>
+#include <asm/spu.h>
 #include <asm/hugetlb.h>
 #include <asm/mmu_context.h>
 
@@ -248,7 +248,9 @@ static void slice_convert(struct mm_struct *mm,
 
 	spin_unlock_irqrestore(&slice_convert_lock, flags);
 
-	copro_flush_all_slbs(mm);
+#ifdef CONFIG_SPU_BASE
+	spu_flush_all_slbs(mm);
+#endif
 }
 
 /*
@@ -657,7 +659,8 @@ unsigned long arch_get_unmapped_area(struct file *filp,
 	unsigned int psize;
 
 	if (radix_enabled())
-		return generic_get_unmapped_area(filp, addr, len, pgoff, flags, vm_flags);
+		return generic_get_unmapped_area(filp, addr, len, pgoff, flags,
+						 legacy_to_vma_flags(vm_flags));
 
 	if (filp && is_file_hugepages(filp))
 		psize = file_to_psize(filp);
@@ -677,7 +680,8 @@ unsigned long arch_get_unmapped_area_topdown(struct file *filp,
 	unsigned int psize;
 
 	if (radix_enabled())
-		return generic_get_unmapped_area_topdown(filp, addr0, len, pgoff, flags, vm_flags);
+		return generic_get_unmapped_area_topdown(filp, addr0, len,
+				pgoff, flags, legacy_to_vma_flags(vm_flags));
 
 	if (filp && is_file_hugepages(filp))
 		psize = file_to_psize(filp);

@@ -20,7 +20,9 @@ properties:
     items:
       - enum:
           - nxp,cbdtu02043
+          - onnn,fsusb42
           - onnn,fsusb43l10x
+          - onnn,fusb340
           - pericom,pi3usb102
           - ti,tmuxhs4212
       - const: gpio-sbu-mux
@@ -51,6 +53,7 @@ required:
 
 allOf:
   - $ref: usb-switch.yaml#
+  - $ref: usb-switch-ports.yaml#
   - if:
       required:
         - mode-switch

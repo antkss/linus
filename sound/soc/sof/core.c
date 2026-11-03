@@ -463,11 +463,12 @@ static int sof_probe_continue(struct snd_sof_dev *sdev)
 
 	sof_set_fw_state(sdev, SOF_FW_BOOT_PREPARE);
 
-	/* set up platform component driver */
-	snd_sof_new_platform_drv(sdev);
-
 	if (sdev->dspless_mode_selected) {
 		sof_set_fw_state(sdev, SOF_DSPLESS_MODE);
+
+		/* set up platform component driver */
+		snd_sof_new_platform_drv(sdev);
+
 		goto skip_dsp_init;
 	}
 
@@ -491,6 +492,9 @@ static int sof_probe_continue(struct snd_sof_dev *sdev)
 		dev_err(sdev->dev, "error: failed to init DSP IPC %d\n", ret);
 		goto ipc_err;
 	}
+
+	/* set up platform component driver after initializing the IPC ops */
+	snd_sof_new_platform_drv(sdev);
 
 	/* load the firmware */
 	ret = snd_sof_load_firmware(sdev);
@@ -607,7 +611,8 @@ static void sof_probe_work(struct work_struct *work)
 }
 
 static void
-sof_apply_profile_override(struct sof_loadable_file_profile *path_override)
+sof_apply_profile_override(struct sof_loadable_file_profile *path_override,
+			   struct snd_sof_pdata *plat_data)
 {
 	if (override_ipc_type >= 0 && override_ipc_type < SOF_IPC_TYPE_COUNT)
 		path_override->ipc_type = override_ipc_type;
@@ -619,8 +624,11 @@ sof_apply_profile_override(struct sof_loadable_file_profile *path_override)
 		path_override->fw_lib_path = override_lib_path;
 	if (override_tplg_path)
 		path_override->tplg_path = override_tplg_path;
-	if (override_tplg_filename)
+	if (override_tplg_filename) {
 		path_override->tplg_name = override_tplg_filename;
+		/* User requested a specific topology file and expect it to be loaded */
+		plat_data->disable_function_topology = true;
+	}
 }
 
 int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
@@ -654,7 +662,7 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 		}
 	}
 
-	sof_apply_profile_override(&plat_data->ipc_file_profile_base);
+	sof_apply_profile_override(&plat_data->ipc_file_profile_base, plat_data);
 
 	/* Initialize sof_ops based on the initial selected IPC version */
 	ret = sof_init_sof_ops(sdev);
@@ -676,6 +684,7 @@ int snd_sof_device_probe(struct device *dev, struct snd_sof_pdata *plat_data)
 	mutex_init(&sdev->power_state_access);
 	mutex_init(&sdev->ipc_client_mutex);
 	mutex_init(&sdev->client_event_handler_mutex);
+	mutex_init(&sdev->dsp_fw_boot_mutex);
 
 	/* set default timeouts if none provided */
 	if (plat_data->desc->ipc_timeout == 0)

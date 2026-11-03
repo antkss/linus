@@ -6,7 +6,6 @@
 //          Sylwester Nawrocki <s.nawrocki@samsung.com>
 
 #include <linux/clk.h>
-#include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -261,7 +260,7 @@ static const struct snd_soc_ops tm2_hdmi_ops = {
 static int tm2_mic_bias(struct snd_soc_dapm_widget *w,
 				struct snd_kcontrol *kcontrol, int event)
 {
-	struct snd_soc_card *card = w->dapm->card;
+	struct snd_soc_card *card = snd_soc_dapm_to_card(w->dapm);
 	struct tm2_machine_priv *priv = snd_soc_card_get_drvdata(card);
 
 	switch (event) {
@@ -280,16 +279,17 @@ static int tm2_set_bias_level(struct snd_soc_card *card,
 				struct snd_soc_dapm_context *dapm,
 				enum snd_soc_bias_level level)
 {
+	struct snd_soc_dapm_context *card_dapm = snd_soc_card_to_dapm(card);
 	struct snd_soc_pcm_runtime *rtd;
 
 	rtd = snd_soc_get_pcm_runtime(card, &card->dai_link[0]);
 
-	if (dapm->dev != snd_soc_rtd_to_codec(rtd, 0)->dev)
+	if (snd_soc_dapm_to_dev(dapm) != snd_soc_rtd_to_codec(rtd, 0)->dev)
 		return 0;
 
 	switch (level) {
 	case SND_SOC_BIAS_STANDBY:
-		if (card->dapm.bias_level == SND_SOC_BIAS_OFF)
+		if (snd_soc_dapm_get_bias_level(card_dapm) == SND_SOC_BIAS_OFF)
 			tm2_start_sysclk(card);
 		break;
 	case SND_SOC_BIAS_OFF:
@@ -451,21 +451,21 @@ static struct snd_soc_dai_link tm2_dai_links[] = {
 		.stream_name	= "HiFi Primary",
 		.ops		= &tm2_aif1_ops,
 		.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-				  SND_SOC_DAIFMT_CBM_CFM,
+				  SND_SOC_DAIFMT_CBP_CFP,
 		SND_SOC_DAILINK_REG(aif1),
 	}, {
 		.name		= "WM5110 Voice",
 		.stream_name	= "Voice call",
 		.ops		= &tm2_aif2_ops,
 		.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-				  SND_SOC_DAIFMT_CBM_CFM,
+				  SND_SOC_DAIFMT_CBP_CFP,
 		.ignore_suspend = 1,
 		SND_SOC_DAILINK_REG(voice),
 	}, {
 		.name		= "WM5110 BT",
 		.stream_name	= "Bluetooth",
 		.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-				  SND_SOC_DAIFMT_CBM_CFM,
+				  SND_SOC_DAIFMT_CBP_CFP,
 		.ignore_suspend = 1,
 		SND_SOC_DAILINK_REG(bt),
 	}, {
@@ -473,7 +473,7 @@ static struct snd_soc_dai_link tm2_dai_links[] = {
 		.stream_name	= "i2s1",
 		.ops		= &tm2_hdmi_ops,
 		.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
-				  SND_SOC_DAIFMT_CBS_CFS,
+				  SND_SOC_DAIFMT_CBC_CFC,
 		SND_SOC_DAILINK_REG(hdmi),
 	}
 };
@@ -518,19 +518,15 @@ static int tm2_probe(struct platform_device *pdev)
 	}
 
 	ret = snd_soc_of_parse_card_name(card, "model");
-	if (ret < 0) {
-		dev_err(dev, "Card name is not specified\n");
+	if (ret < 0)
 		return ret;
-	}
 
 	ret = snd_soc_of_parse_audio_routing(card, "audio-routing");
 	if (ret < 0) {
 		/* Backwards compatible way */
 		ret = snd_soc_of_parse_audio_routing(card, "samsung,audio-routing");
-		if (ret < 0) {
-			dev_err(dev, "Audio routing is not specified or invalid\n");
+		if (ret < 0)
 			return ret;
-		}
 	}
 
 	card->aux_dev[0].dlc.of_node = of_parse_phandle(dev->of_node,
@@ -609,10 +605,8 @@ static int tm2_probe(struct platform_device *pdev)
 
 	ret = devm_snd_soc_register_component(dev, &tm2_component,
 				tm2_ext_dai, ARRAY_SIZE(tm2_ext_dai));
-	if (ret < 0) {
-		dev_err(dev, "Failed to register component: %d\n", ret);
+	if (ret < 0)
 		goto dai_node_put;
-	}
 
 	ret = devm_snd_soc_register_card(dev, card);
 	if (ret < 0) {

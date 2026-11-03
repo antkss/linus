@@ -72,8 +72,9 @@ led_tg(struct sk_buff *skb, const struct xt_action_param *par)
 
 static void led_timeout_callback(struct timer_list *t)
 {
-	struct xt_led_info_internal *ledinternal = from_timer(ledinternal, t,
-							      timer);
+	struct xt_led_info_internal *ledinternal = timer_container_of(ledinternal,
+								      t,
+								      timer);
 
 	led_trigger_event(&ledinternal->netfilter_led_trigger, LED_OFF);
 }
@@ -110,11 +111,12 @@ static int led_tg_check(const struct xt_tgchk_param *par)
 	}
 
 	err = -ENOMEM;
-	ledinternal = kzalloc(sizeof(struct xt_led_info_internal), GFP_KERNEL);
+	ledinternal = kzalloc_obj(struct xt_led_info_internal,
+				  GFP_KERNEL_ACCOUNT);
 	if (!ledinternal)
 		goto exit_mutex_only;
 
-	ledinternal->trigger_id = kstrdup(ledinfo->id, GFP_KERNEL);
+	ledinternal->trigger_id = kstrdup(ledinfo->id, GFP_KERNEL_ACCOUNT);
 	if (!ledinternal->trigger_id)
 		goto exit_internal_alloc;
 

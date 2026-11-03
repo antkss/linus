@@ -28,6 +28,7 @@
 #include <net/arp.h>
 #include <net/ndisc.h>
 #include <net/inet_dscp.h>
+#include <net/sock.h>
 #include <linux/in_route.h>
 #include <linux/rtnetlink.h>
 #include <linux/rcupdate.h>
@@ -128,7 +129,40 @@ struct in_device;
 
 int ip_rt_init(void);
 void rt_cache_flush(struct net *net);
+#ifdef CONFIG_INET
 void rt_flush_dev(struct net_device *dev);
+#else
+static inline void rt_flush_dev(struct net_device *dev)
+{
+}
+#endif
+
+static inline void inet_sk_init_flowi4(const struct inet_sock *inet,
+				       struct flowi4 *fl4)
+{
+	const struct ip_options_rcu *ip4_opt;
+	const struct sock *sk;
+	__be32 daddr;
+
+	rcu_read_lock();
+	ip4_opt = rcu_dereference(inet->inet_opt);
+
+	/* Source routing option overrides the socket destination address */
+	if (ip4_opt && ip4_opt->opt.srr)
+		daddr = ip4_opt->opt.faddr;
+	else
+		daddr = inet->inet_daddr;
+	rcu_read_unlock();
+
+	sk = &inet->sk;
+	flowi4_init_output(fl4, sk->sk_bound_dev_if, READ_ONCE(sk->sk_mark),
+			   ip_sock_rt_tos(sk), ip_sock_rt_scope(sk),
+			   sk->sk_protocol, inet_sk_flowi_flags(sk), daddr,
+			   inet->inet_saddr, inet->inet_dport,
+			   inet->inet_sport, sk_uid(sk));
+	security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
+}
+
 struct rtable *ip_route_output_key_hash(struct net *net, struct flowi4 *flp,
 					const struct sk_buff *skb);
 struct rtable *ip_route_output_key_hash_rcu(struct net *net, struct flowi4 *flp,
@@ -161,7 +195,7 @@ static inline struct rtable *ip_route_output(struct net *net, __be32 daddr,
 {
 	struct flowi4 fl4 = {
 		.flowi4_oif = oif,
-		.flowi4_tos = inet_dscp_to_dsfield(dscp),
+		.flowi4_dscp = dscp,
 		.flowi4_scope = scope,
 		.daddr = daddr,
 		.saddr = saddr,
@@ -183,20 +217,6 @@ static inline struct rtable *ip_route_output_ports(struct net *net, struct flowi
 	if (sk)
 		security_sk_classify_flow(sk, flowi4_to_flowi_common(fl4));
 	return ip_route_output_flow(net, fl4, sk);
-}
-
-static inline struct rtable *ip_route_output_gre(struct net *net, struct flowi4 *fl4,
-						 __be32 daddr, __be32 saddr,
-						 __be32 gre_key, __u8 tos, int oif)
-{
-	memset(fl4, 0, sizeof(*fl4));
-	fl4->flowi4_oif = oif;
-	fl4->daddr = daddr;
-	fl4->saddr = saddr;
-	fl4->flowi4_tos = tos;
-	fl4->flowi4_proto = IPPROTO_GRE;
-	fl4->fl4_gre_key = gre_key;
-	return ip_route_output_key(net, fl4);
 }
 
 enum skb_drop_reason
@@ -262,6 +282,8 @@ int fib_dump_info_fnhe(struct sk_buff *skb, struct netlink_callback *cb,
 		       u32 table_id, struct fib_info *fi,
 		       int *fa_index, int fa_start, unsigned int flags);
 
+void fnhe_update_pmtu(struct fib_nh_exception *fnhe, u32 new, u32 orig);
+
 static inline void ip_rt_put(struct rtable *rt)
 {
 	/* dst_release() accepts a NULL parameter.
@@ -312,9 +334,12 @@ static inline void ip_route_connect_init(struct flowi4 *fl4, __be32 dst,
 	if (inet_test_bit(TRANSPARENT, sk))
 		flow_flags |= FLOWI_FLAG_ANYSRC;
 
+	if (IS_ENABLED(CONFIG_IP_ROUTE_MULTIPATH) && !sport)
+		flow_flags |= FLOWI_FLAG_ANY_SPORT;
+
 	flowi4_init_output(fl4, oif, READ_ONCE(sk->sk_mark), ip_sock_rt_tos(sk),
 			   ip_sock_rt_scope(sk), protocol, flow_flags, dst,
-			   src, dport, sport, sk->sk_uid);
+			   src, dport, sport, sk_uid(sk));
 }
 
 static inline struct rtable *ip_route_connect(struct flowi4 *fl4, __be32 dst,
@@ -368,10 +393,15 @@ static inline int inet_iif(const struct sk_buff *skb)
 static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
 {
 	int hoplimit = dst_metric_raw(dst, RTAX_HOPLIMIT);
-	struct net *net = dev_net(dst->dev);
 
-	if (hoplimit == 0)
+	if (hoplimit == 0) {
+		const struct net *net;
+
+		rcu_read_lock();
+		net = dst_dev_net_rcu(dst);
 		hoplimit = READ_ONCE(net->ipv4.sysctl_ip_default_ttl);
+		rcu_read_unlock();
+	}
 	return hoplimit;
 }
 
@@ -381,8 +411,11 @@ static inline struct neighbour *ip_neigh_gw4(struct net_device *dev,
 	struct neighbour *neigh;
 
 	neigh = __ipv4_neigh_lookup_noref(dev, (__force u32)daddr);
-	if (unlikely(!neigh))
-		neigh = __neigh_create(&arp_tbl, &daddr, dev, false);
+	if (unlikely(!neigh)) {
+		struct neigh_table *tbl = arp_table(dev_net(dev));
+
+		neigh = __neigh_create(tbl, &daddr, dev, false);
+	}
 
 	return neigh;
 }

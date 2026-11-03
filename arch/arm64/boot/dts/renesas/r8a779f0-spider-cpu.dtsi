@@ -101,6 +101,7 @@
 &hscif0 {
 	pinctrl-0 = <&hscif0_pins>;
 	pinctrl-names = "default";
+	bootph-all;
 
 	uart-has-rtscts;
 	status = "okay";
@@ -205,7 +206,7 @@
 		function = "scif0";
 	};
 
-	scif_clk_pins: scif_clk {
+	scif_clk_pins: scif-clk {
 		groups = "scif_clk";
 		function = "scif_clk";
 	};

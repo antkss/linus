@@ -412,8 +412,8 @@ static int hi3660_thermal_probe(struct hisi_thermal_data *data)
 
 	data->nr_sensors = 1;
 
-	data->sensor = devm_kzalloc(dev, sizeof(*data->sensor) *
-				    data->nr_sensors, GFP_KERNEL);
+	data->sensor = devm_kcalloc(dev, data->nr_sensors,
+				    sizeof(*data->sensor), GFP_KERNEL);
 	if (!data->sensor)
 		return -ENOMEM;
 
@@ -578,10 +578,8 @@ static int hisi_thermal_probe(struct platform_device *pdev)
 						hisi_thermal_alarm_irq_thread,
 						IRQF_ONESHOT, sensor->irq_name,
 						sensor);
-		if (ret < 0) {
-			dev_err(dev, "Failed to request alarm irq: %d\n", ret);
+		if (ret < 0)
 			return ret;
-		}
 
 		ret = data->ops->enable_sensor(sensor);
 		if (ret) {

@@ -483,9 +483,7 @@ int cast5_setkey(struct crypto_tfm *tfm, const u8 *key, unsigned int key_len)
 
 	c->rr = key_len <= 10 ? 1 : 0;
 
-	memset(p_key, 0, 16);
-	memcpy(p_key, key, key_len);
-
+	memcpy_and_pad(p_key, sizeof(p_key), key, key_len, 0);
 
 	x[0] = be32_to_cpu(p_key[0]);
 	x[1] = be32_to_cpu(p_key[1]);
@@ -531,7 +529,7 @@ static void __exit cast5_mod_fini(void)
 	crypto_unregister_alg(&alg);
 }
 
-subsys_initcall(cast5_mod_init);
+module_init(cast5_mod_init);
 module_exit(cast5_mod_fini);
 
 MODULE_LICENSE("GPL");

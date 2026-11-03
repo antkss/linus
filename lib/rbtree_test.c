@@ -14,6 +14,7 @@
 __param(int, nnodes, 100, "Number of nodes in the rb-tree");
 __param(int, perf_loops, 1000, "Number of iterations modifying the rb-tree");
 __param(int, check_loops, 100, "Number of iterations modifying and verifying the rb-tree");
+__param(ullong, seed, 3141592653589793238ULL, "Random seed");
 
 struct test_node {
 	u32 key;
@@ -29,41 +30,20 @@ static struct test_node *nodes = NULL;
 
 static struct rnd_state rnd;
 
+static inline bool less(struct rb_node *a, const struct rb_node *b)
+{
+	return rb_entry(a, struct test_node, rb)->key <
+	       rb_entry(b, struct test_node, rb)->key;
+}
+
 static void insert(struct test_node *node, struct rb_root_cached *root)
 {
-	struct rb_node **new = &root->rb_root.rb_node, *parent = NULL;
-	u32 key = node->key;
-
-	while (*new) {
-		parent = *new;
-		if (key < rb_entry(parent, struct test_node, rb)->key)
-			new = &parent->rb_left;
-		else
-			new = &parent->rb_right;
-	}
-
-	rb_link_node(&node->rb, parent, new);
-	rb_insert_color(&node->rb, &root->rb_root);
+	rb_add(&node->rb, &root->rb_root, less);
 }
 
 static void insert_cached(struct test_node *node, struct rb_root_cached *root)
 {
-	struct rb_node **new = &root->rb_root.rb_node, *parent = NULL;
-	u32 key = node->key;
-	bool leftmost = true;
-
-	while (*new) {
-		parent = *new;
-		if (key < rb_entry(parent, struct test_node, rb)->key)
-			new = &parent->rb_left;
-		else {
-			new = &parent->rb_right;
-			leftmost = false;
-		}
-	}
-
-	rb_link_node(&node->rb, parent, new);
-	rb_insert_color_cached(&node->rb, root, leftmost);
+	rb_add_cached(&node->rb, root, less);
 }
 
 static inline void erase(struct test_node *node, struct rb_root_cached *root)
@@ -109,29 +89,8 @@ static void insert_augmented(struct test_node *node,
 static void insert_augmented_cached(struct test_node *node,
 				    struct rb_root_cached *root)
 {
-	struct rb_node **new = &root->rb_root.rb_node, *rb_parent = NULL;
-	u32 key = node->key;
-	u32 val = node->val;
-	struct test_node *parent;
-	bool leftmost = true;
-
-	while (*new) {
-		rb_parent = *new;
-		parent = rb_entry(rb_parent, struct test_node, rb);
-		if (parent->augmented < val)
-			parent->augmented = val;
-		if (key < parent->key)
-			new = &parent->rb.rb_left;
-		else {
-			new = &parent->rb.rb_right;
-			leftmost = false;
-		}
-	}
-
-	node->augmented = val;
-	rb_link_node(&node->rb, rb_parent, new);
-	rb_insert_augmented_cached(&node->rb, root,
-				   leftmost, &augment_callbacks);
+	node->augmented = node->val;
+	rb_add_augmented_cached(&node->rb, root, less, &augment_callbacks);
 }
 
 
@@ -239,19 +198,14 @@ static void check_augmented(int nr_nodes)
 	}
 }
 
-static int __init rbtree_test_init(void)
+static int basic_check(void)
 {
 	int i, j;
 	cycles_t time1, time2, time;
 	struct rb_node *node;
 
-	nodes = kmalloc_array(nnodes, sizeof(*nodes), GFP_KERNEL);
-	if (!nodes)
-		return -ENOMEM;
-
 	printk(KERN_ALERT "rbtree testing");
 
-	prandom_seed_state(&rnd, 3141592653589793238ULL);
 	init();
 
 	time1 = get_cycles();
@@ -343,6 +297,14 @@ static int __init rbtree_test_init(void)
 		check(0);
 	}
 
+	return 0;
+}
+
+static int augmented_check(void)
+{
+	int i, j;
+	cycles_t time1, time2, time;
+
 	printk(KERN_ALERT "augmented rbtree testing");
 
 	init();
@@ -389,6 +351,20 @@ static int __init rbtree_test_init(void)
 		}
 		check_augmented(0);
 	}
+
+	return 0;
+}
+
+static int __init rbtree_test_init(void)
+{
+	nodes = kmalloc_objs(*nodes, nnodes);
+	if (!nodes)
+		return -ENOMEM;
+
+	prandom_seed_state(&rnd, seed);
+
+	basic_check();
+	augmented_check();
 
 	kfree(nodes);
 

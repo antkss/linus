@@ -21,7 +21,6 @@
 #ifndef __AMDGPU_UMC_H__
 #define __AMDGPU_UMC_H__
 #include "amdgpu_ras.h"
-#include "amdgpu_mca.h"
 /*
  * (addr / 256) * 4096, the higher 26 bits in ErrorAddr
  * is the index of 4KB block
@@ -46,14 +45,31 @@
 #define LOOP_UMC_CH_INST(ch_inst) for ((ch_inst) = 0; (ch_inst) < adev->umc.channel_inst_num; (ch_inst)++)
 #define LOOP_UMC_INST_AND_CH(umc_inst, ch_inst) LOOP_UMC_INST((umc_inst)) LOOP_UMC_CH_INST((ch_inst))
 
-#define LOOP_UMC_NODE_INST(node_inst) \
-		for_each_set_bit((node_inst), &(adev->umc.active_mask), adev->umc.node_inst_num)
-
-#define LOOP_UMC_EACH_NODE_INST_AND_CH(node_inst, umc_inst, ch_inst) \
-		LOOP_UMC_NODE_INST((node_inst)) LOOP_UMC_INST_AND_CH((umc_inst), (ch_inst))
-
 /* Page retirement tag */
 #define UMC_ECC_NEW_DETECTED_TAG       0x1
+/*
+ * a flag to indicate v2 of channel index stored in eeprom
+ *
+ * v1 (legacy way): store channel index within a umc instance in eeprom
+ *    range in UMC v12: 0 ~ 7
+ * v2: store global channel index in eeprom
+ *    range in UMC v12: 0 ~ 127
+ *
+ * NOTE: it's better to store it in eeprom_table_record.mem_channel,
+ * but there is only 8 bits in mem_channel, and the channel number may
+ * increase in the future, we decide to save it in
+ * eeprom_table_record.retired_page. retired_page is useless in v2,
+ * we depend on eeprom_table_record.address instead of retired_page in v2.
+ * Only 48 bits are saved on eeprom, use bit 47 here.
+ */
+#define UMC_CHANNEL_IDX_V2	BIT_ULL(47)
+
+/*
+ * save nps value to eeprom_table_record.retired_page[47:40],
+ * the channel index flag above will be retired.
+ */
+#define UMC_NPS_SHIFT 40
+#define UMC_NPS_MASK 0xffULL
 
 typedef int (*umc_func)(struct amdgpu_device *adev, uint32_t node_inst,
 			uint32_t umc_inst, uint32_t ch_inst, void *data);
@@ -66,10 +82,6 @@ struct amdgpu_umc_ras {
 				      void *ras_error_status);
 	void (*ecc_info_query_ras_error_address)(struct amdgpu_device *adev,
 					void *ras_error_status);
-	bool (*check_ecc_err_status)(struct amdgpu_device *adev,
-			enum amdgpu_mca_error_type type, void *ras_error_status);
-	int (*update_ecc_status)(struct amdgpu_device *adev,
-			uint64_t status, uint64_t ipid, uint64_t addr);
 };
 
 struct amdgpu_umc_funcs {
@@ -99,7 +111,9 @@ struct amdgpu_umc {
 	struct amdgpu_umc_ras *ras;
 
 	/* active mask for umc node instance */
-	unsigned long active_mask;
+	u64 active_mask;
+
+	unsigned long err_addr_cnt;
 };
 
 int amdgpu_umc_ras_sw_init(struct amdgpu_device *adev);
@@ -110,6 +124,9 @@ int amdgpu_umc_pasid_poison_handler(struct amdgpu_device *adev,
 			enum amdgpu_ras_block block, uint16_t pasid,
 			pasid_notify pasid_fn, void *data, uint32_t reset);
 int amdgpu_umc_process_ecc_irq(struct amdgpu_device *adev,
+		struct amdgpu_irq_src *source,
+		struct amdgpu_iv_entry *entry);
+int amdgpu_umc_uniras_process_ecc_irq(struct amdgpu_device *adev,
 		struct amdgpu_irq_src *source,
 		struct amdgpu_iv_entry *entry);
 int amdgpu_umc_fill_error_record(struct ras_err_data *err_data,
@@ -126,11 +143,6 @@ int amdgpu_umc_page_retirement_mca(struct amdgpu_device *adev,
 
 int amdgpu_umc_loop_channels(struct amdgpu_device *adev,
 			umc_func func, void *data);
-
-int amdgpu_umc_update_ecc_status(struct amdgpu_device *adev,
-				uint64_t status, uint64_t ipid, uint64_t addr);
-int amdgpu_umc_logs_ecc_err(struct amdgpu_device *adev,
-		struct radix_tree_root *ecc_tree, struct ras_ecc_err *ecc_err);
 
 void amdgpu_umc_handle_bad_pages(struct amdgpu_device *adev,
 			void *ras_error_status);

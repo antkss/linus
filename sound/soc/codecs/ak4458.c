@@ -187,7 +187,7 @@ static const struct soc_enum ak4458_dif_enum =
 static int get_digfil(struct snd_kcontrol *kcontrol,
 		      struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct ak4458_priv *ak4458 = snd_soc_component_get_drvdata(component);
 
 	ucontrol->value.enumerated.item[0] = ak4458->digfil;
@@ -198,7 +198,7 @@ static int get_digfil(struct snd_kcontrol *kcontrol,
 static int set_digfil(struct snd_kcontrol *kcontrol,
 		      struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct ak4458_priv *ak4458 = snd_soc_component_get_drvdata(component);
 	int num;
 
@@ -586,14 +586,17 @@ static const struct snd_pcm_hw_constraint_list ak4458_rate_constraints = {
 static int ak4458_startup(struct snd_pcm_substream *substream,
 			  struct snd_soc_dai *dai)
 {
-	int ret;
-
-	ret = snd_pcm_hw_constraint_list(substream->runtime, 0,
-					 SNDRV_PCM_HW_PARAM_RATE,
-					 &ak4458_rate_constraints);
-
-	return ret;
+	return snd_pcm_hw_constraint_list(substream->runtime, 0,
+					  SNDRV_PCM_HW_PARAM_RATE,
+					  &ak4458_rate_constraints);
 }
+
+static const u64 ak4458_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_RIGHT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_PDM;
 
 static const struct snd_soc_dai_ops ak4458_dai_ops = {
 	.startup        = ak4458_startup,
@@ -601,6 +604,8 @@ static const struct snd_soc_dai_ops ak4458_dai_ops = {
 	.set_fmt	= ak4458_set_dai_fmt,
 	.mute_stream	= ak4458_set_dai_mute,
 	.set_tdm_slot	= ak4458_set_tdm_slot,
+	.auto_selectable_formats	= &ak4458_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 	.no_capture_mute = 1,
 };
 
@@ -639,8 +644,7 @@ static void ak4458_reset(struct ak4458_priv *ak4458, bool active)
 	}
 }
 
-#ifdef CONFIG_PM
-static int __maybe_unused ak4458_runtime_suspend(struct device *dev)
+static int ak4458_runtime_suspend(struct device *dev)
 {
 	struct ak4458_priv *ak4458 = dev_get_drvdata(dev);
 
@@ -656,7 +660,7 @@ static int __maybe_unused ak4458_runtime_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused ak4458_runtime_resume(struct device *dev)
+static int ak4458_runtime_resume(struct device *dev)
 {
 	struct ak4458_priv *ak4458 = dev_get_drvdata(dev);
 	int ret;
@@ -676,9 +680,16 @@ static int __maybe_unused ak4458_runtime_resume(struct device *dev)
 	regcache_cache_only(ak4458->regmap, false);
 	regcache_mark_dirty(ak4458->regmap);
 
-	return regcache_sync(ak4458->regmap);
+	ret = regcache_sync(ak4458->regmap);
+	if (ret)
+		goto err;
+
+	return 0;
+err:
+	regcache_cache_only(ak4458->regmap, true);
+	regulator_bulk_disable(ARRAY_SIZE(ak4458->supplies), ak4458->supplies);
+	return ret;
 }
-#endif /* CONFIG_PM */
 
 static const struct snd_soc_component_driver soc_codec_dev_ak4458 = {
 	.controls		= ak4458_snd_controls,
@@ -727,9 +738,8 @@ static const struct ak4458_drvdata ak4497_drvdata = {
 };
 
 static const struct dev_pm_ops ak4458_pm = {
-	SET_RUNTIME_PM_OPS(ak4458_runtime_suspend, ak4458_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	RUNTIME_PM_OPS(ak4458_runtime_suspend, ak4458_runtime_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 };
 
 static int ak4458_i2c_probe(struct i2c_client *i2c)
@@ -782,16 +792,12 @@ static int ak4458_i2c_probe(struct i2c_client *i2c)
 
 	pm_runtime_enable(&i2c->dev);
 	regcache_cache_only(ak4458->regmap, true);
-	ak4458_reset(ak4458, false);
 
 	return 0;
 }
 
 static void ak4458_i2c_remove(struct i2c_client *i2c)
 {
-	struct ak4458_priv *ak4458 = i2c_get_clientdata(i2c);
-
-	ak4458_reset(ak4458, true);
 	pm_runtime_disable(&i2c->dev);
 }
 
@@ -805,7 +811,7 @@ MODULE_DEVICE_TABLE(of, ak4458_of_match);
 static struct i2c_driver ak4458_i2c_driver = {
 	.driver = {
 		.name = "ak4458",
-		.pm = &ak4458_pm,
+		.pm = pm_ptr(&ak4458_pm),
 		.of_match_table = ak4458_of_match,
 		},
 	.probe = ak4458_i2c_probe,

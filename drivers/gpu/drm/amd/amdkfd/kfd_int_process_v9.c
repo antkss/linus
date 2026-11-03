@@ -28,6 +28,7 @@
 #include "kfd_device_queue_manager.h"
 #include "kfd_smi_events.h"
 #include "amdgpu_ras.h"
+#include "amdgpu_ras_mgr.h"
 
 /*
  * GFX9 SQ Interrupts
@@ -146,7 +147,7 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
 {
 	enum amdgpu_ras_block block = 0;
 	uint32_t reset = 0;
-	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid);
+	struct kfd_process *p = kfd_lookup_process_by_pasid(pasid, NULL);
 	enum ras_event_type type = RAS_EVENT_TYPE_POISON_CONSUMPTION;
 	u64 event_id;
 	int old_poison, ret;
@@ -184,6 +185,7 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
 		} else {
 			reset = AMDGPU_RAS_GPU_RESET_MODE2_RESET;
 		}
+		amdgpu_ras_set_err_poison(dev->adev, AMDGPU_RAS_BLOCK__GFX);
 		break;
 	case SOC15_IH_CLIENTID_VMC:
 	case SOC15_IH_CLIENTID_VMC1:
@@ -213,6 +215,7 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
 		} else {
 			reset = AMDGPU_RAS_GPU_RESET_MODE2_RESET;
 		}
+		amdgpu_ras_set_err_poison(dev->adev, AMDGPU_RAS_BLOCK__SDMA);
 		break;
 	default:
 		dev_warn(dev->adev->dev,
@@ -226,7 +229,11 @@ static void event_interrupt_poison_consumption_v9(struct kfd_node *dev,
 
 	kfd_signal_poison_consumed_event(dev, pasid);
 
-	event_id = amdgpu_ras_acquire_event_id(dev->adev, type);
+	if (amdgpu_uniras_enabled(dev->adev))
+		event_id = amdgpu_ras_mgr_gen_ras_event_seqno(dev->adev,
+					RAS_SEQNO_TYPE_POISON_CONSUMPTION);
+	else
+		event_id = amdgpu_ras_acquire_event_id(dev->adev, type);
 
 	RAS_EVENT_LOG(dev->adev, event_id,
 		      "poison is consumed by client %d, kick off gpu reset flow\n", client_id);
@@ -312,11 +319,12 @@ static bool event_interrupt_isr_v9(struct kfd_node *dev,
 					& ~pasid_mask) | pasid);
 	}
 
-	pr_debug("client id 0x%x, source id %d, vmid %d, pasid 0x%x. raw data:\n",
-		 client_id, source_id, vmid, pasid);
-	pr_debug("%8X, %8X, %8X, %8X, %8X, %8X, %8X, %8X.\n",
-		 data[0], data[1], data[2], data[3],
-		 data[4], data[5], data[6], data[7]);
+	dev_dbg(dev->adev->dev,
+		"client id 0x%x, source id %d, vmid %d, pasid 0x%x. raw data:\n",
+		client_id, source_id, vmid, pasid);
+	dev_dbg(dev->adev->dev, "%8X, %8X, %8X, %8X, %8X, %8X, %8X, %8X.\n",
+		data[0], data[1], data[2], data[3], data[4], data[5], data[6],
+		data[7]);
 
 	/* If there is no valid PASID, it's likely a bug */
 	if (WARN_ONCE(pasid == 0, "Bug: No PASID in KFD interrupt"))
@@ -351,6 +359,24 @@ static bool event_interrupt_isr_v9(struct kfd_node *dev,
 		!amdgpu_no_queue_eviction_on_vm_fault);
 }
 
+static void gfx_9_clean_fault(uint16_t pasid)
+{
+	struct kfd_process *p;
+	struct kfd_process_device *pdd = NULL;
+	struct device_queue_manager *dqm;
+
+	p = kfd_lookup_process_by_pasid(pasid, &pdd);
+
+	if (!pdd)
+		return;
+
+	/* To Clean the GFX on the faulting device	 */
+	dqm = pdd->dev->dqm;
+	dqm->ops.clean_process_queues_cpsch(dqm, &pdd->qpd);
+
+	kfd_unref_process(p);
+}
+
 static void event_interrupt_wq_v9(struct kfd_node *dev,
 					const uint32_t *ih_ring_entry)
 {
@@ -371,34 +397,88 @@ static void event_interrupt_wq_v9(struct kfd_node *dev,
 	    client_id == SOC15_IH_CLIENTID_SE2SH ||
 	    client_id == SOC15_IH_CLIENTID_SE3SH) {
 		if (source_id == SOC15_INTSRC_CP_END_OF_PIPE)
-			kfd_signal_event_interrupt(pasid, context_id0, 32);
+			kfd_signal_event_interrupt(pasid, context_id0, 32, true);
 		else if (source_id == SOC15_INTSRC_SQ_INTERRUPT_MSG) {
 			sq_int_data = KFD_CONTEXT_ID_GET_SQ_INT_DATA(context_id0, context_id1);
 			encoding = REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, ENCODING);
 			switch (encoding) {
 			case SQ_INTERRUPT_WORD_ENCODING_AUTO:
-				pr_debug_ratelimited(
+				dev_dbg_ratelimited(
+					dev->adev->dev,
 					"sq_intr: auto, se %d, ttrace %d, wlt %d, ttrac_buf_full %d, reg_tms %d, cmd_tms %d, host_cmd_ovf %d, host_reg_ovf %d, immed_ovf %d, ttrace_utc_err %d\n",
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, SE_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, THREAD_TRACE),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, WLT),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, THREAD_TRACE_BUF_FULL),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, REG_TIMESTAMP),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, CMD_TIMESTAMP),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, HOST_CMD_OVERFLOW),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, HOST_REG_OVERFLOW),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, IMMED_OVERFLOW),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_AUTO_CTXID, THREAD_TRACE_UTC_ERROR));
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						SE_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						THREAD_TRACE),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						WLT),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						THREAD_TRACE_BUF_FULL),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						REG_TIMESTAMP),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						CMD_TIMESTAMP),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						HOST_CMD_OVERFLOW),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						HOST_REG_OVERFLOW),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						IMMED_OVERFLOW),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_AUTO_CTXID,
+						THREAD_TRACE_UTC_ERROR));
 				break;
 			case SQ_INTERRUPT_WORD_ENCODING_INST:
-				pr_debug_ratelimited("sq_intr: inst, se %d, data 0x%x, sh %d, priv %d, wave_id %d, simd_id %d, cu_id %d, intr_data 0x%x\n",
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SE_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, DATA),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SH_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, PRIV),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, WAVE_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SIMD_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, CU_ID),
+				dev_dbg_ratelimited(
+					dev->adev->dev,
+					"sq_intr: inst, se %d, data 0x%x, sh %d, priv %d, wave_id %d, simd_id %d, cu_id %d, intr_data 0x%x\n",
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SE_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						DATA),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SH_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						PRIV),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						WAVE_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SIMD_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						CU_ID),
 					sq_int_data);
 				if (context_id0 & SQ_INTERRUPT_WORD_WAVE_CTXID__PRIV_MASK) {
 					if (kfd_set_dbg_ev_from_interrupt(dev, pasid,
@@ -410,14 +490,37 @@ static void event_interrupt_wq_v9(struct kfd_node *dev,
 				break;
 			case SQ_INTERRUPT_WORD_ENCODING_ERROR:
 				sq_intr_err = REG_GET_FIELD(sq_int_data, KFD_SQ_INT_DATA, ERR_TYPE);
-				pr_warn_ratelimited("sq_intr: error, se %d, data 0x%x, sh %d, priv %d, wave_id %d, simd_id %d, cu_id %d, err_type %d\n",
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SE_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, DATA),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SH_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, PRIV),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, WAVE_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, SIMD_ID),
-					REG_GET_FIELD(context_id0, SQ_INTERRUPT_WORD_WAVE_CTXID, CU_ID),
+				dev_warn_ratelimited(
+					dev->adev->dev,
+					"sq_intr: error, se %d, data 0x%x, sh %d, priv %d, wave_id %d, simd_id %d, cu_id %d, err_type %d\n",
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SE_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						DATA),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SH_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						PRIV),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						WAVE_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						SIMD_ID),
+					REG_GET_FIELD(
+						context_id0,
+						SQ_INTERRUPT_WORD_WAVE_CTXID,
+						CU_ID),
 					sq_intr_err);
 				if (sq_intr_err != SQ_INTERRUPT_ERROR_TYPE_ILLEGAL_INST &&
 					sq_intr_err != SQ_INTERRUPT_ERROR_TYPE_MEMVIOL) {
@@ -428,7 +531,7 @@ static void event_interrupt_wq_v9(struct kfd_node *dev,
 			default:
 				break;
 			}
-			kfd_signal_event_interrupt(pasid, sq_int_data, 24);
+			kfd_signal_event_interrupt(pasid, sq_int_data, 24, true);
 		} else if (source_id == SOC15_INTSRC_CP_BAD_OPCODE &&
 			   KFD_DBG_EC_TYPE_IS_PACKET(KFD_DEBUG_CP_BAD_OP_ECODE(context_id0))) {
 			kfd_set_dbg_ev_from_interrupt(dev, pasid,
@@ -445,7 +548,7 @@ static void event_interrupt_wq_v9(struct kfd_node *dev,
 		   client_id == SOC15_IH_CLIENTID_SDMA6 ||
 		   client_id == SOC15_IH_CLIENTID_SDMA7) {
 		if (source_id == SOC15_INTSRC_SDMA_TRAP) {
-			kfd_signal_event_interrupt(pasid, context_id0 & 0xfffffff, 28);
+			kfd_signal_event_interrupt(pasid, context_id0 & 0xfffffff, 28, true);
 		} else if (source_id == SOC15_INTSRC_SDMA_ECC) {
 			event_interrupt_poison_consumption_v9(dev, pasid, client_id);
 			return;
@@ -461,6 +564,13 @@ static void event_interrupt_wq_v9(struct kfd_node *dev,
 			event_interrupt_poison_consumption_v9(dev, pasid, client_id);
 			return;
 		}
+
+		/* GPR cleaner for GFX9 MI-series GPUs */
+		if (KFD_GC_VERSION(dev) == IP_VERSION(9, 4, 2) ||
+		    KFD_GC_VERSION(dev) == IP_VERSION(9, 4, 3) ||
+		    KFD_GC_VERSION(dev) == IP_VERSION(9, 4, 4) ||
+		    KFD_GC_VERSION(dev) == IP_VERSION(9, 5, 0))
+			gfx_9_clean_fault(pasid);
 
 		info.vmid = vmid;
 		info.mc_id = client_id;

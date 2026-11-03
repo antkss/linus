@@ -8,11 +8,11 @@
  * Copyright (c) 2021 Tianjia Zhang <tianjia.zhang@linux.alibaba.com>
  */
 
+#include <asm/fpu/api.h>
 #include <linux/module.h>
 #include <linux/crypto.h>
+#include <linux/export.h>
 #include <linux/kernel.h>
-#include <asm/simd.h>
-#include <crypto/internal/simd.h>
 #include <crypto/internal/skcipher.h>
 #include <crypto/sm4.h>
 #include "sm4-avx.h"
@@ -263,10 +263,9 @@ static int ctr_crypt(struct skcipher_request *req)
 static struct skcipher_alg sm4_aesni_avx_skciphers[] = {
 	{
 		.base = {
-			.cra_name		= "__ecb(sm4)",
-			.cra_driver_name	= "__ecb-sm4-aesni-avx",
+			.cra_name		= "ecb(sm4)",
+			.cra_driver_name	= "ecb-sm4-aesni-avx",
 			.cra_priority		= 400,
-			.cra_flags		= CRYPTO_ALG_INTERNAL,
 			.cra_blocksize		= SM4_BLOCK_SIZE,
 			.cra_ctxsize		= sizeof(struct sm4_ctx),
 			.cra_module		= THIS_MODULE,
@@ -279,10 +278,9 @@ static struct skcipher_alg sm4_aesni_avx_skciphers[] = {
 		.decrypt	= sm4_avx_ecb_decrypt,
 	}, {
 		.base = {
-			.cra_name		= "__cbc(sm4)",
-			.cra_driver_name	= "__cbc-sm4-aesni-avx",
+			.cra_name		= "cbc(sm4)",
+			.cra_driver_name	= "cbc-sm4-aesni-avx",
 			.cra_priority		= 400,
-			.cra_flags		= CRYPTO_ALG_INTERNAL,
 			.cra_blocksize		= SM4_BLOCK_SIZE,
 			.cra_ctxsize		= sizeof(struct sm4_ctx),
 			.cra_module		= THIS_MODULE,
@@ -296,10 +294,9 @@ static struct skcipher_alg sm4_aesni_avx_skciphers[] = {
 		.decrypt	= cbc_decrypt,
 	}, {
 		.base = {
-			.cra_name		= "__ctr(sm4)",
-			.cra_driver_name	= "__ctr-sm4-aesni-avx",
+			.cra_name		= "ctr(sm4)",
+			.cra_driver_name	= "ctr-sm4-aesni-avx",
 			.cra_priority		= 400,
-			.cra_flags		= CRYPTO_ALG_INTERNAL,
 			.cra_blocksize		= 1,
 			.cra_ctxsize		= sizeof(struct sm4_ctx),
 			.cra_module		= THIS_MODULE,
@@ -315,36 +312,22 @@ static struct skcipher_alg sm4_aesni_avx_skciphers[] = {
 	}
 };
 
-static struct simd_skcipher_alg *
-simd_sm4_aesni_avx_skciphers[ARRAY_SIZE(sm4_aesni_avx_skciphers)];
-
 static int __init sm4_init(void)
 {
-	const char *feature_name;
-
 	if (!boot_cpu_has(X86_FEATURE_AVX) ||
-	    !boot_cpu_has(X86_FEATURE_AES) ||
-	    !boot_cpu_has(X86_FEATURE_OSXSAVE)) {
+	    !boot_cpu_has(X86_FEATURE_AES)) {
 		pr_info("AVX or AES-NI instructions are not detected.\n");
 		return -ENODEV;
 	}
 
-	if (!cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM,
-				&feature_name)) {
-		pr_info("CPU feature '%s' is not supported.\n", feature_name);
-		return -ENODEV;
-	}
-
-	return simd_register_skciphers_compat(sm4_aesni_avx_skciphers,
-					ARRAY_SIZE(sm4_aesni_avx_skciphers),
-					simd_sm4_aesni_avx_skciphers);
+	return crypto_register_skciphers(sm4_aesni_avx_skciphers,
+					 ARRAY_SIZE(sm4_aesni_avx_skciphers));
 }
 
 static void __exit sm4_exit(void)
 {
-	simd_unregister_skciphers(sm4_aesni_avx_skciphers,
-					ARRAY_SIZE(sm4_aesni_avx_skciphers),
-					simd_sm4_aesni_avx_skciphers);
+	crypto_unregister_skciphers(sm4_aesni_avx_skciphers,
+				    ARRAY_SIZE(sm4_aesni_avx_skciphers));
 }
 
 module_init(sm4_init);

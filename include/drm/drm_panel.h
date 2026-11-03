@@ -28,10 +28,14 @@
 #include <linux/errno.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/kref.h>
+
+#include <drm/drm_bridge.h>
 
 struct backlight_device;
 struct dentry;
 struct device_node;
+struct drm_bridge;
 struct drm_connector;
 struct drm_device;
 struct drm_panel_follower;
@@ -160,6 +164,20 @@ struct drm_panel_follower_funcs {
 	 * Called before the panel is powered off.
 	 */
 	int (*panel_unpreparing)(struct drm_panel_follower *follower);
+
+	/**
+	 * @panel_enabled:
+	 *
+	 * Called after the panel and the backlight have been enabled.
+	 */
+	int (*panel_enabled)(struct drm_panel_follower *follower);
+
+	/**
+	 * @panel_disabling:
+	 *
+	 * Called before the panel and the backlight are disabled.
+	 */
+	int (*panel_disabling)(struct drm_panel_follower *follower);
 };
 
 struct drm_panel_follower {
@@ -213,6 +231,22 @@ struct drm_panel {
 	 * Operations that can be performed on the panel.
 	 */
 	const struct drm_panel_funcs *funcs;
+
+	/**
+	 * @bridge:
+	 *
+	 * Bridge to access the panel features through the drm_bridge API.
+	 */
+	struct drm_bridge bridge;
+
+	/**
+	 * @connector:
+	 *
+	 * Connector instantiated by the bridge (only for legacy code not
+	 * yet using the drm_bridge_connector and
+	 * DRM_BRIDGE_ATTACH_NO_CONNECTOR).
+	 */
+	struct drm_connector connector;
 
 	/**
 	 * @connector_type:
@@ -269,39 +303,69 @@ struct drm_panel {
 	bool enabled;
 };
 
-void drm_panel_init(struct drm_panel *panel, struct device *dev,
-		    const struct drm_panel_funcs *funcs,
-		    int connector_type);
+void *__devm_drm_panel_alloc(struct device *dev, size_t size, size_t offset,
+			     const struct drm_panel_funcs *funcs,
+			     int connector_type);
+
+/**
+ * devm_drm_panel_alloc - Allocate and initialize a refcounted panel.
+ *
+ * @dev: struct device of the panel device
+ * @type: the type of the struct which contains struct &drm_panel
+ * @member: the name of the &drm_panel within @type
+ * @funcs: callbacks for this panel
+ * @connector_type: the connector type (DRM_MODE_CONNECTOR_*) corresponding to
+ * the panel interface
+ *
+ * The reference count of the returned panel is initialized to 1. This
+ * reference will be automatically dropped via devm (by calling
+ * drm_panel_put()) when @dev is removed.
+ *
+ * Returns:
+ * Pointer to container structure embedding the panel, ERR_PTR on failure.
+ */
+#define devm_drm_panel_alloc(dev, type, member, funcs, connector_type) \
+	((type *)__devm_drm_panel_alloc(dev, sizeof(type), \
+					offsetof(type, member), funcs, \
+					connector_type))
+
+struct drm_panel *drm_panel_get(struct drm_panel *panel);
+void drm_panel_put(struct drm_panel *panel);
 
 void drm_panel_add(struct drm_panel *panel);
 void drm_panel_remove(struct drm_panel *panel);
+int devm_drm_panel_add(struct device *dev, struct drm_panel *panel);
 
-int drm_panel_prepare(struct drm_panel *panel);
-int drm_panel_unprepare(struct drm_panel *panel);
+void drm_panel_prepare(struct drm_panel *panel);
+void drm_panel_unprepare(struct drm_panel *panel);
 
-int drm_panel_enable(struct drm_panel *panel);
-int drm_panel_disable(struct drm_panel *panel);
+void drm_panel_enable(struct drm_panel *panel);
+void drm_panel_disable(struct drm_panel *panel);
 
 int drm_panel_get_modes(struct drm_panel *panel, struct drm_connector *connector);
 
-#if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+#if defined(CONFIG_OF) && IS_ENABLED(CONFIG_DRM_PANEL)
 struct drm_panel *of_drm_find_panel(const struct device_node *np);
-int of_drm_get_panel_orientation(const struct device_node *np,
-				 enum drm_panel_orientation *orientation);
+int drm_of_find_panel_or_bridge(const struct device_node *np,
+				int port, int endpoint,
+				struct drm_panel **panel,
+				struct drm_bridge **bridge);
 #else
 static inline struct drm_panel *of_drm_find_panel(const struct device_node *np)
 {
 	return ERR_PTR(-ENODEV);
 }
 
-static inline int of_drm_get_panel_orientation(const struct device_node *np,
-					       enum drm_panel_orientation *orientation)
+static inline int drm_of_find_panel_or_bridge(const struct device_node *np,
+					      int port, int endpoint,
+					      struct drm_panel **panel,
+					      struct drm_bridge **bridge)
 {
-	return -ENODEV;
+	return -EINVAL;
 }
 #endif
 
-#if defined(CONFIG_DRM_PANEL)
+#if IS_ENABLED(CONFIG_DRM_PANEL)
 bool drm_is_panel_follower(struct device *dev);
 int drm_panel_add_follower(struct device *follower_dev,
 			   struct drm_panel_follower *follower);
@@ -335,6 +399,58 @@ int drm_panel_of_backlight(struct drm_panel *panel);
 static inline int drm_panel_of_backlight(struct drm_panel *panel)
 {
 	return 0;
+}
+#endif
+
+#ifdef CONFIG_DRM_PANEL_BRIDGE
+bool drm_bridge_is_panel(const struct drm_bridge *bridge);
+struct drm_bridge *drm_panel_bridge_add(struct drm_panel *panel);
+struct drm_bridge *drm_panel_bridge_add_typed(struct drm_panel *panel,
+					      u32 connector_type);
+void drm_panel_bridge_remove(struct drm_bridge *bridge);
+int drm_panel_bridge_set_orientation(struct drm_connector *connector,
+				     struct drm_bridge *bridge);
+struct drm_bridge *devm_drm_panel_bridge_add(struct device *dev,
+					     struct drm_panel *panel);
+struct drm_bridge *devm_drm_panel_bridge_add_typed(struct device *dev,
+						   struct drm_panel *panel,
+						   u32 connector_type);
+struct drm_bridge *drmm_panel_bridge_add(struct drm_device *drm,
+					 struct drm_panel *panel);
+struct drm_connector *drm_panel_bridge_connector(struct drm_bridge *bridge);
+#else
+static inline bool drm_bridge_is_panel(const struct drm_bridge *bridge)
+{
+	return false;
+}
+
+static inline int drm_panel_bridge_set_orientation(struct drm_connector *connector,
+						   struct drm_bridge *bridge)
+{
+	return -EINVAL;
+}
+#endif
+
+#if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL_BRIDGE)
+struct drm_bridge *devm_drm_of_get_bridge(struct device *dev, struct device_node *node,
+					  u32 port, u32 endpoint);
+struct drm_bridge *drmm_of_get_bridge(struct drm_device *drm, struct device_node *node,
+				      u32 port, u32 endpoint);
+#else
+static inline struct drm_bridge *devm_drm_of_get_bridge(struct device *dev,
+							struct device_node *node,
+							u32 port,
+							u32 endpoint)
+{
+	return ERR_PTR(-ENODEV);
+}
+
+static inline struct drm_bridge *drmm_of_get_bridge(struct drm_device *drm,
+						    struct device_node *node,
+						    u32 port,
+						    u32 endpoint)
+{
+	return ERR_PTR(-ENODEV);
 }
 #endif
 

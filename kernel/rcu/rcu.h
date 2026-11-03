@@ -46,16 +46,28 @@
  *					the number of pending readers that will use
  *					this inactive index is bounded).
  *
- * RCU polled GP special control value:
+ * RCU polled GP special control values:
  *
  *	RCU_GET_STATE_COMPLETED :	State value indicating an already-completed
  *					polled GP has completed.  This value covers
  *					both the state and the counter of the
  *					grace-period sequence number.
+ *
+ *	RCU_GET_STATE_NOT_TRACKED :	State value indicating that a GP component
+ *					is not tracked by this subsystem and should
+ *					not be checked.  Used by SRCU and RCU Tasks
+ *					which do not track expedited GPs, to prevent
+ *					false-positive completion when their
+ *					gp_seq entries are checked via
+ *					poll_state_synchronize_rcu_full().
  */
 
-/* Low-order bit definition for polled grace-period APIs. */
+/* Low-order bit definitions for polled grace-period APIs. */
 #define RCU_GET_STATE_COMPLETED	0x1
+#define RCU_GET_STATE_NOT_TRACKED	0x2
+
+/* A complete grace period count */
+#define RCU_SEQ_GP (RCU_SEQ_STATE_MASK + 1)
 
 extern int sysctl_sched_rt_runtime;
 
@@ -157,12 +169,21 @@ static inline bool rcu_seq_done(unsigned long *sp, unsigned long s)
  * Given a snapshot from rcu_seq_snap(), determine whether or not a
  * full update-side operation has occurred, but do not allow the
  * (ULONG_MAX / 2) safety-factor/guard-band.
+ *
+ * The token returned by get_state_synchronize_rcu_full() is based on
+ * rcu_state.gp_seq but it is tested in poll_state_synchronize_rcu_full()
+ * against the root rnp->gp_seq. Since rcu_seq_start() is first called
+ * on rcu_state.gp_seq and only later reflected on the root rnp->gp_seq,
+ * it is possible that rcu_seq_snap(rcu_state.gp_seq) returns 2 full grace
+ * periods ahead of the root rnp->gp_seq. To prevent false-positives with the
+ * full polling API that a wrap around instantly completed the GP, when nothing
+ * like that happened, adjust for the 2 GPs in the ULONG_CMP_LT().
  */
 static inline bool rcu_seq_done_exact(unsigned long *sp, unsigned long s)
 {
 	unsigned long cur_s = READ_ONCE(*sp);
 
-	return ULONG_CMP_GE(cur_s, s) || ULONG_CMP_LT(cur_s, s - (2 * RCU_SEQ_STATE_MASK + 1));
+	return ULONG_CMP_GE(cur_s, s) || ULONG_CMP_LT(cur_s, s - (2 * RCU_SEQ_GP));
 }
 
 /*
@@ -490,6 +511,15 @@ do {									\
 	___locked;							\
 })
 
+#define raw_spin_trylock_irqsave_rcu_node(p, flags)			\
+({									\
+	bool ___locked = raw_spin_trylock_irqsave(&ACCESS_PRIVATE(p, lock), flags); \
+									\
+	if (___locked)							\
+		smp_mb__after_unlock_lock();				\
+	___locked;							\
+})
+
 #define raw_lockdep_assert_held_rcu_node(p)				\
 	lockdep_assert_held(&ACCESS_PRIVATE(p, lock))
 
@@ -532,10 +562,6 @@ struct task_struct *get_rcu_tasks_rude_gp_kthread(void);
 void rcu_tasks_rude_get_gp_data(int *flags, unsigned long *gp_seq);
 #endif // # ifdef CONFIG_TASKS_RUDE_RCU
 
-#ifdef CONFIG_TASKS_TRACE_RCU
-void rcu_tasks_trace_get_gp_data(int *flags, unsigned long *gp_seq);
-#endif
-
 #ifdef CONFIG_TASKS_RCU_GENERIC
 void tasks_cblist_init_generic(void);
 #else /* #ifdef CONFIG_TASKS_RCU_GENERIC */
@@ -545,6 +571,20 @@ static inline void tasks_cblist_init_generic(void) { }
 #define RCU_SCHEDULER_INACTIVE	0
 #define RCU_SCHEDULER_INIT	1
 #define RCU_SCHEDULER_RUNNING	2
+
+/*
+ * Defer whenever interrupts are disabled, since a callback-list operation may
+ * be in flight on this CPU.  Not before the scheduler is up: irq_work is not
+ * usable that early, and rcu_init() itself calls call_rcu().
+ */
+static inline bool should_rcu_defer(void)
+{
+	return IS_ENABLED(CONFIG_RCU_DEFER) && irqs_disabled() &&
+	       rcu_scheduler_active != RCU_SCHEDULER_INACTIVE;
+}
+
+/* Drain an outgoing CPU's deferred SRCU callbacks; see rcutree_migrate_callbacks(). */
+void srcu_offline_drain(int cpu);
 
 enum rcutorture_type {
 	RCU_FLAVOR,
@@ -572,6 +612,8 @@ void do_trace_rcu_torture_read(const char *rcutorturename,
 			       unsigned long c_old,
 			       unsigned long c);
 void rcu_gp_set_torture_wait(int duration);
+void rcu_set_gpwrap_lag(unsigned long lag);
+int rcu_get_gpwrap_count(int cpu);
 #else
 static inline void rcutorture_get_gp_data(int *flags, unsigned long *gp_seq)
 {
@@ -589,7 +631,11 @@ void do_trace_rcu_torture_read(const char *rcutorturename,
 	do { } while (0)
 #endif
 static inline void rcu_gp_set_torture_wait(int duration) { }
+static inline void rcu_set_gpwrap_lag(unsigned long lag) { }
+static inline int rcu_get_gpwrap_count(int cpu) { return 0; }
 #endif
+unsigned long long rcutorture_gather_gp_seqs(void);
+void rcutorture_format_gp_seqs(unsigned long long seqs, char *cp, size_t len);
 
 #ifdef CONFIG_TINY_SRCU
 
@@ -611,8 +657,6 @@ void srcutorture_get_gp_data(struct srcu_struct *sp, int *flags,
 static inline bool rcu_watching_zero_in_eqs(int cpu, int *vp) { return false; }
 static inline unsigned long rcu_get_gp_seq(void) { return 0; }
 static inline unsigned long rcu_exp_batches_completed(void) { return 0; }
-static inline unsigned long
-srcu_batches_completed(struct srcu_struct *sp) { return 0; }
 static inline void rcu_force_quiescent_state(void) { }
 static inline bool rcu_check_boost_fail(unsigned long gp_state, int *cpup) { return true; }
 static inline void show_rcu_gp_kthreads(void) { }
@@ -624,7 +668,6 @@ static inline void rcu_gp_slow_unregister(atomic_t *rgssp) { }
 bool rcu_watching_zero_in_eqs(int cpu, int *vp);
 unsigned long rcu_get_gp_seq(void);
 unsigned long rcu_exp_batches_completed(void);
-unsigned long srcu_batches_completed(struct srcu_struct *sp);
 bool rcu_check_boost_fail(unsigned long gp_state, int *cpup);
 void show_rcu_gp_kthreads(void);
 int rcu_get_gp_kthreads_prio(void);
@@ -635,6 +678,12 @@ extern struct kthread_worker *rcu_exp_gp_kworker;
 void rcu_gp_slow_register(atomic_t *rgssp);
 void rcu_gp_slow_unregister(atomic_t *rgssp);
 #endif /* #else #ifdef CONFIG_TINY_RCU */
+
+#ifdef CONFIG_TINY_SRCU
+static inline unsigned long srcu_batches_completed(struct srcu_struct *sp) { return 0; }
+#else // #ifdef CONFIG_TINY_SRCU
+unsigned long srcu_batches_completed(struct srcu_struct *sp);
+#endif // #else // #ifdef CONFIG_TINY_SRCU
 
 #ifdef CONFIG_RCU_NOCB_CPU
 void rcu_bind_current_to_nocb(void);
@@ -652,11 +701,6 @@ void show_rcu_tasks_rude_gp_kthread(void);
 #else
 static inline void show_rcu_tasks_rude_gp_kthread(void) {}
 #endif
-#if !defined(CONFIG_TINY_RCU) && defined(CONFIG_TASKS_TRACE_RCU)
-void show_rcu_tasks_trace_gp_kthread(void);
-#else
-static inline void show_rcu_tasks_trace_gp_kthread(void) {}
-#endif
 
 #ifdef CONFIG_TINY_RCU
 static inline bool rcu_cpu_beenfullyonline(int cpu) { return true; }
@@ -669,5 +713,16 @@ int rcu_stall_notifier_call_chain(unsigned long val, void *v);
 #else // #if defined(CONFIG_RCU_STALL_COMMON) && defined(CONFIG_RCU_CPU_STALL_NOTIFIER)
 static inline int rcu_stall_notifier_call_chain(unsigned long val, void *v) { return NOTIFY_DONE; }
 #endif // #else // #if defined(CONFIG_RCU_STALL_COMMON) && defined(CONFIG_RCU_CPU_STALL_NOTIFIER)
+
+#ifdef CONFIG_TRIVIAL_PREEMPT_RCU
+void synchronize_rcu_trivial_preempt(void);
+#endif // #ifdef CONFIG_TRIVIAL_PREEMPT_RCU
+
+#if defined(CONFIG_RCU_TORTURE_TEST) && defined(CONFIG_RCU_BOOST)
+bool rcu_is_task_rcu_boosted(void);
+#else // #if defined(CONFIG_RCU_TORTURE_TEST) && defined(CONFIG_RCU_BOOST)
+static inline bool rcu_is_task_rcu_boosted(void) { return false; }
+#endif // #else // #if defined(CONFIG_RCU_TORTURE_TEST) && defined(CONFIG_RCU_BOOST)
+
 
 #endif /* __LINUX_RCU_H */

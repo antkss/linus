@@ -48,7 +48,7 @@ static void uvd_v6_0_set_irq_funcs(struct amdgpu_device *adev);
 static int uvd_v6_0_start(struct amdgpu_device *adev);
 static void uvd_v6_0_stop(struct amdgpu_device *adev);
 static void uvd_v6_0_set_sw_clock_gating(struct amdgpu_device *adev);
-static int uvd_v6_0_set_clockgating_state(void *handle,
+static int uvd_v6_0_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state);
 static void uvd_v6_0_enable_mgcg(struct amdgpu_device *adev,
 				 bool enable);
@@ -217,7 +217,9 @@ static int uvd_v6_0_enc_get_create_msg(struct amdgpu_ring *ring, uint32_t handle
 	int i, r;
 
 	r = amdgpu_job_alloc_with_ib(ring->adev, NULL, NULL, ib_size_dw * 4,
-				     AMDGPU_IB_POOL_DIRECT, &job);
+				     AMDGPU_IB_POOL_DIRECT,
+				     AMDGPU_KERNEL_JOB_ID_VCN_RING_TEST,
+				     &job);
 	if (r)
 		return r;
 
@@ -281,7 +283,9 @@ static int uvd_v6_0_enc_get_destroy_msg(struct amdgpu_ring *ring,
 	int i, r;
 
 	r = amdgpu_job_alloc_with_ib(ring->adev, NULL, NULL, ib_size_dw * 4,
-				     AMDGPU_IB_POOL_DIRECT, &job);
+				     AMDGPU_IB_POOL_DIRECT,
+				     AMDGPU_KERNEL_JOB_ID_VCN_RING_TEST,
+				     &job);
 	if (r)
 		return r;
 
@@ -406,7 +410,7 @@ static int uvd_v6_0_sw_init(struct amdgpu_ip_block *ip_block)
 		adev->uvd.inst->irq.num_types = 1;
 		adev->uvd.num_enc_rings = 0;
 
-		DRM_INFO("UVD ENC is disabled\n");
+		drm_info(adev_to_drm(adev), "UVD ENC is disabled\n");
 	}
 
 	ring = &adev->uvd.inst->ring;
@@ -467,7 +471,7 @@ static int uvd_v6_0_hw_init(struct amdgpu_ip_block *ip_block)
 	int i, r;
 
 	amdgpu_asic_set_uvd_clocks(adev, 10000, 10000);
-	uvd_v6_0_set_clockgating_state(adev, AMD_CG_STATE_UNGATE);
+	uvd_v6_0_set_clockgating_state(ip_block, AMD_CG_STATE_UNGATE);
 	uvd_v6_0_enable_mgcg(adev, true);
 
 	r = amdgpu_ring_test_helper(ring);
@@ -476,7 +480,7 @@ static int uvd_v6_0_hw_init(struct amdgpu_ip_block *ip_block)
 
 	r = amdgpu_ring_alloc(ring, 10);
 	if (r) {
-		DRM_ERROR("amdgpu: ring failed to lock UVD ring (%d).\n", r);
+		drm_err(adev_to_drm(adev), "ring alloc failed (%d).\n", r);
 		goto done;
 	}
 
@@ -513,9 +517,9 @@ static int uvd_v6_0_hw_init(struct amdgpu_ip_block *ip_block)
 done:
 	if (!r) {
 		if (uvd_v6_0_enc_support(adev))
-			DRM_INFO("UVD and UVD ENC initialized successfully.\n");
+			drm_info(adev_to_drm(adev), "UVD and UVD ENC initialized successfully.\n");
 		else
-			DRM_INFO("UVD initialized successfully.\n");
+			drm_info(adev_to_drm(adev), "UVD initialized successfully.\n");
 	}
 
 	return r;
@@ -1143,9 +1147,9 @@ static void uvd_v6_0_enc_ring_emit_vm_flush(struct amdgpu_ring *ring,
 	amdgpu_ring_write(ring, vmid);
 }
 
-static bool uvd_v6_0_is_idle(void *handle)
+static bool uvd_v6_0_is_idle(struct amdgpu_ip_block *ip_block)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	return !(RREG32(mmSRBM_STATUS) & SRBM_STATUS__UVD_BUSY_MASK);
 }
@@ -1156,43 +1160,13 @@ static int uvd_v6_0_wait_for_idle(struct amdgpu_ip_block *ip_block)
 	struct amdgpu_device *adev = ip_block->adev;
 
 	for (i = 0; i < adev->usec_timeout; i++) {
-		if (uvd_v6_0_is_idle(adev))
+		if (uvd_v6_0_is_idle(ip_block))
 			return 0;
 	}
 	return -ETIMEDOUT;
 }
 
 #define AMDGPU_UVD_STATUS_BUSY_MASK    0xfd
-static bool uvd_v6_0_check_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	struct amdgpu_device *adev = ip_block->adev;
-	u32 srbm_soft_reset = 0;
-	u32 tmp = RREG32(mmSRBM_STATUS);
-
-	if (REG_GET_FIELD(tmp, SRBM_STATUS, UVD_RQ_PENDING) ||
-	    REG_GET_FIELD(tmp, SRBM_STATUS, UVD_BUSY) ||
-	    (RREG32(mmUVD_STATUS) & AMDGPU_UVD_STATUS_BUSY_MASK))
-		srbm_soft_reset = REG_SET_FIELD(srbm_soft_reset, SRBM_SOFT_RESET, SOFT_RESET_UVD, 1);
-
-	if (srbm_soft_reset) {
-		adev->uvd.inst->srbm_soft_reset = srbm_soft_reset;
-		return true;
-	} else {
-		adev->uvd.inst->srbm_soft_reset = 0;
-		return false;
-	}
-}
-
-static int uvd_v6_0_pre_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	struct amdgpu_device *adev = ip_block->adev;
-
-	if (!adev->uvd.inst->srbm_soft_reset)
-		return 0;
-
-	uvd_v6_0_stop(adev);
-	return 0;
-}
 
 static int uvd_v6_0_soft_reset(struct amdgpu_ip_block *ip_block)
 {
@@ -1223,18 +1197,6 @@ static int uvd_v6_0_soft_reset(struct amdgpu_ip_block *ip_block)
 	}
 
 	return 0;
-}
-
-static int uvd_v6_0_post_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	struct amdgpu_device *adev = ip_block->adev;
-
-	if (!adev->uvd.inst->srbm_soft_reset)
-		return 0;
-
-	mdelay(5);
-
-	return uvd_v6_0_start(adev);
 }
 
 static int uvd_v6_0_set_interrupt_state(struct amdgpu_device *adev,
@@ -1450,16 +1412,11 @@ static void uvd_v6_0_enable_mgcg(struct amdgpu_device *adev,
 	}
 }
 
-static int uvd_v6_0_set_clockgating_state(void *handle,
+static int uvd_v6_0_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
-	struct amdgpu_ip_block *ip_block;
+	struct amdgpu_device *adev = ip_block->adev;
 	bool enable = (state == AMD_CG_STATE_GATE);
-
-	ip_block = amdgpu_device_ip_get_ip_block(adev, AMD_IP_BLOCK_TYPE_UVD);
-	if (!ip_block)
-		return -EINVAL;
 
 	if (enable) {
 		/* wait for STATUS to clear */
@@ -1476,7 +1433,7 @@ static int uvd_v6_0_set_clockgating_state(void *handle,
 	return 0;
 }
 
-static int uvd_v6_0_set_powergating_state(void *handle,
+static int uvd_v6_0_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	/* This doesn't actually powergate the UVD block.
@@ -1486,7 +1443,7 @@ static int uvd_v6_0_set_powergating_state(void *handle,
 	 * revisit this when there is a cleaner line between
 	 * the smc and the hw blocks
 	 */
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	int ret = 0;
 
 	WREG32(mmUVD_POWER_STATUS, UVD_POWER_STATUS__UVD_PG_EN_MASK);
@@ -1503,9 +1460,9 @@ out:
 	return ret;
 }
 
-static void uvd_v6_0_get_clockgating_state(void *handle, u64 *flags)
+static void uvd_v6_0_get_clockgating_state(struct amdgpu_ip_block *ip_block, u64 *flags)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 	int data;
 
 	mutex_lock(&adev->pm.mutex);
@@ -1516,7 +1473,7 @@ static void uvd_v6_0_get_clockgating_state(void *handle, u64 *flags)
 		data = RREG32_SMC(ixCURRENT_PG_STATUS);
 
 	if (data & CURRENT_PG_STATUS__UVD_PG_STATUS_MASK) {
-		DRM_INFO("Cannot get clockgating state when UVD is powergated.\n");
+		drm_info(adev_to_drm(adev), "Cannot get clockgating state when UVD is powergated.\n");
 		goto out;
 	}
 
@@ -1539,12 +1496,8 @@ static const struct amd_ip_funcs uvd_v6_0_ip_funcs = {
 	.prepare_suspend = uvd_v6_0_prepare_suspend,
 	.suspend = uvd_v6_0_suspend,
 	.resume = uvd_v6_0_resume,
-	.is_idle = uvd_v6_0_is_idle,
 	.wait_for_idle = uvd_v6_0_wait_for_idle,
-	.check_soft_reset = uvd_v6_0_check_soft_reset,
-	.pre_soft_reset = uvd_v6_0_pre_soft_reset,
 	.soft_reset = uvd_v6_0_soft_reset,
-	.post_soft_reset = uvd_v6_0_post_soft_reset,
 	.set_clockgating_state = uvd_v6_0_set_clockgating_state,
 	.set_powergating_state = uvd_v6_0_set_powergating_state,
 	.get_clockgating_state = uvd_v6_0_get_clockgating_state,
@@ -1636,10 +1589,10 @@ static void uvd_v6_0_set_ring_funcs(struct amdgpu_device *adev)
 {
 	if (adev->asic_type >= CHIP_POLARIS10) {
 		adev->uvd.inst->ring.funcs = &uvd_v6_0_ring_vm_funcs;
-		DRM_INFO("UVD is enabled in VM mode\n");
+		drm_info(adev_to_drm(adev), "UVD is enabled in VM mode\n");
 	} else {
 		adev->uvd.inst->ring.funcs = &uvd_v6_0_ring_phys_funcs;
-		DRM_INFO("UVD is enabled in physical mode\n");
+		drm_info(adev_to_drm(adev), "UVD is enabled in physical mode\n");
 	}
 }
 
@@ -1650,7 +1603,7 @@ static void uvd_v6_0_set_enc_ring_funcs(struct amdgpu_device *adev)
 	for (i = 0; i < adev->uvd.num_enc_rings; ++i)
 		adev->uvd.inst->ring_enc[i].funcs = &uvd_v6_0_enc_ring_vm_funcs;
 
-	DRM_INFO("UVD ENC is enabled in VM mode\n");
+	drm_info(adev_to_drm(adev), "UVD ENC is enabled in VM mode\n");
 }
 
 static const struct amdgpu_irq_src_funcs uvd_v6_0_irq_funcs = {

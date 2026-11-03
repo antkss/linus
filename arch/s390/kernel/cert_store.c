@@ -138,7 +138,7 @@ static void cert_store_key_describe(const struct key *key, struct seq_file *m)
 	 * First 64 bytes of the key description is key name in EBCDIC CP 500.
 	 * Convert it to ASCII for displaying in /proc/keys.
 	 */
-	strscpy(ascii, key->description, sizeof(ascii));
+	strscpy(ascii, key->description);
 	EBCASC_500(ascii, VC_NAME_LEN_BYTES);
 	seq_puts(m, ascii);
 
@@ -235,10 +235,10 @@ static int __diag320(unsigned long subcode, void *addr)
 {
 	union register_pair rp = { .even = (unsigned long)addr, };
 
-	asm volatile(
-		"	diag	%[rp],%[subcode],0x320\n"
-		"0:	nopr	%%r7\n"
-		EX_TABLE(0b, 0b)
+	asm_inline volatile(
+		"0:	diag	%[rp],%[subcode],0x320\n"
+		"1:\n"
+		EX_TABLE_INSN(0b, 1b)
 		: [rp] "+d" (rp.pair)
 		: [subcode] "d" (subcode)
 		: "cc", "memory");
@@ -322,7 +322,7 @@ static int invalidate_keyring_keys(struct key *keyring)
 
 	keyring_payload_len = key_type_keyring.read(keyring, NULL, 0);
 	num_keys = keyring_payload_len / sizeof(key_serial_t);
-	key_array = kcalloc(num_keys, sizeof(key_serial_t), GFP_KERNEL);
+	key_array = kzalloc_objs(key_serial_t, num_keys);
 	if (!key_array)
 		return -ENOMEM;
 

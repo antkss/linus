@@ -29,6 +29,10 @@
 
 #define __KVM_HAVE_ARCH_VCPU_DEBUGFS
 
+#if defined(CONFIG_KVM_BOOK3S_HV_POSSIBLE) && !defined(CONFIG_KVM_BOOK3S_PR_POSSIBLE)
+#define __KVM_NO_MMIO
+#endif
+
 #define KVM_MAX_VCPUS		NR_CPUS
 #define KVM_MAX_VCORES		NR_CPUS
 
@@ -49,6 +53,9 @@
 #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
 
 #define __KVM_HAVE_ARCH_INTC_INITIALIZED
+#ifdef CONFIG_KVM_MPIC
+#define __KVM_HAVE_MSI
+#endif
 
 #define KVM_HALT_POLL_NS_DEFAULT 10000	/* 10 us */
 
@@ -902,7 +909,6 @@ struct kvm_vcpu_arch {
 #define __KVM_HAVE_ARCH_WQP
 #define __KVM_HAVE_CREATE_DEVICE
 
-static inline void kvm_arch_sync_events(struct kvm *kvm) {}
 static inline void kvm_arch_memslots_updated(struct kvm *kvm, u64 gen) {}
 static inline void kvm_arch_flush_shadow_all(struct kvm *kvm) {}
 static inline void kvm_arch_vcpu_blocking(struct kvm_vcpu *vcpu) {}

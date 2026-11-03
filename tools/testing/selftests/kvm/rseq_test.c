@@ -75,7 +75,7 @@ static void *migration_worker(void *__rseq_tid)
 {
 	pid_t rseq_tid = (pid_t)(unsigned long)__rseq_tid;
 	cpu_set_t allowed_mask;
-	int r, i, cpu;
+	int i, cpu;
 
 	CPU_ZERO(&allowed_mask);
 
@@ -96,9 +96,7 @@ static void *migration_worker(void *__rseq_tid)
 		 * stable, i.e. while changing affinity is in-progress.
 		 */
 		smp_wmb();
-		r = sched_setaffinity(rseq_tid, sizeof(allowed_mask), &allowed_mask);
-		TEST_ASSERT(!r, "sched_setaffinity failed, errno = %d (%s)",
-			    errno, strerror(errno));
+		kvm_sched_setaffinity(rseq_tid, sizeof(allowed_mask), &allowed_mask);
 		smp_wmb();
 		atomic_inc(&seq_cnt);
 
@@ -196,25 +194,28 @@ static void calc_min_max_cpu(void)
 static void help(const char *name)
 {
 	puts("");
-	printf("usage: %s [-h] [-u]\n", name);
+	printf("usage: %s [-h] [-u] [-l latency]\n", name);
 	printf(" -u: Don't sanity check the number of successful KVM_RUNs\n");
+	printf(" -l: Set /dev/cpu_dma_latency to suppress deep sleep states\n");
 	puts("");
 	exit(0);
 }
 
 int main(int argc, char *argv[])
 {
+	int r, i, snapshot, opt, fd = -1, latency = -1;
 	bool skip_sanity_check = false;
-	int r, i, snapshot;
 	struct kvm_vm *vm;
 	struct kvm_vcpu *vcpu;
 	u32 cpu, rseq_cpu;
-	int opt;
 
-	while ((opt = getopt(argc, argv, "hu")) != -1) {
+	while ((opt = getopt(argc, argv, "hl:u")) != -1) {
 		switch (opt) {
 		case 'u':
 			skip_sanity_check = true;
+			break;
+		case 'l':
+			latency = atoi_paranoid(optarg);
 			break;
 		case 'h':
 		default:
@@ -223,9 +224,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	r = sched_getaffinity(0, sizeof(possible_mask), &possible_mask);
-	TEST_ASSERT(!r, "sched_getaffinity failed, errno = %d (%s)", errno,
-		    strerror(errno));
+	kvm_sched_getaffinity(0, sizeof(possible_mask), &possible_mask);
 
 	calc_min_max_cpu();
 
@@ -240,8 +239,22 @@ int main(int argc, char *argv[])
 	 */
 	vm = vm_create_with_one_vcpu(&vcpu, guest_code);
 
-	pthread_create(&migration_thread, NULL, migration_worker,
-		       (void *)(unsigned long)syscall(SYS_gettid));
+	kvm_pthread_create(&migration_thread, NULL, migration_worker,
+			   (void *)(unsigned long)kvm_gettid());
+
+	if (latency >= 0) {
+		/*
+		 * Writes to cpu_dma_latency persist only while the file is
+		 * open, i.e. it allows userspace to provide guaranteed latency
+		 * while running a workload.  Keep the file open until the test
+		 * completes, otherwise writing cpu_dma_latency is meaningless.
+		 */
+		fd = open("/dev/cpu_dma_latency", O_RDWR);
+		TEST_ASSERT(fd >= 0, __KVM_SYSCALL_ERROR("open() /dev/cpu_dma_latency", fd));
+
+		r = write(fd, &latency, 4);
+		TEST_ASSERT(r >= 1, "Error setting /dev/cpu_dma_latency");
+	}
 
 	for (i = 0; !done; i++) {
 		vcpu_run(vcpu);
@@ -278,6 +291,9 @@ int main(int argc, char *argv[])
 			    "rseq CPU = %d, sched CPU = %d", rseq_cpu, cpu);
 	}
 
+	if (fd > 0)
+		close(fd);
+
 	/*
 	 * Sanity check that the test was able to enter the guest a reasonable
 	 * number of times, e.g. didn't get stalled too often/long waiting for
@@ -293,10 +309,10 @@ int main(int argc, char *argv[])
 	TEST_ASSERT(skip_sanity_check || i > (NR_TASK_MIGRATIONS / 2),
 		    "Only performed %d KVM_RUNs, task stalled too much?\n\n"
 		    "  Try disabling deep sleep states to reduce CPU wakeup latency,\n"
-		    "  e.g. via cpuidle.off=1 or setting /dev/cpu_dma_latency to '0',\n"
-		    "  or run with -u to disable this sanity check.", i);
+		    "  e.g. via cpuidle.off=1 or via -l <latency>, or run with -u to\n"
+		    "  disable this sanity check.", i);
 
-	pthread_join(migration_thread, NULL);
+	kvm_pthread_join(migration_thread, NULL);
 
 	kvm_vm_free(vm);
 

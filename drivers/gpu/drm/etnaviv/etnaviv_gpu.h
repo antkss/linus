@@ -93,6 +93,7 @@ struct etnaviv_event {
 struct etnaviv_cmdbuf_suballoc;
 struct regulator;
 struct clk;
+struct reset_control;
 
 #define ETNA_NR_EVENTS 30
 
@@ -158,6 +159,7 @@ struct etnaviv_gpu {
 	struct clk *clk_reg;
 	struct clk *clk_core;
 	struct clk *clk_shader;
+	struct reset_control *rst;
 
 	unsigned int freq_scale;
 	unsigned int fe_waitcycles;
@@ -200,6 +202,12 @@ static inline void gpu_write_power(struct etnaviv_gpu *gpu, u32 reg, u32 data)
 static inline u32 gpu_read_power(struct etnaviv_gpu *gpu, u32 reg)
 {
 	return readl(gpu->mmio + gpu_fix_power_address(gpu, reg));
+}
+
+static inline void gpu_write_power_sync(struct etnaviv_gpu *gpu, u32 reg, u32 data)
+{
+	gpu_write_power(gpu, reg, data);
+	gpu_read_power(gpu, reg);
 }
 
 int etnaviv_gpu_get_param(struct etnaviv_gpu *gpu, u32 param, u64 *value);

@@ -6,7 +6,6 @@
 #include <linux/clk-provider.h>
 #include <linux/platform_device.h>
 #include <linux/module.h>
-#include <linux/of_address.h>
 #include <linux/regmap.h>
 
 #include <dt-bindings/clock/qcom,lpass-sdm845.h>
@@ -145,17 +144,7 @@ static struct platform_driver lpass_cc_sdm845_driver = {
 	},
 };
 
-static int __init lpass_cc_sdm845_init(void)
-{
-	return platform_driver_register(&lpass_cc_sdm845_driver);
-}
-subsys_initcall(lpass_cc_sdm845_init);
-
-static void __exit lpass_cc_sdm845_exit(void)
-{
-	platform_driver_unregister(&lpass_cc_sdm845_driver);
-}
-module_exit(lpass_cc_sdm845_exit);
+subsys_platform_driver(lpass_cc_sdm845_driver);
 
 MODULE_DESCRIPTION("QTI LPASS_CC SDM845 Driver");
 MODULE_LICENSE("GPL v2");

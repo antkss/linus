@@ -33,6 +33,8 @@ The following registers are defined:
     highest PSCI version implemented by KVM and compatible with v0.2)
   - Allows any PSCI version implemented by KVM and compatible with
     v0.2 to be set with SET_ONE_REG
+  - Returns -EINVAL for a version below v1.1 on a protected VM (see
+    Documentation/virt/kvm/arm/pkvm.rst)
   - Affects the whole VM (even if the register view is per-vcpu)
 
 * KVM_REG_ARM_SMCCC_ARCH_WORKAROUND_1:
@@ -116,7 +118,7 @@ The pseudo-firmware bitmap register are as follows:
       ARM DEN0057A.
 
 * KVM_REG_ARM_VENDOR_HYP_BMAP:
-    Controls the bitmap of the Vendor specific Hypervisor Service Calls.
+    Controls the bitmap of the Vendor specific Hypervisor Service Calls[0-63].
 
   The following bits are accepted:
 
@@ -126,6 +128,19 @@ The pseudo-firmware bitmap register are as follows:
 
     Bit-1: KVM_REG_ARM_VENDOR_HYP_BIT_PTP:
       The bit represents the Precision Time Protocol KVM service.
+
+* KVM_REG_ARM_VENDOR_HYP_BMAP_2:
+    Controls the bitmap of the Vendor specific Hypervisor Service Calls[64-127].
+
+  The following bits are accepted:
+
+    Bit-0: KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_VER
+      This represents the ARM_SMCCC_VENDOR_HYP_KVM_DISCOVER_IMPL_VER_FUNC_ID
+      function-id. This is reset to 0.
+
+    Bit-1: KVM_REG_ARM_VENDOR_HYP_BIT_DISCOVER_IMPL_CPUS
+      This represents the ARM_SMCCC_VENDOR_HYP_KVM_DISCOVER_IMPL_CPUS_FUNC_ID
+      function-id. This is reset to 0.
 
 Errors:
 

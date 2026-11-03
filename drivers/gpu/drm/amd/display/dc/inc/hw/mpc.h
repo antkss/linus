@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-15 Advanced Micro Devices, Inc.
+ * Copyright 2012-2026 Advanced Micro Devices, Inc.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -54,6 +54,7 @@
 #include "dc_hw_types.h"
 #include "hw_shared.h"
 #include "transform.h"
+#include "dc_types.h"
 
 #define MAX_MPCC 6
 #define MAX_OPP 6
@@ -65,7 +66,6 @@ enum mpc_output_csc_mode {
 	MPC_OUTPUT_CSC_COEF_A,
 	MPC_OUTPUT_CSC_COEF_B
 };
-
 
 enum mpcc_blend_mode {
 	MPCC_BLEND_MODE_BYPASS,
@@ -102,17 +102,20 @@ enum mpcc_movable_cm_location {
 	MPCC_MOVABLE_CM_LOCATION_AFTER,
 };
 
-enum MCM_LUT_XABLE {
-	MCM_LUT_DISABLE,
-	MCM_LUT_DISABLED = MCM_LUT_DISABLE,
-	MCM_LUT_ENABLE,
-	MCM_LUT_ENABLED = MCM_LUT_ENABLE,
-};
-
 enum MCM_LUT_ID {
 	MCM_LUT_3DLUT,
 	MCM_LUT_1DLUT,
 	MCM_LUT_SHAPER
+};
+
+struct mpc_fl_3dlut_config {
+	bool enabled;
+	enum dc_cm_lut_size size;
+	bool select_lut_bank_a;
+	uint16_t bit_depth;
+	int hubp_index;
+	uint16_t bias;
+	uint16_t scale;
 };
 
 union mcm_lut_params {
@@ -278,6 +281,7 @@ struct mpc_tree {
 struct mpc {
 	const struct mpc_funcs *funcs;
 	struct dc_context *ctx;
+	int inst;
 
 	struct mpcc mpcc_array[MAX_MPCC];
 	struct pwl_params blender_params;
@@ -303,6 +307,15 @@ struct mpcc_state {
 	struct mpc_grph_gamut_adjustment gamut_remap;
 };
 
+struct dcn_mpc_reg_state {
+	uint32_t mpcc_bot_sel;
+	uint32_t mpcc_control;
+	uint32_t mpcc_status;
+	uint32_t mpcc_top_sel;
+	uint32_t mpcc_opp_id;
+	uint32_t mpcc_ogam_control;
+};
+
 /**
  * struct mpc_funcs - funcs
  */
@@ -326,6 +339,24 @@ struct mpc_funcs {
 			struct mpc *mpc,
 			int mpcc_inst,
 			struct mpcc_state *s);
+	/**
+    * @mpc_read_reg_state:
+    *
+    * Read MPC register state for debugging underflow purposes.
+    *
+    * Parameters:
+    *
+    * - [in] mpc - MPC context
+    * - [out] reg_state - MPC register state structure
+    *
+    * Return:
+    *
+    * void
+    */
+	void (*mpc_read_reg_state)(
+			struct mpc *mpc,
+			int mpcc_inst,
+			struct dcn_mpc_reg_state *mpc_reg_state);
 
 	/**
 	* @insert_plane:
@@ -967,6 +998,7 @@ struct mpc_funcs {
 	*/
 
 	void (*update_3dlut_fast_load_select)(struct mpc *mpc, int mpcc_id, int hubp_idx);
+
 	/**
 	* @get_3dlut_fast_load_status:
 	*
@@ -1001,8 +1033,11 @@ struct mpc_funcs {
 	*
 	* void
 	*/
-	void (*populate_lut)(struct mpc *mpc, const enum MCM_LUT_ID id, const union mcm_lut_params params,
-			bool lut_bank_a, int mpcc_id);
+	void (*populate_lut)(struct mpc *mpc,
+			const enum MCM_LUT_ID id,
+			const union mcm_lut_params *params,
+			const bool lut_bank_a,
+			const int mpcc_id);
 
 	/**
 	* @program_lut_read_write_control:
@@ -1013,13 +1048,18 @@ struct mpc_funcs {
 	* - [in/out] mpc - MPC context.
 	* - [in] id
 	* - [in] lut_bank_a
+	* - [in] bit_depth
 	* - [in] mpcc_id
 	*
 	* Return:
 	*
 	* void
 	*/
-	void (*program_lut_read_write_control)(struct mpc *mpc, const enum MCM_LUT_ID id, bool lut_bank_a, int mpcc_id);
+	void (*program_lut_read_write_control)(struct mpc *mpc,
+		const enum MCM_LUT_ID id,
+		const bool lut_bank_a,
+		const unsigned int bit_depth,
+		const int mpcc_id);
 
 	/**
 	* @program_lut_mode:
@@ -1029,31 +1069,44 @@ struct mpc_funcs {
 	* Parameters:
 	* - [in/out] mpc - MPC context.
 	* - [in] id
-	* - [in] xable
+	* - [in] enable
 	* - [in] lut_bank_a
+	* - [in] size
 	* - [in] mpcc_id
 	*
 	* Return:
 	*
 	* void
 	*/
-	void (*program_lut_mode)(struct mpc *mpc, const enum MCM_LUT_ID id, const enum MCM_LUT_XABLE xable,
-			bool lut_bank_a, int mpcc_id);
+	void (*program_lut_mode)(struct mpc *mpc,
+			const enum MCM_LUT_ID id,
+			const bool enable,
+			const bool lut_bank_a,
+			const enum dc_cm_lut_size size,
+			const int mpcc_id);
+
+
 	/**
-	* @program_3dlut_size:
+	* @get_lut_mode:
 	*
-	* Program 3D LUT size.
+	* Obtains enablement and ram bank status.
 	*
 	* Parameters:
 	* - [in/out] mpc - MPC context.
-	* - [in] is_17x17x17 - is 3dlut 17x17x17
+	* - [in] id
 	* - [in] mpcc_id
+	* - [out] enable
+	* - [out] lut_bank_a
 	*
 	* Return:
 	*
 	* void
 	*/
-	void (*program_3dlut_size)(struct mpc *mpc, bool is_17x17x17, int mpcc_id);
+	void (*get_lut_mode)(struct mpc *mpc,
+			const enum MCM_LUT_ID id,
+			const int mpcc_id,
+			bool *enable,
+			bool *lut_bank_a);
 };
 
 #endif

@@ -4,8 +4,12 @@
 
 #ifdef CONFIG_X86_CPU_RESCTRL
 
-#include <linux/sched.h>
 #include <linux/jump_label.h>
+#include <linux/percpu.h>
+#include <linux/resctrl_types.h>
+#include <linux/sched.h>
+
+#include <asm/msr.h>
 
 /*
  * This value can never be a valid CLOSID, and is used when mapping a
@@ -96,8 +100,9 @@ static inline void resctrl_arch_disable_mon(void)
 static inline void __resctrl_sched_in(struct task_struct *tsk)
 {
 	struct resctrl_pqr_state *state = this_cpu_ptr(&pqr_state);
-	u32 closid = state->default_closid;
-	u32 rmid = state->default_rmid;
+	u32 closid = READ_ONCE(state->default_closid);
+	u32 rmid = READ_ONCE(state->default_rmid);
+	struct msr val;
 	u32 tmp;
 
 	/*
@@ -119,7 +124,9 @@ static inline void __resctrl_sched_in(struct task_struct *tsk)
 	if (closid != state->cur_closid || rmid != state->cur_rmid) {
 		state->cur_closid = closid;
 		state->cur_rmid = rmid;
-		wrmsr(MSR_IA32_PQR_ASSOC, rmid, closid);
+		val.l = rmid;
+		val.h = closid;
+		wrmsrq(MSR_IA32_PQR_ASSOC, val.q);
 	}
 }
 
@@ -130,6 +137,13 @@ static inline unsigned int resctrl_arch_round_mon_val(unsigned int val)
 	/* h/w works in units of "boot_cpu_data.x86_cache_occ_scale" */
 	val /= scale;
 	return val * scale;
+}
+
+static inline void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid,
+							    u32 rmid)
+{
+	WRITE_ONCE(per_cpu(pqr_state.default_closid, cpu), closid);
+	WRITE_ONCE(per_cpu(pqr_state.default_rmid, cpu), rmid);
 }
 
 static inline void resctrl_arch_set_closid_rmid(struct task_struct *tsk,
@@ -150,7 +164,7 @@ static inline bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 ignored,
 	return READ_ONCE(tsk->rmid) == rmid;
 }
 
-static inline void resctrl_sched_in(struct task_struct *tsk)
+static inline void resctrl_arch_sched_in(struct task_struct *tsk)
 {
 	if (static_branch_likely(&rdt_enable_key))
 		__resctrl_sched_in(tsk);
@@ -169,20 +183,22 @@ static inline u32 resctrl_arch_rmid_idx_encode(u32 ignored, u32 rmid)
 
 /* x86 can always read an rmid, nothing needs allocating */
 struct rdt_resource;
-static inline void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r, int evtid)
+static inline void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r,
+					       enum resctrl_event_id evtid)
 {
 	might_sleep();
 	return NULL;
-};
+}
 
-static inline void resctrl_arch_mon_ctx_free(struct rdt_resource *r, int evtid,
-					     void *ctx) { };
+static inline void resctrl_arch_mon_ctx_free(struct rdt_resource *r,
+					     enum resctrl_event_id evtid,
+					     void *ctx) { }
 
 void resctrl_cpu_detect(struct cpuinfo_x86 *c);
 
 #else
 
-static inline void resctrl_sched_in(struct task_struct *tsk) {}
+static inline void resctrl_arch_sched_in(struct task_struct *tsk) {}
 static inline void resctrl_cpu_detect(struct cpuinfo_x86 *c) {}
 
 #endif /* CONFIG_X86_CPU_RESCTRL */

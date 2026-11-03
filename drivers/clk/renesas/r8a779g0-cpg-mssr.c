@@ -96,7 +96,8 @@ static const struct cpg_core_clk r8a779g0_core_clks[] __initconst = {
 	DEF_FIXED(".vc",	CLK_VC,		CLK_PLL5_DIV2,	3, 1),
 
 	/* Core Clock Outputs */
-	DEF_GEN4_Z("z0",	R8A779G0_CLK_Z0,	CLK_TYPE_GEN4_Z,	CLK_PLL2,	2, 0),
+	DEF_GEN4_Z("z0",	R8A779G0_CLK_Z0,	CLK_PLL2,	2, CPG_FRQCRC0, 0),
+	DEF_GEN4_Z("zg",	R8A779G0_CLK_ZG,	CLK_PLL4,	2, CPG_FRQCRB, 24),
 	DEF_FIXED("s0d2",	R8A779G0_CLK_S0D2,	CLK_S0,		2, 1),
 	DEF_FIXED("s0d3",	R8A779G0_CLK_S0D3,	CLK_S0,		3, 1),
 	DEF_FIXED("s0d4",	R8A779G0_CLK_S0D4,	CLK_S0,		4, 1),
@@ -163,6 +164,9 @@ static const struct cpg_core_clk r8a779g0_core_clks[] __initconst = {
 };
 
 static const struct mssr_mod_clk r8a779g0_mod_clks[] __initconst = {
+	DEF_MOD("rgx",		  0,	R8A779G0_CLK_ZG),
+	DEF_MOD("isp0",		 16,	R8A779G0_CLK_S0D2_VIO),
+	DEF_MOD("isp1",		 17,	R8A779G0_CLK_S0D2_VIO),
 	DEF_MOD("avb0",		211,	R8A779G0_CLK_S0D4_HSC),
 	DEF_MOD("avb1",		212,	R8A779G0_CLK_S0D4_HSC),
 	DEF_MOD("avb2",		213,	R8A779G0_CLK_S0D4_HSC),
@@ -238,7 +242,12 @@ static const struct mssr_mod_clk r8a779g0_mod_clks[] __initconst = {
 	DEF_MOD("pfc2",		917,	R8A779G0_CLK_CP),
 	DEF_MOD("pfc3",		918,	R8A779G0_CLK_CP),
 	DEF_MOD("tsc",		919,	R8A779G0_CLK_CL16M),
+	DEF_MOD("vspx0",	1028,	R8A779G0_CLK_S0D1_VIO),
+	DEF_MOD("vspx1",	1029,	R8A779G0_CLK_S0D1_VIO),
+	DEF_MOD("fcpvx0",	1100,	R8A779G0_CLK_S0D1_VIO),
+	DEF_MOD("fcpvx1",	1101,	R8A779G0_CLK_S0D1_VIO),
 	DEF_MOD("tsn",		2723,	R8A779G0_CLK_S0D4_HSC),
+	DEF_MOD("dsc",		2819,	R8A779G0_CLK_VIOBUSD2),
 	DEF_MOD("ssiu",		2926,	R8A779G0_CLK_S0D6_PER),
 	DEF_MOD("ssi",		2927,	R8A779G0_CLK_S0D6_PER),
 };

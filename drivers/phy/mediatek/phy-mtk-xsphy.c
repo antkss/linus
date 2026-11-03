@@ -11,10 +11,12 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of_address.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 
 #include "phy-mtk-io.h"
 
@@ -60,6 +62,14 @@
 #define P2A6_RG_BC11_SW_EN	BIT(23)
 #define P2A6_RG_OTG_VBUSCMP_EN	BIT(20)
 
+#define XSP_U2PHYDTM0		((SSUSB_SIFSLV_U2PHY_COM) + 0x068)
+#define P2D_FORCE_DATAIN	BIT(23)
+#define P2D_FORCE_DM_PULLDOWN	BIT(21)
+#define P2D_FORCE_DP_PULLDOWN	BIT(20)
+#define P2D_FORCE_XCVRSEL	BIT(19)
+#define P2D_FORCE_SUSPENDM	BIT(18)
+#define P2D_FORCE_TERMSEL	BIT(17)
+
 #define XSP_U2PHYDTM1		((SSUSB_SIFSLV_U2PHY_COM) + 0x06C)
 #define P2D_FORCE_IDDIG		BIT(9)
 #define P2D_RG_VBUSVALID	BIT(5)
@@ -81,12 +91,23 @@
 #define XSP_SR_COEF_DIVISOR	1000
 #define XSP_FM_DET_CYCLE_CNT	1024
 
+/* PHY switch between pcie/usb3/sgmii */
+#define USB_PHY_SWITCH_CTRL	0x0
+#define RG_PHY_SW_TYPE		GENMASK(3, 0)
+#define RG_PHY_SW_PCIE		0x0
+#define RG_PHY_SW_USB3		0x1
+#define RG_PHY_SW_SGMII		0x2
+
 struct xsphy_instance {
 	struct phy *phy;
 	void __iomem *port_base;
 	struct clk *ref_clk;	/* reference clock of anolog phy */
+	struct phy *repeater;
 	u32 index;
 	u32 type;
+	struct regmap *type_sw;
+	u32 type_sw_reg;
+	u32 type_sw_index;
 	/* only for HQA test */
 	int efuse_intr;
 	int efuse_tx_imp;
@@ -100,10 +121,10 @@ struct xsphy_instance {
 struct mtk_xsphy {
 	struct device *dev;
 	void __iomem *glb_base;	/* only shared u3 sif */
-	struct xsphy_instance **phys;
-	int nphys;
 	int src_ref_clk; /* MHZ, reference clock for slew rate calibrate */
 	int src_coef;    /* coefficient for slew rate calibrate */
+	int nphys;
+	struct xsphy_instance *phys[] __counted_by(nphys);
 };
 
 static void u2_phy_slew_rate_calibrate(struct mtk_xsphy *xsphy,
@@ -168,6 +189,11 @@ static void u2_phy_instance_init(struct mtk_xsphy *xsphy,
 				 struct xsphy_instance *inst)
 {
 	void __iomem *pbase = inst->port_base;
+
+	mtk_phy_clear_bits(pbase + XSP_U2PHYDTM0,
+			   P2D_FORCE_DATAIN | P2D_FORCE_DM_PULLDOWN |
+			   P2D_FORCE_DP_PULLDOWN | P2D_FORCE_XCVRSEL |
+			   P2D_FORCE_SUSPENDM | P2D_FORCE_TERMSEL);
 
 	/* DP/DM BC1.1 path Disable */
 	mtk_phy_clear_bits(pbase + XSP_USBPHYACR6, P2A6_RG_BC11_SW_EN);
@@ -259,6 +285,10 @@ static void phy_parse_property(struct mtk_xsphy *xsphy,
 			inst->efuse_intr, inst->efuse_tx_imp,
 			inst->efuse_rx_imp);
 		break;
+	case PHY_TYPE_PCIE:
+	case PHY_TYPE_SGMII:
+		/* nothing to do */
+		break;
 	default:
 		dev_err(xsphy->dev, "incompatible phy type\n");
 		return;
@@ -305,6 +335,62 @@ static void u3_phy_props_set(struct mtk_xsphy *xsphy,
 				     RG_XTP_LN0_RX_IMPSEL, inst->efuse_rx_imp);
 }
 
+/* type switch for usb3/pcie/sgmii */
+static int phy_type_syscon_get(struct xsphy_instance *instance,
+			       struct device_node *dn)
+{
+	struct of_phandle_args args;
+	int ret;
+
+	/* type switch function is optional */
+	if (!of_property_present(dn, "mediatek,syscon-type"))
+		return 0;
+
+	ret = of_parse_phandle_with_fixed_args(dn, "mediatek,syscon-type",
+					       2, 0, &args);
+	if (ret)
+		return ret;
+
+	instance->type_sw_reg = args.args[0];
+	instance->type_sw_index = args.args[1] & 0x3; /* <=3 */
+	instance->type_sw = syscon_node_to_regmap(args.np);
+	of_node_put(args.np);
+	dev_info(&instance->phy->dev, "type_sw - reg %#x, index %d\n",
+		 instance->type_sw_reg, instance->type_sw_index);
+
+	return PTR_ERR_OR_ZERO(instance->type_sw);
+}
+
+static int phy_type_set(struct xsphy_instance *instance)
+{
+	int type;
+	u32 offset;
+
+	if (!instance->type_sw)
+		return 0;
+
+	switch (instance->type) {
+	case PHY_TYPE_USB3:
+		type = RG_PHY_SW_USB3;
+		break;
+	case PHY_TYPE_PCIE:
+		type = RG_PHY_SW_PCIE;
+		break;
+	case PHY_TYPE_SGMII:
+		type = RG_PHY_SW_SGMII;
+		break;
+	case PHY_TYPE_USB2:
+	default:
+		return 0;
+	}
+
+	offset = instance->type_sw_index * BITS_PER_BYTE;
+	regmap_update_bits(instance->type_sw, instance->type_sw_reg,
+			   RG_PHY_SW_TYPE << offset, type << offset);
+
+	return 0;
+}
+
 static int mtk_phy_init(struct phy *phy)
 {
 	struct xsphy_instance *inst = phy_get_drvdata(phy);
@@ -319,11 +405,20 @@ static int mtk_phy_init(struct phy *phy)
 
 	switch (inst->type) {
 	case PHY_TYPE_USB2:
+		ret = phy_init(inst->repeater);
+		if (ret) {
+			clk_disable_unprepare(inst->ref_clk);
+			return ret;
+		}
 		u2_phy_instance_init(xsphy, inst);
 		u2_phy_props_set(xsphy, inst);
 		break;
 	case PHY_TYPE_USB3:
 		u3_phy_props_set(xsphy, inst);
+		break;
+	case PHY_TYPE_PCIE:
+	case PHY_TYPE_SGMII:
+		/* nothing to do, only used to set type */
 		break;
 	default:
 		dev_err(xsphy->dev, "incompatible phy type\n");
@@ -362,7 +457,11 @@ static int mtk_phy_exit(struct phy *phy)
 {
 	struct xsphy_instance *inst = phy_get_drvdata(phy);
 
+	if (inst->type == PHY_TYPE_USB2)
+		phy_exit(inst->repeater);
+
 	clk_disable_unprepare(inst->ref_clk);
+
 	return 0;
 }
 
@@ -370,9 +469,16 @@ static int mtk_phy_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct xsphy_instance *inst = phy_get_drvdata(phy);
 	struct mtk_xsphy *xsphy = dev_get_drvdata(phy->dev.parent);
+	int ret;
 
-	if (inst->type == PHY_TYPE_USB2)
-		u2_phy_instance_set_mode(xsphy, inst, mode);
+	if (inst->type != PHY_TYPE_USB2)
+		return 0;
+
+	ret = phy_set_mode_ext(inst->repeater, mode, submode);
+	if (ret)
+		return ret;
+
+	u2_phy_instance_set_mode(xsphy, inst, mode);
 
 	return 0;
 }
@@ -403,12 +509,15 @@ static struct phy *mtk_phy_xlate(struct device *dev,
 
 	inst->type = args->args[0];
 	if (!(inst->type == PHY_TYPE_USB2 ||
-	      inst->type == PHY_TYPE_USB3)) {
+	      inst->type == PHY_TYPE_USB3 ||
+	      inst->type == PHY_TYPE_PCIE ||
+	      inst->type == PHY_TYPE_SGMII)) {
 		dev_err(dev, "unsupported phy type: %d\n", inst->type);
 		return ERR_PTR(-EINVAL);
 	}
 
 	phy_parse_property(xsphy, inst);
+	phy_type_set(inst);
 
 	return inst->phy;
 }
@@ -436,18 +545,15 @@ static int mtk_xsphy_probe(struct platform_device *pdev)
 	struct resource *glb_res;
 	struct mtk_xsphy *xsphy;
 	struct resource res;
+	size_t nphys;
 	int port;
 
-	xsphy = devm_kzalloc(dev, sizeof(*xsphy), GFP_KERNEL);
+	nphys = of_get_child_count(np);
+	xsphy = devm_kzalloc(dev, struct_size(xsphy, phys, nphys), GFP_KERNEL);
 	if (!xsphy)
 		return -ENOMEM;
 
-	xsphy->nphys = of_get_child_count(np);
-	xsphy->phys = devm_kcalloc(dev, xsphy->nphys,
-				       sizeof(*xsphy->phys), GFP_KERNEL);
-	if (!xsphy->phys)
-		return -ENOMEM;
-
+	xsphy->nphys = nphys;
 	xsphy->dev = dev;
 	platform_set_drvdata(pdev, xsphy);
 
@@ -510,6 +616,15 @@ static int mtk_xsphy_probe(struct platform_device *pdev)
 			dev_err(dev, "failed to get ref_clk(id-%d)\n", port);
 			return PTR_ERR(inst->ref_clk);
 		}
+
+		retval = phy_type_syscon_get(inst, child_np);
+		if (retval)
+			return retval;
+
+		inst->repeater = devm_of_phy_optional_get(dev, child_np, NULL);
+		if (IS_ERR(inst->repeater))
+			return dev_err_probe(dev, PTR_ERR(inst->repeater),
+					 "failed to get repeater\n");
 	}
 
 	provider = devm_of_phy_provider_register(dev, mtk_phy_xlate);

@@ -7,6 +7,7 @@
  *		 Martin Schwidefsky (schwidefsky@de.ibm.com)
  */
 
+#include <linux/export.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/io.h>
@@ -98,7 +99,7 @@ static void ccw_timeout_log(struct ccw_device *cdev)
 void
 ccw_device_timeout(struct timer_list *t)
 {
-	struct ccw_device_private *priv = from_timer(priv, t, timer);
+	struct ccw_device_private *priv = timer_container_of(priv, t, timer);
 	struct ccw_device *cdev = priv->cdev;
 
 	spin_lock_irq(cdev->ccwlock);
@@ -115,7 +116,7 @@ void
 ccw_device_set_timeout(struct ccw_device *cdev, int expires)
 {
 	if (expires == 0)
-		del_timer(&cdev->private->timer);
+		timer_delete(&cdev->private->timer);
 	else
 		mod_timer(&cdev->private->timer, jiffies + expires);
 }
@@ -168,6 +169,9 @@ __recover_lost_chpids(struct subchannel *sch, int old_lpm)
 {
 	int mask, i;
 	struct chp_id chpid;
+
+	if (!sch->schib.pmcw.dnv)
+		return;
 
 	chp_id_init(&chpid);
 	for (i = 0; i<8; i++) {

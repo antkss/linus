@@ -318,8 +318,11 @@ static int mt8188_afe_fe_startup(struct snd_pcm_substream *substream,
 	ret = snd_pcm_hw_constraint_minmax(runtime,
 					   SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 1,
 					   MT8188_MEMIF_DL7_MAX_PERIOD_SIZE);
-	if (ret < 0)
+	if (ret >= 0)
+		ret = 0;
+	else
 		dev_dbg(afe->dev, "hw_constraint_minmax failed\n");
+
 out:
 	return ret;
 }
@@ -652,6 +655,7 @@ static struct snd_soc_dai_driver mt8188_memif_dai_driver[] = {
 
 static const struct snd_kcontrol_new o002_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I000 Switch", AFE_CONN2, 0, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I004 Switch", AFE_CONN2, 4, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I012 Switch", AFE_CONN2, 12, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I020 Switch", AFE_CONN2, 20, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I022 Switch", AFE_CONN2, 22, 1, 0),
@@ -662,6 +666,8 @@ static const struct snd_kcontrol_new o002_mix[] = {
 
 static const struct snd_kcontrol_new o003_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I001 Switch", AFE_CONN3, 1, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I005 Switch", AFE_CONN3, 5, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I006 Switch", AFE_CONN3, 6, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I013 Switch", AFE_CONN3, 13, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I021 Switch", AFE_CONN3, 21, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I023 Switch", AFE_CONN3, 23, 1, 0),
@@ -672,6 +678,8 @@ static const struct snd_kcontrol_new o003_mix[] = {
 
 static const struct snd_kcontrol_new o004_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I000 Switch", AFE_CONN4, 0, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I006 Switch", AFE_CONN4, 6, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I008 Switch", AFE_CONN4, 8, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I014 Switch", AFE_CONN4, 14, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I024 Switch", AFE_CONN4, 24, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I074 Switch", AFE_CONN4_2, 10, 1, 0),
@@ -679,6 +687,8 @@ static const struct snd_kcontrol_new o004_mix[] = {
 
 static const struct snd_kcontrol_new o005_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I001 Switch", AFE_CONN5, 1, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I007 Switch", AFE_CONN5, 7, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I010 Switch", AFE_CONN5, 10, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I015 Switch", AFE_CONN5, 15, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I025 Switch", AFE_CONN5, 25, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I075 Switch", AFE_CONN5_2, 11, 1, 0),
@@ -686,6 +696,7 @@ static const struct snd_kcontrol_new o005_mix[] = {
 
 static const struct snd_kcontrol_new o006_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I000 Switch", AFE_CONN6, 0, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I008 Switch", AFE_CONN6, 8, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I016 Switch", AFE_CONN6, 16, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I026 Switch", AFE_CONN6, 26, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I076 Switch", AFE_CONN6_2, 12, 1, 0),
@@ -693,18 +704,21 @@ static const struct snd_kcontrol_new o006_mix[] = {
 
 static const struct snd_kcontrol_new o007_mix[] = {
 	SOC_DAPM_SINGLE_AUTODISABLE("I001 Switch", AFE_CONN7, 1, 1, 0),
+	SOC_DAPM_SINGLE_AUTODISABLE("I009 Switch", AFE_CONN7, 9, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I017 Switch", AFE_CONN7, 17, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I027 Switch", AFE_CONN7, 27, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I077 Switch", AFE_CONN7_2, 13, 1, 0),
 };
 
 static const struct snd_kcontrol_new o008_mix[] = {
+	SOC_DAPM_SINGLE_AUTODISABLE("I010 Switch", AFE_CONN8, 10, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I018 Switch", AFE_CONN8, 18, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I028 Switch", AFE_CONN8, 28, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I078 Switch", AFE_CONN8_2, 14, 1, 0),
 };
 
 static const struct snd_kcontrol_new o009_mix[] = {
+	SOC_DAPM_SINGLE_AUTODISABLE("I011 Switch", AFE_CONN9, 11, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I019 Switch", AFE_CONN9, 19, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I029 Switch", AFE_CONN9, 29, 1, 0),
 	SOC_DAPM_SINGLE_AUTODISABLE("I079 Switch", AFE_CONN9_2, 15, 1, 0),
@@ -1275,6 +1289,18 @@ static const struct snd_soc_dapm_route mt8188_memif_routes[] = {
 	{"O002", "I070 Switch", "I070"},
 	{"O003", "I071 Switch", "I071"},
 
+	{"O002", "I004 Switch", "I004"},
+	{"O003", "I005 Switch", "I005"},
+	{"O003", "I006 Switch", "I006"},
+	{"O004", "I006 Switch", "I006"},
+	{"O004", "I008 Switch", "I008"},
+	{"O005", "I007 Switch", "I007"},
+	{"O005", "I010 Switch", "I010"},
+	{"O006", "I008 Switch", "I008"},
+	{"O007", "I009 Switch", "I009"},
+	{"O008", "I010 Switch", "I010"},
+	{"O009", "I011 Switch", "I011"},
+
 	{"O034", "I000 Switch", "I000"},
 	{"O035", "I001 Switch", "I001"},
 	{"O034", "I002 Switch", "I002"},
@@ -1600,8 +1626,7 @@ static SOC_VALUE_ENUM_SINGLE_DECL(ul10_fs_timing_sel_enum,
 static int mt8188_memif_1x_en_sel_put(struct snd_kcontrol *kcontrol,
 				      struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component =
-		snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
 	struct mt8188_afe_private *afe_priv = afe->platform_priv;
 	struct mtk_dai_memif_priv *memif_priv;
@@ -1624,8 +1649,7 @@ static int mt8188_memif_1x_en_sel_put(struct snd_kcontrol *kcontrol,
 static int mt8188_asys_irq_1x_en_sel_put(struct snd_kcontrol *kcontrol,
 					 struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component =
-		snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
 	struct mt8188_afe_private *afe_priv = afe->platform_priv;
 	unsigned int id = kcontrol->id.device;
@@ -1645,7 +1669,7 @@ static int mt8188_asys_irq_1x_en_sel_put(struct snd_kcontrol *kcontrol,
 static int mt8188_memif_fs_timing_sel_get(struct snd_kcontrol *kcontrol,
 					  struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
 	struct mt8188_afe_private *afe_priv = afe->platform_priv;
 	struct mtk_dai_memif_priv *memif_priv;
@@ -1663,7 +1687,7 @@ static int mt8188_memif_fs_timing_sel_get(struct snd_kcontrol *kcontrol,
 static int mt8188_memif_fs_timing_sel_put(struct snd_kcontrol *kcontrol,
 					  struct snd_ctl_elem_value *ucontrol)
 {
-	struct snd_soc_component *component = snd_soc_kcontrol_component(kcontrol);
+	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
 	struct mtk_base_afe *afe = snd_soc_component_get_drvdata(component);
 	struct mt8188_afe_private *afe_priv = afe->platform_priv;
 	struct mtk_dai_memif_priv *memif_priv;
@@ -2855,10 +2879,6 @@ static bool mt8188_is_volatile_reg(struct device *dev, unsigned int reg)
 	case AFE_DMIC3_SRC_DEBUG_MON0:
 	case AFE_DMIC3_UL_SRC_MON0:
 	case AFE_DMIC3_UL_SRC_MON1:
-	case DMIC_GAIN1_CUR:
-	case DMIC_GAIN2_CUR:
-	case DMIC_GAIN3_CUR:
-	case DMIC_GAIN4_CUR:
 	case ETDM_IN1_MONITOR:
 	case ETDM_IN2_MONITOR:
 	case ETDM_OUT1_MONITOR:
@@ -3013,22 +3033,33 @@ static int mt8188_afe_runtime_resume(struct device *dev)
 	struct mtk_base_afe *afe = dev_get_drvdata(dev);
 	struct mt8188_afe_private *afe_priv = afe->platform_priv;
 	struct arm_smccc_res res;
+	int ret;
 
 	arm_smccc_smc(MTK_SIP_AUDIO_CONTROL,
 		      MTK_AUDIO_SMC_OP_DOMAIN_SIDEBANDS,
 		      0, 0, 0, 0, 0, 0, &res);
 
-	mt8188_afe_enable_reg_rw_clk(afe);
+	ret = mt8188_afe_enable_reg_rw_clk(afe);
+	if (ret)
+		return ret;
 
 	if (!afe->regmap || afe_priv->pm_runtime_bypass_reg_ctl)
-		goto skip_regmap;
+		return 0;
 
 	regcache_cache_only(afe->regmap, false);
-	regcache_sync(afe->regmap);
+	ret = regcache_sync(afe->regmap);
+	if (ret)
+		goto err;
 
-	mt8188_afe_enable_main_clock(afe);
-skip_regmap:
+	ret = mt8188_afe_enable_main_clock(afe);
+	if (ret)
+		goto err;
+
 	return 0;
+err:
+	mt8188_afe_disable_reg_rw_clk(afe);
+	regcache_cache_only(afe->regmap, true);
+	return ret;
 }
 
 static int init_memif_priv_data(struct mtk_base_afe *afe)
@@ -3076,6 +3107,7 @@ static int mt8188_dai_memif_register(struct mtk_base_afe *afe)
 typedef int (*dai_register_cb)(struct mtk_base_afe *);
 static const dai_register_cb dai_register_cbs[] = {
 	mt8188_dai_adda_register,
+	mt8188_dai_dmic_register,
 	mt8188_dai_etdm_register,
 	mt8188_dai_pcm_register,
 	mt8188_dai_memif_register,
@@ -3181,7 +3213,7 @@ static int mt8188_afe_pcm_dev_probe(struct platform_device *pdev)
 	struct regmap *infra_ao;
 	int i, irq_id, ret;
 
-	ret = of_reserved_mem_device_init(dev);
+	ret = devm_of_reserved_mem_device_init(dev);
 	if (ret)
 		dev_dbg(dev, "failed to assign memory region: %d\n", ret);
 
@@ -3203,8 +3235,7 @@ static int mt8188_afe_pcm_dev_probe(struct platform_device *pdev)
 
 	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(afe->base_addr))
-		return dev_err_probe(dev, PTR_ERR(afe->base_addr),
-				     "AFE base_addr not found\n");
+		return PTR_ERR(afe->base_addr);
 
 	infra_ao = syscon_regmap_lookup_by_phandle(dev->of_node,
 						   "mediatek,infracfg");
@@ -3240,7 +3271,7 @@ static int mt8188_afe_pcm_dev_probe(struct platform_device *pdev)
 	/* initial audio related clock */
 	ret = mt8188_afe_init_clock(afe);
 	if (ret)
-		return dev_err_probe(dev, ret, "init clock error");
+		return ret;
 
 	spin_lock_init(&afe_priv->afe_ctrl_lock);
 
@@ -3273,12 +3304,12 @@ static int mt8188_afe_pcm_dev_probe(struct platform_device *pdev)
 	/* request irq */
 	irq_id = platform_get_irq(pdev, 0);
 	if (irq_id < 0)
-		return dev_err_probe(dev, irq_id, "no irq found");
+		return irq_id;
 
 	ret = devm_request_irq(dev, irq_id, mt8188_afe_irq_handler,
 			       IRQF_TRIGGER_NONE, "asys-isr", (void *)afe);
 	if (ret)
-		return dev_err_probe(dev, ret, "could not request_irq for asys-isr\n");
+		return ret;
 
 	/* init sub_dais */
 	INIT_LIST_HEAD(&afe->sub_dais);
@@ -3334,10 +3365,8 @@ static int mt8188_afe_pcm_dev_probe(struct platform_device *pdev)
 	/* register component */
 	ret = devm_snd_soc_register_component(dev, &mtk_afe_pcm_platform,
 					      afe->dai_drivers, afe->num_dai_drivers);
-	if (ret) {
-		dev_warn(dev, "err_platform\n");
+	if (ret)
 		goto err_pm_put;
-	}
 
 	mt8188_afe_init_registers(afe);
 
@@ -3361,15 +3390,15 @@ static const struct of_device_id mt8188_afe_pcm_dt_match[] = {
 MODULE_DEVICE_TABLE(of, mt8188_afe_pcm_dt_match);
 
 static const struct dev_pm_ops mt8188_afe_pm_ops = {
-	SET_RUNTIME_PM_OPS(mt8188_afe_runtime_suspend,
-			   mt8188_afe_runtime_resume, NULL)
+	RUNTIME_PM_OPS(mt8188_afe_runtime_suspend,
+		       mt8188_afe_runtime_resume, NULL)
 };
 
 static struct platform_driver mt8188_afe_pcm_driver = {
 	.driver = {
 		   .name = "mt8188-audio",
 		   .of_match_table = mt8188_afe_pcm_dt_match,
-		   .pm = &mt8188_afe_pm_ops,
+		   .pm = pm_ptr(&mt8188_afe_pm_ops),
 	},
 	.probe = mt8188_afe_pcm_dev_probe,
 };

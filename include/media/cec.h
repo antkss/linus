@@ -10,7 +10,6 @@
 
 #include <linux/poll.h>
 #include <linux/fs.h>
-#include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
 #include <linux/kthread.h>
@@ -86,7 +85,6 @@ struct cec_event_entry {
 	struct cec_event	ev;
 };
 
-#define CEC_NUM_CORE_EVENTS 2
 #define CEC_NUM_EVENTS CEC_EVENT_PIN_5V_HIGH
 
 struct cec_fh {
@@ -102,7 +100,6 @@ struct cec_fh {
 	struct list_head	events[CEC_NUM_EVENTS]; /* queued events */
 	u16			queued_events[CEC_NUM_EVENTS];
 	unsigned int		total_queued_events;
-	struct cec_event_entry	core_events[CEC_NUM_CORE_EVENTS];
 	struct list_head	msgs; /* queued messages */
 	unsigned int		queued_msgs;
 };
@@ -224,6 +221,8 @@ struct cec_adap_ops {
  * @tx_error_log_cnt:	number of logged Error transmits since the adapter was
  *                      enabled. Used to avoid flooding the kernel log if this
  *                      happens a lot.
+ * @error_inj_tx_timeouts: error injection: the next @error_inj_tx_timeouts
+ *			transmits will time out.
  * @notifier:		CEC notifier
  * @pin:		CEC pin status struct
  * @cec_dir:		debugfs cec directory
@@ -283,6 +282,8 @@ struct cec_adapter {
 	u32 tx_arb_lost_cnt;
 	u32 tx_low_drive_log_cnt;
 	u32 tx_error_log_cnt;
+
+	u32 error_inj_tx_timeouts;
 
 #ifdef CONFIG_CEC_NOTIFIER
 	struct cec_notifier *notifier;

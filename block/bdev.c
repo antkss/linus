@@ -12,7 +12,6 @@
 #include <linux/major.h>
 #include <linux/device_cgroup.h>
 #include <linux/blkdev.h>
-#include <linux/blk-integrity.h>
 #include <linux/backing-dev.h>
 #include <linux/module.h>
 #include <linux/blkpg.h>
@@ -67,7 +66,7 @@ static void bdev_write_inode(struct block_device *bdev)
 	int ret;
 
 	spin_lock(&inode->i_lock);
-	while (inode->i_state & I_DIRTY) {
+	while (inode_state_read(inode) & I_DIRTY) {
 		spin_unlock(&inode->i_lock);
 		ret = write_inode_now(inode, true);
 		if (ret)
@@ -148,40 +147,98 @@ static void set_init_blocksize(struct block_device *bdev)
 		bsize <<= 1;
 	}
 	BD_INODE(bdev)->i_blkbits = blksize_bits(bsize);
+	mapping_set_folio_min_order(BD_INODE(bdev)->i_mapping,
+				    get_order(bsize));
 }
+
+/**
+ * bdev_validate_blocksize - check that this block size is acceptable
+ * @bdev:	blockdevice to check
+ * @block_size:	block size to check
+ *
+ * For block device users that do not use buffer heads or the block device
+ * page cache, make sure that this block size can be used with the device.
+ *
+ * Return: On success zero is returned, negative error code on failure.
+ */
+int bdev_validate_blocksize(struct block_device *bdev, int block_size)
+{
+	if (blk_validate_block_size(block_size))
+		return -EINVAL;
+
+	/* Size cannot be smaller than the size supported by the device */
+	if (block_size < bdev_logical_block_size(bdev))
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bdev_validate_blocksize);
 
 int set_blocksize(struct file *file, int size)
 {
 	struct inode *inode = file->f_mapping->host;
 	struct block_device *bdev = I_BDEV(inode);
+	int ret;
 
-	if (blk_validate_block_size(size))
-		return -EINVAL;
-
-	/* Size cannot be smaller than the size supported by the device */
-	if (size < bdev_logical_block_size(bdev))
-		return -EINVAL;
+	ret = bdev_validate_blocksize(bdev, size);
+	if (ret)
+		return ret;
 
 	if (!file->private_data)
 		return -EINVAL;
 
 	/* Don't change the size if it is same as current */
 	if (inode->i_blkbits != blksize_bits(size)) {
+		/*
+		 * Flush and truncate the pagecache before we reconfigure the
+		 * mapping geometry because folio sizes are variable now.  If a
+		 * reader has already allocated a folio whose size is smaller
+		 * than the new min_order but invokes readahead after the new
+		 * min_order becomes visible, readahead will think there are
+		 * "zero" blocks per folio and crash.  Take the inode and
+		 * invalidation locks to avoid racing with
+		 * read/write/fallocate.
+		 */
+		inode_lock(inode);
+		filemap_invalidate_lock(inode->i_mapping);
+
 		sync_blockdev(bdev);
-		inode->i_blkbits = blksize_bits(size);
 		kill_bdev(bdev);
+
+		inode->i_blkbits = blksize_bits(size);
+		mapping_set_folio_min_order(inode->i_mapping, get_order(size));
+		filemap_invalidate_unlock(inode->i_mapping);
+		inode_unlock(inode);
 	}
 	return 0;
 }
 
 EXPORT_SYMBOL(set_blocksize);
 
+static int sb_validate_large_blocksize(struct super_block *sb, int size)
+{
+	const char *err_str = NULL;
+
+	if (!(sb->s_type->fs_flags & FS_LBS))
+		err_str = "not supported by filesystem";
+	else if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+		err_str = "is only supported with CONFIG_TRANSPARENT_HUGEPAGE";
+
+	if (!err_str)
+		return 0;
+
+	pr_warn_ratelimited("%s: block size(%d) > page size(%lu) %s\n",
+				sb->s_type->name, size, PAGE_SIZE, err_str);
+	return -EINVAL;
+}
+
 int sb_set_blocksize(struct super_block *sb, int size)
 {
+	if (size > PAGE_SIZE && sb_validate_large_blocksize(sb, size))
+		return 0;
 	if (set_blocksize(sb->s_bdev_file, size))
 		return 0;
-	/* If we get here, we know size is power of two
-	 * and it's value is between 512 and PAGE_SIZE */
+	/* If we get here, we know size is validated */
 	sb->s_blocksize = size;
 	sb->s_blocksize_bits = blksize_bits(size);
 	return sb->s_blocksize;
@@ -189,7 +246,7 @@ int sb_set_blocksize(struct super_block *sb, int size)
 
 EXPORT_SYMBOL(sb_set_blocksize);
 
-int sb_min_blocksize(struct super_block *sb, int size)
+int __must_check sb_min_blocksize(struct super_block *sb, int size)
 {
 	int minsize = bdev_logical_block_size(sb->s_bdev);
 	if (size < minsize)
@@ -235,7 +292,7 @@ EXPORT_SYMBOL(sync_blockdev_range);
  * The reference counter (bd_fsfreeze_count) guarantees that only the last
  * unfreeze process can unfreeze the frozen filesystem actually when multiple
  * freeze requests arrive simultaneously. It counts up in bdev_freeze() and
- * count down in bdev_thaw(). When it becomes 0, thaw_bdev() will unfreeze
+ * count down in bdev_thaw(). When it becomes 0, bdev_thaw() will unfreeze
  * actually.
  *
  * Return: On success zero is returned, negative error code on failure.
@@ -246,7 +303,12 @@ int bdev_freeze(struct block_device *bdev)
 
 	mutex_lock(&bdev->bd_fsfreeze_mutex);
 
-	if (atomic_inc_return(&bdev->bd_fsfreeze_count) > 1) {
+	/* A device being removed from its filesystem refuses freezes. */
+	if (!atomic_inc_unless_negative(&bdev->bd_fsfreeze_count)) {
+		mutex_unlock(&bdev->bd_fsfreeze_mutex);
+		return -EBUSY;
+	}
+	if (atomic_read(&bdev->bd_fsfreeze_count) > 1) {
 		mutex_unlock(&bdev->bd_fsfreeze_mutex);
 		return 0;
 	}
@@ -282,18 +344,18 @@ int bdev_thaw(struct block_device *bdev)
 
 	mutex_lock(&bdev->bd_fsfreeze_mutex);
 
-	/*
-	 * If this returns < 0 it means that @bd_fsfreeze_count was
-	 * already 0 and no decrement was performed.
-	 */
-	nr_freeze = atomic_dec_if_positive(&bdev->bd_fsfreeze_count);
-	if (nr_freeze < 0)
+	/* <= 0: not frozen (0) or a freeze deny is held (< 0); leave it. */
+	nr_freeze = atomic_read(&bdev->bd_fsfreeze_count);
+	if (nr_freeze <= 0)
 		goto out;
 
 	error = 0;
-	if (nr_freeze > 0)
+	if (nr_freeze > 1) {
+		atomic_dec(&bdev->bd_fsfreeze_count);
 		goto out;
+	}
 
+	/* Keep the count positive across the thaw so a deny is refused. */
 	mutex_lock(&bdev->bd_holder_lock);
 	if (bdev->bd_holder_ops && bdev->bd_holder_ops->thaw) {
 		error = bdev->bd_holder_ops->thaw(bdev);
@@ -302,13 +364,51 @@ int bdev_thaw(struct block_device *bdev)
 		mutex_unlock(&bdev->bd_holder_lock);
 	}
 
-	if (error)
-		atomic_inc(&bdev->bd_fsfreeze_count);
+	if (!error)
+		atomic_dec(&bdev->bd_fsfreeze_count);
 out:
 	mutex_unlock(&bdev->bd_fsfreeze_mutex);
 	return error;
 }
 EXPORT_SYMBOL(bdev_thaw);
+
+/**
+ * bdev_deny_freeze - make a block device unfreezable
+ * @bdev: block device
+ *
+ * Reserve @bdev against bdev_freeze() the way deny_write_access() reserves a
+ * file against writers.  bd_fsfreeze_count is sign-encoded: > 0 counts active
+ * freezes, < 0 counts deniers, so a deny succeeds only while no freeze is in
+ * progress.  While held, bdev_freeze() returns -EBUSY.  Pair with
+ * bdev_allow_freeze().
+ *
+ * A filesystem removing, adding or replacing a member device denies freezes on
+ * it for the duration, so a claim a freeze walk might act on is never torn down
+ * behind the freezer's back.  The deny is device-scoped, not (device,
+ * superblock)-scoped: a device shared by several superblocks is refused for all
+ * of them.  No in-tree filesystem removes a shared claim from a live superblock.
+ *
+ * Return: 0, or -EBUSY if the device is currently frozen.
+ */
+int bdev_deny_freeze(struct block_device *bdev)
+{
+	return atomic_dec_unless_positive(&bdev->bd_fsfreeze_count) ? 0 : -EBUSY;
+}
+EXPORT_SYMBOL_GPL(bdev_deny_freeze);
+
+/**
+ * bdev_allow_freeze - allow freezing a block device again
+ * @bdev: block device
+ *
+ * Undo one bdev_deny_freeze().
+ */
+void bdev_allow_freeze(struct block_device *bdev)
+{
+	/* A deny must be held, i.e. the count must be negative. */
+	WARN_ON_ONCE(atomic_read(&bdev->bd_fsfreeze_count) >= 0);
+	atomic_inc(&bdev->bd_fsfreeze_count);
+}
+EXPORT_SYMBOL_GPL(bdev_allow_freeze);
 
 /*
  * pseudo-fs
@@ -359,19 +459,11 @@ static void init_once(void *data)
 	inode_init_once(&ei->vfs_inode);
 }
 
-static void bdev_evict_inode(struct inode *inode)
-{
-	truncate_inode_pages_final(&inode->i_data);
-	invalidate_inode_buffers(inode); /* is it needed here? */
-	clear_inode(inode);
-}
-
 static const struct super_operations bdev_sops = {
 	.statfs = simple_statfs,
 	.alloc_inode = bdev_alloc_inode,
 	.free_inode = bdev_free_inode,
-	.drop_inode = generic_delete_inode,
-	.evict_inode = bdev_evict_inode,
+	.drop_inode = inode_just_drop,
 };
 
 static int bd_init_fs_context(struct fs_context *fc)
@@ -396,15 +488,10 @@ EXPORT_SYMBOL_GPL(blockdev_superblock);
 
 void __init bdev_cache_init(void)
 {
-	int err;
-
 	bdev_cachep = kmem_cache_create("bdev_cache", sizeof(struct bdev_inode),
 			0, (SLAB_HWCACHE_ALIGN|SLAB_RECLAIM_ACCOUNT|
 				SLAB_ACCOUNT|SLAB_PANIC),
 			init_once);
-	err = register_filesystem(&bd_type);
-	if (err)
-		panic("Cannot register bdev pseudo-fs");
 	blockdev_mnt = kern_mount(&bd_type);
 	if (IS_ERR(blockdev_mnt))
 		panic("Cannot create bdev pseudo-fs");
@@ -773,13 +860,13 @@ static void blkdev_put_part(struct block_device *part)
 	blkdev_put_whole(whole);
 }
 
-struct block_device *blkdev_get_no_open(dev_t dev)
+struct block_device *blkdev_get_no_open(dev_t dev, bool autoload)
 {
 	struct block_device *bdev;
 	struct inode *inode;
 
 	inode = ilookup(blockdev_superblock, dev);
-	if (!inode && IS_ENABLED(CONFIG_BLOCK_LEGACY_AUTOLOAD)) {
+	if (!inode && autoload && IS_ENABLED(CONFIG_BLOCK_LEGACY_AUTOLOAD)) {
 		blk_request_module(dev);
 		inode = ilookup(blockdev_superblock, dev);
 		if (inode)
@@ -1001,7 +1088,7 @@ struct file *bdev_file_open_by_dev(dev_t dev, blk_mode_t mode, void *holder,
 	if (ret)
 		return ERR_PTR(ret);
 
-	bdev = blkdev_get_no_open(dev);
+	bdev = blkdev_get_no_open(dev, true);
 	if (!bdev)
 		return ERR_PTR(-ENXIO);
 
@@ -1108,6 +1195,39 @@ put_no_open:
 }
 
 /**
+ * bdev_yield_claim - give up the holder claim on an open block device
+ * @bdev_file: open block device
+ *
+ * Yield the holder and any write access for @bdev_file without closing it, so
+ * the caller can still act on the device - e.g. bdev_allow_freeze() it - before
+ * the final bdev_fput().  bdev_fput() yields too, so calling it afterwards is
+ * safe.
+ */
+void bdev_yield_claim(struct file *bdev_file)
+{
+	struct block_device *bdev;
+	struct gendisk *disk;
+
+	if (!bdev_file->private_data)
+		return;
+
+	bdev = file_bdev(bdev_file);
+	disk = bdev->bd_disk;
+
+	mutex_lock(&disk->open_mutex);
+	bdev_yield_write_access(bdev_file);
+	bd_yield_claim(bdev_file);
+	/*
+	 * Tell release we already gave up our hold on the
+	 * device and if write restrictions are available that
+	 * we already gave up write access to the device.
+	 */
+	bdev_file->private_data = BDEV_I(bdev_file->f_mapping->host);
+	mutex_unlock(&disk->open_mutex);
+}
+EXPORT_SYMBOL_GPL(bdev_yield_claim);
+
+/**
  * bdev_fput - yield claim to the block device and put the file
  * @bdev_file: open block device
  *
@@ -1120,22 +1240,7 @@ void bdev_fput(struct file *bdev_file)
 	if (WARN_ON_ONCE(bdev_file->f_op != &def_blk_fops))
 		return;
 
-	if (bdev_file->private_data) {
-		struct block_device *bdev = file_bdev(bdev_file);
-		struct gendisk *disk = bdev->bd_disk;
-
-		mutex_lock(&disk->open_mutex);
-		bdev_yield_write_access(bdev_file);
-		bd_yield_claim(bdev_file);
-		/*
-		 * Tell release we already gave up our hold on the
-		 * device and if write restrictions are available that
-		 * we already gave up write access to the device.
-		 */
-		bdev_file->private_data = BDEV_I(bdev_file->f_mapping->host);
-		mutex_unlock(&disk->open_mutex);
-	}
-
+	bdev_yield_claim(bdev_file);
 	fput(bdev_file);
 }
 EXPORT_SYMBOL(bdev_fput);
@@ -1172,6 +1277,18 @@ int lookup_bdev(const char *pathname, dev_t *dev)
 	if (!may_open_dev(&path))
 		goto out_path_put;
 
+	/*
+	 * Reject a block device inode with i_rdev == 0.  A dev_t of 0 is
+	 * never valid for a block device: no real block device driver
+	 * registers major 0.  Fake block device inodes (e.g. fuse with
+	 * rootmode=S_IFBLK) can expose i_rdev == 0, and letting that
+	 * propagate would confuse superblock lookup and trigger warnings
+	 * in the device-to-superblock table (sget_fc).
+	 */
+	error = -ENODEV;
+	if (!inode->i_rdev)
+		goto out_path_put;
+
 	*dev = inode->i_rdev;
 	error = 0;
 out_path_put:
@@ -1200,7 +1317,13 @@ void bdev_mark_dead(struct block_device *bdev, bool surprise)
 		bdev->bd_holder_ops->mark_dead(bdev, surprise);
 	else {
 		mutex_unlock(&bdev->bd_holder_lock);
-		sync_blockdev(bdev);
+		/*
+		 * On surprise removal the device is already gone; syncing is
+		 * futile and can hang forever waiting on I/O that will never
+		 * complete.  Match fs_bdev_mark_dead(), which also skips it.
+		 */
+		if (!surprise)
+			sync_blockdev(bdev);
 	}
 
 	invalidate_bdev(bdev);
@@ -1223,7 +1346,7 @@ void sync_bdevs(bool wait)
 		struct block_device *bdev;
 
 		spin_lock(&inode->i_lock);
-		if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW) ||
+		if (inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW) ||
 		    mapping->nrpages == 0) {
 			spin_unlock(&inode->i_lock);
 			continue;
@@ -1243,6 +1366,15 @@ void sync_bdevs(bool wait)
 		old_inode = inode;
 		bdev = I_BDEV(inode);
 
+		/*
+		 * The inode does not keep the gendisk of a partition alive, the
+		 * device does.
+		 */
+		if (!kobject_get_unless_zero(&bdev->bd_device.kobj)) {
+			spin_lock(&blockdev_superblock->s_inode_list_lock);
+			continue;
+		}
+
 		mutex_lock(&bdev->bd_disk->open_mutex);
 		if (!atomic_read(&bdev->bd_openers)) {
 			; /* skip */
@@ -1258,6 +1390,7 @@ void sync_bdevs(bool wait)
 			filemap_fdatawrite(inode->i_mapping);
 		}
 		mutex_unlock(&bdev->bd_disk->open_mutex);
+		put_device(&bdev->bd_device);
 
 		spin_lock(&blockdev_superblock->s_inode_list_lock);
 	}
@@ -1268,24 +1401,17 @@ void sync_bdevs(bool wait)
 /*
  * Handle STATX_{DIOALIGN, WRITE_ATOMIC} for block devices.
  */
-void bdev_statx(struct path *path, struct kstat *stat,
-		u32 request_mask)
+void bdev_statx(const struct path *path, struct kstat *stat, u32 request_mask)
 {
-	struct inode *backing_inode;
 	struct block_device *bdev;
 
-	if (!(request_mask & (STATX_DIOALIGN | STATX_WRITE_ATOMIC)))
-		return;
-
-	backing_inode = d_backing_inode(path->dentry);
-
 	/*
-	 * Note that backing_inode is the inode of a block device node file,
-	 * not the block device's internal inode.  Therefore it is *not* valid
-	 * to use I_BDEV() here; the block device has to be looked up by i_rdev
+	 * Note that d_backing_inode() returns the block device node inode, not
+	 * the block device's internal inode.  Therefore it is *not* valid to
+	 * use I_BDEV() here; the block device has to be looked up by i_rdev
 	 * instead.
 	 */
-	bdev = blkdev_get_no_open(backing_inode->i_rdev);
+	bdev = blkdev_get_no_open(d_backing_inode(path->dentry)->i_rdev, false);
 	if (!bdev)
 		return;
 
@@ -1300,8 +1426,11 @@ void bdev_statx(struct path *path, struct kstat *stat,
 
 		generic_fill_statx_atomic_writes(stat,
 			queue_atomic_write_unit_min_bytes(bd_queue),
-			queue_atomic_write_unit_max_bytes(bd_queue));
+			queue_atomic_write_unit_max_bytes(bd_queue),
+			0);
 	}
+
+	stat->blksize = bdev_io_min(bdev);
 
 	blkdev_put_no_open(bdev);
 }

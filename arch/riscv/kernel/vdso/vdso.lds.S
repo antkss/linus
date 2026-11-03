@@ -4,15 +4,14 @@
  */
 #include <asm/page.h>
 #include <asm/vdso.h>
+#include <vdso/datapage.h>
 
 OUTPUT_ARCH(riscv)
 
 SECTIONS
 {
-	PROVIDE(_vdso_data = . - __VVAR_PAGES * PAGE_SIZE);
-#ifdef CONFIG_TIME_NS
-	PROVIDE(_timens_data = _vdso_data + PAGE_SIZE);
-#endif
+	VDSO_VVAR_SYMS
+
 	. = SIZEOF_HEADERS;
 
 	.hash		: { *(.hash) }			:text
@@ -31,7 +30,7 @@ SECTIONS
 		*(.data .data.* .gnu.linkonce.d.*)
 		*(.dynbss)
 		*(.bss .bss.* .gnu.linkonce.b.*)
-	}
+	}						:text
 
 	.note		: { *(.note.*) }		:text	:note
 
@@ -46,9 +45,11 @@ SECTIONS
 	.text		: { *(.text .text.*) }		:text
 
 	. = ALIGN(4);
+	__vdso_alternatives_start = .;
 	.alternative : {
 		*(.alternative)
 	}
+	__vdso_alternatives_end = .;
 }
 
 /*
@@ -80,6 +81,9 @@ VERSION
 		__vdso_flush_icache;
 #ifndef COMPAT_VDSO
 		__vdso_riscv_hwprobe;
+#endif
+#if defined(CONFIG_VDSO_GETRANDOM) && !defined(COMPAT_VDSO)
+		__vdso_getrandom;
 #endif
 	local: *;
 	};

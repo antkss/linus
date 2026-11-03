@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2012-2014, 2018-2019 Intel Corporation
+ * Copyright (C) 2012-2014, 2018-2019, 2025-2026 Intel Corporation
  * Copyright (C) 2017 Intel Deutschland GmbH
  */
 #include <linux/leds.h>
-#include "iwl-io.h"
+#include "iwl-trans.h"
 #include "iwl-csr.h"
 #include "mvm.h"
 
@@ -38,8 +38,8 @@ static void iwl_mvm_led_set(struct iwl_mvm *mvm, bool on)
 		return;
 	}
 
-	iwl_write32(mvm->trans, CSR_LED_REG,
-		    on ? CSR_LED_REG_TURN_ON : CSR_LED_REG_TURN_OFF);
+	iwl_trans_write32(mvm->trans, CSR_LED_REG,
+			  on ? CSR_LED_REG_TURN_ON : CSR_LED_REG_TURN_OFF);
 }
 
 static void iwl_led_brightness_set(struct led_classdev *led_cdev,
@@ -102,7 +102,7 @@ void iwl_mvm_leds_sync(struct iwl_mvm *mvm)
 	 * if we control through the register, we're doing it
 	 * even when the firmware isn't up, so no need to sync
 	 */
-	if (mvm->trans->trans_cfg->device_family < IWL_DEVICE_FAMILY_8000)
+	if (mvm->trans->mac_cfg->device_family < IWL_DEVICE_FAMILY_8000)
 		return;
 
 	iwl_mvm_led_set(mvm, mvm->led.brightness > 0);

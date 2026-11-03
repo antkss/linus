@@ -8,26 +8,33 @@
  *	    Brian Austin, Cirrus Logic Inc, <brian.austin@cirrus.com>
  */
 
+#include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/delay.h>
-#include <linux/of_gpio.h>
 #include <linux/pm.h>
-#include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <sound/core.h>
+#include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
-#include <sound/initval.h>
 #include <sound/tlv.h>
-#include <sound/cs42l73.h>
-#include "cs42l73.h"
 #include "cirrus_legacy.h"
+#include "cs42l73.h"
+
+struct cs42l73_platform_data {
+	/* RST GPIO */
+	struct gpio_desc *reset_gpio;
+	unsigned int chgfreq;
+	int jack_detection;
+	unsigned int mclk_freq;
+};
 
 struct sp_config {
 	u8 spc, mmcc, spfs;
@@ -754,7 +761,7 @@ static const struct snd_soc_dapm_route cs42l73_audio_map[] = {
 	{"ASPOUTL", "ASP-IP Volume", "ASPL Output Mixer"},
 	{"ASPOUTR", "ASP-IP Volume", "ASPR Output Mixer"},
 
-	/* Auxillary Capture */
+	/* Auxiliary Capture */
 	{"XSPL Output Mixer", NULL, "Input Left Capture"},
 	{"XSPR Output Mixer", NULL, "Input Right Capture"},
 
@@ -943,11 +950,11 @@ static int cs42l73_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	mmcc = snd_soc_component_read(component, CS42L73_MMCC(id));
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		mmcc |= CS42L73_MS_MASTER;
 		break;
 
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		mmcc &= ~CS42L73_MS_MASTER;
 		break;
 
@@ -1094,6 +1101,7 @@ static int cs42l73_set_bias_level(struct snd_soc_component *component,
 				  enum snd_soc_bias_level level)
 {
 	struct cs42l73_private *cs42l73 = snd_soc_component_get_drvdata(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 
 	switch (level) {
 	case SND_SOC_BIAS_ON:
@@ -1105,7 +1113,7 @@ static int cs42l73_set_bias_level(struct snd_soc_component *component,
 		break;
 
 	case SND_SOC_BIAS_STANDBY:
-		if (snd_soc_component_get_bias_level(component) == SND_SOC_BIAS_OFF) {
+		if (snd_soc_dapm_get_bias_level(dapm) == SND_SOC_BIAS_OFF) {
 			regcache_cache_only(cs42l73->regmap, false);
 			regcache_sync(cs42l73->regmap);
 		}
@@ -1118,7 +1126,7 @@ static int cs42l73_set_bias_level(struct snd_soc_component *component,
 			mdelay(cs42l73->shutdwn_delay);
 			cs42l73->shutdwn_delay = 0;
 		} else {
-			mdelay(15); /* Min amount of time requred to power
+			mdelay(15); /* Min amount of time required to power
 				     * down.
 				     */
 		}
@@ -1155,12 +1163,19 @@ static int cs42l73_pcm_startup(struct snd_pcm_substream *substream,
 #define CS42L73_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE |\
 	SNDRV_PCM_FMTBIT_S24_LE)
 
+static const u64 cs42l73_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B;
+
 static const struct snd_soc_dai_ops cs42l73_ops = {
 	.startup = cs42l73_pcm_startup,
 	.hw_params = cs42l73_pcm_hw_params,
 	.set_fmt = cs42l73_set_dai_fmt,
 	.set_sysclk = cs42l73_set_sysclk,
 	.set_tristate = cs42l73_set_tristate,
+	.auto_selectable_formats = &cs42l73_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static struct snd_soc_dai_driver cs42l73_dai[] = {
@@ -1276,7 +1291,7 @@ static const struct regmap_config cs42l73_regmap = {
 static int cs42l73_i2c_probe(struct i2c_client *i2c_client)
 {
 	struct cs42l73_private *cs42l73;
-	struct cs42l73_platform_data *pdata = dev_get_platdata(&i2c_client->dev);
+	struct cs42l73_platform_data *pdata;
 	int ret, devid;
 	unsigned int reg;
 	u32 val32;
@@ -1292,38 +1307,27 @@ static int cs42l73_i2c_probe(struct i2c_client *i2c_client)
 		return ret;
 	}
 
-	if (pdata) {
-		cs42l73->pdata = *pdata;
-	} else {
-		pdata = devm_kzalloc(&i2c_client->dev, sizeof(*pdata),
-				     GFP_KERNEL);
-		if (!pdata)
-			return -ENOMEM;
+	pdata = devm_kzalloc(&i2c_client->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata)
+		return -ENOMEM;
 
-		if (i2c_client->dev.of_node) {
-			if (of_property_read_u32(i2c_client->dev.of_node,
-				"chgfreq", &val32) >= 0)
-				pdata->chgfreq = val32;
-		}
-		pdata->reset_gpio = of_get_named_gpio(i2c_client->dev.of_node,
-						"reset-gpio", 0);
-		cs42l73->pdata = *pdata;
+	if (i2c_client->dev.of_node) {
+		if (of_property_read_u32(i2c_client->dev.of_node, "chgfreq", &val32) >= 0)
+			pdata->chgfreq = val32;
 	}
+	pdata->reset_gpio = devm_gpiod_get_optional(&i2c_client->dev, "reset", GPIOD_OUT_LOW);
+
+	if (IS_ERR(pdata->reset_gpio))
+		return PTR_ERR(pdata->reset_gpio);
+
+	gpiod_set_consumer_name(pdata->reset_gpio, "CS42L73 /RST");
+	cs42l73->pdata = *pdata;
 
 	i2c_set_clientdata(i2c_client, cs42l73);
 
 	if (cs42l73->pdata.reset_gpio) {
-		ret = devm_gpio_request_one(&i2c_client->dev,
-					    cs42l73->pdata.reset_gpio,
-					    GPIOF_OUT_INIT_HIGH,
-					    "CS42L73 /RST");
-		if (ret < 0) {
-			dev_err(&i2c_client->dev, "Failed to request /RST %d: %d\n",
-				cs42l73->pdata.reset_gpio, ret);
-			return ret;
-		}
-		gpio_set_value_cansleep(cs42l73->pdata.reset_gpio, 0);
-		gpio_set_value_cansleep(cs42l73->pdata.reset_gpio, 1);
+		gpiod_set_value_cansleep(cs42l73->pdata.reset_gpio, 1);
+		gpiod_set_value_cansleep(cs42l73->pdata.reset_gpio, 0);
 	}
 
 	/* initialize codec */
@@ -1360,7 +1364,7 @@ static int cs42l73_i2c_probe(struct i2c_client *i2c_client)
 	return 0;
 
 err_reset:
-	gpio_set_value_cansleep(cs42l73->pdata.reset_gpio, 0);
+	gpiod_set_value_cansleep(cs42l73->pdata.reset_gpio, 1);
 
 	return ret;
 }
@@ -1372,8 +1376,8 @@ static const struct of_device_id cs42l73_of_match[] = {
 MODULE_DEVICE_TABLE(of, cs42l73_of_match);
 
 static const struct i2c_device_id cs42l73_id[] = {
-	{"cs42l73"},
-	{}
+	{ .name = "cs42l73" },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(i2c, cs42l73_id);

@@ -4,10 +4,13 @@
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
+#include <linux/in.h>
+#include <linux/ip.h>
 #include <linux/stddef.h>
 #include <linux/if_packet.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -27,6 +30,7 @@ bool seen_host;
 bool seen_mcast;
 
 int mark, prio;
+unsigned short headroom, tailroom;
 
 SEC("tc/ingress")
 int tc1(struct __sk_buff *skb)
@@ -104,11 +108,32 @@ out:
 	return TCX_PASS;
 }
 
+struct sk_buff {
+	struct net_device *dev;
+};
+
+struct net_device {
+	unsigned short needed_headroom;
+	unsigned short needed_tailroom;
+};
+
 SEC("tc/egress")
 int tc8(struct __sk_buff *skb)
 {
+	struct net_device *dev = BPF_CORE_READ((struct sk_buff *)skb, dev);
+	struct iphdr iph = {};
+
+	if (skb->protocol != __bpf_constant_htons(ETH_P_IP))
+		goto out;
+	if (bpf_skb_load_bytes(skb, sizeof(struct ethhdr), &iph, sizeof(iph)))
+		goto out;
+	if (iph.protocol != IPPROTO_ICMP)
+		goto out;
 	seen_tc8 = true;
 	mark = skb->mark;
 	prio = skb->priority;
+	headroom = BPF_CORE_READ(dev, needed_headroom);
+	tailroom = BPF_CORE_READ(dev, needed_tailroom);
+out:
 	return TCX_PASS;
 }

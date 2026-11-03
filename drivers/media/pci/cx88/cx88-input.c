@@ -190,8 +190,7 @@ static int __cx88_ir_start(void *priv)
 	ir = core->ir;
 
 	if (ir->polling) {
-		hrtimer_init(&ir->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		ir->timer.function = cx88_ir_work;
+		hrtimer_setup(&ir->timer, cx88_ir_work, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		hrtimer_start(&ir->timer,
 			      ktime_set(0, ir->polling * 1000000),
 			      HRTIMER_MODE_REL);
@@ -260,7 +259,7 @@ static void cx88_ir_close(struct rc_dev *rc)
 int cx88_ir_init(struct cx88_core *core, struct pci_dev *pci)
 {
 	struct cx88_IR *ir;
-	struct rc_dev *dev;
+	struct rc_dev *dev = NULL;
 	char *ir_codes = NULL;
 	u64 rc_proto = RC_PROTO_BIT_OTHER;
 	int err = -ENOMEM;
@@ -268,12 +267,9 @@ int cx88_ir_init(struct cx88_core *core, struct pci_dev *pci)
 				 * used with a full-code IR table
 				 */
 
-	ir = kzalloc(sizeof(*ir), GFP_KERNEL);
-	dev = rc_allocate_device(RC_DRIVER_IR_RAW);
-	if (!ir || !dev)
-		goto err_out_free;
-
-	ir->dev = dev;
+	ir = kzalloc_obj(*ir);
+	if (!ir)
+		return -ENOMEM;
 
 	/* detect & configure */
 	switch (core->boardnr) {
@@ -440,6 +436,13 @@ int cx88_ir_init(struct cx88_core *core, struct pci_dev *pci)
 		goto err_out_free;
 	}
 
+	dev = rc_allocate_device(ir->sampling ?
+				 RC_DRIVER_IR_RAW : RC_DRIVER_SCANCODE);
+	if (!dev)
+		goto err_out_free;
+
+	ir->dev = dev;
+
 	/*
 	 * The usage of mask_keycode were very convenient, due to several
 	 * reasons. Among others, the scancode tables were using the scancode
@@ -478,12 +481,10 @@ int cx88_ir_init(struct cx88_core *core, struct pci_dev *pci)
 	dev->close = cx88_ir_close;
 	dev->scancode_mask = hardware_mask;
 
-	if (ir->sampling) {
+	if (ir->sampling)
 		dev->timeout = MS_TO_US(10); /* 10 ms */
-	} else {
-		dev->driver_type = RC_DRIVER_SCANCODE;
+	else
 		dev->allowed_protocols = rc_proto;
-	}
 
 	ir->core = core;
 	core->ir = ir;
@@ -510,8 +511,9 @@ int cx88_ir_fini(struct cx88_core *core)
 	if (!ir)
 		return 0;
 
-	cx88_ir_stop(core);
 	rc_unregister_device(ir->dev);
+	cx88_ir_stop(core);
+	rc_free_device(ir->dev);
 	kfree(ir);
 
 	/* done */

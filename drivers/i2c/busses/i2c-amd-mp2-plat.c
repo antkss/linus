@@ -179,7 +179,7 @@ static u32 i2c_amd_func(struct i2c_adapter *a)
 }
 
 static const struct i2c_algorithm i2c_amd_algorithm = {
-	.master_xfer = i2c_amd_xfer,
+	.xfer = i2c_amd_xfer,
 	.functionality = i2c_amd_func,
 };
 
@@ -316,8 +316,10 @@ static int i2c_amd_probe(struct platform_device *pdev)
 
 	amd_mp2_pm_runtime_put(mp2_dev);
 
-	if (ret < 0)
+	if (ret < 0) {
 		dev_err(&pdev->dev, "i2c add adapter failed = %d\n", ret);
+		amd_mp2_unregister_cb(&i2c_dev->common);
+	}
 
 	return ret;
 }
@@ -339,7 +341,7 @@ static void i2c_amd_remove(struct platform_device *pdev)
 }
 
 static const struct acpi_device_id i2c_amd_acpi_match[] = {
-	{ "AMDI0011" },
+	{ .id = "AMDI0011" },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, i2c_amd_acpi_match);

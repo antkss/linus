@@ -9,6 +9,7 @@
 #include <linux/blkdev.h>
 #include <linux/interrupt.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -37,8 +38,10 @@
  * @host:	host to identify
  * @buffer:	userspace buffer for identification
  *
- * Return an identifying string at @buffer, if @buffer is non-NULL, filling
- * to the length stored at * (int *) @buffer.
+ * Return:
+ * * if successful, %1 and an identifying string at @buffer, if @buffer
+ * is non-NULL, filling to the length stored at * (int *) @buffer.
+ * * <0 error code on failure.
  */
 static int ioctl_probe(struct Scsi_Host *host, void __user *buffer)
 {
@@ -94,7 +97,8 @@ static int ioctl_internal_command(struct scsi_device *sdev, char *cmd,
 					    "ioctl_internal_command: "
 					    "ILLEGAL REQUEST "
 					    "asc=0x%x ascq=0x%x\n",
-					    sshdr.asc, sshdr.ascq);
+					    scsi_sense_asc(&sshdr),
+					    scsi_sense_ascq(&sshdr));
 			break;
 		case NOT_READY:	/* This happens if there is no disc in drive */
 			if (sdev->removable)
@@ -121,6 +125,16 @@ out:
 	return result;
 }
 
+/**
+ * scsi_set_medium_removal() - send command to allow or prevent medium removal
+ * @sdev: target scsi device
+ * @state: removal state to set (prevent or allow)
+ *
+ * Returns:
+ * * %0 if @sdev is not removable or not lockable or successful.
+ * * non-%0 is a SCSI result code if > 0 or kernel error code if < 0.
+ * * Sets @sdev->locked to the new state on success.
+ */
 int scsi_set_medium_removal(struct scsi_device *sdev, char state)
 {
 	char scsi_cmd[MAX_COMMAND_SIZE];
@@ -164,10 +178,13 @@ static int scsi_ioctl_get_pci(struct scsi_device *sdev, void __user *arg)
 
 	name = dev_name(dev);
 
-	/* compatibility with old ioctl which only returned
-	 * 20 characters */
-        return copy_to_user(arg, name, min(strlen(name), (size_t)20))
-		? -EFAULT: 0;
+	/*
+	 * Compatibility with old ioctl which only returned 20 characters.
+	 */
+	if (copy_to_user(arg, name, strnlen(name, 20)))
+		return -EFAULT;
+
+	return 0;
 }
 
 static int sg_get_version(int __user *p)
@@ -180,10 +197,14 @@ static int sg_set_timeout(struct scsi_device *sdev, int __user *p)
 {
 	int timeout, err = get_user(timeout, p);
 
-	if (!err)
-		sdev->sg_timeout = clock_t_to_jiffies(timeout);
+	if (err)
+		return err;
+	if (timeout < 0)
+		return -EIO;
 
-	return err;
+	sdev->sg_timeout = min(clock_t_to_jiffies(timeout),
+			       min(UINT_MAX, MAX_JIFFY_OFFSET));
+	return 0;
 }
 
 static int sg_get_reserved_size(struct scsi_device *sdev, int __user *p)
@@ -242,11 +263,15 @@ static int scsi_send_start_stop(struct scsi_device *sdev, int data)
 				      NORMAL_RETRIES);
 }
 
-/*
- * Check if the given command is allowed.
+/**
+ * scsi_cmd_allowed() - Check if the given command is allowed.
+ * @cmd:            SCSI command to check
+ * @open_for_write: is the file / block device opened for writing?
  *
  * Only a subset of commands are allowed for unprivileged users. Commands used
  * to format the media, update the firmware, etc. are not permitted.
+ *
+ * Return: %true if the cmd is allowed, otherwise @false.
  */
 bool scsi_cmd_allowed(unsigned char *cmd, bool open_for_write)
 {
@@ -585,7 +610,7 @@ static int sg_scsi_ioctl(struct request_queue *q, bool open_for_write,
 	}
 
 	if (bytes) {
-		err = blk_rq_map_kern(q, rq, buffer, bytes, GFP_NOIO);
+		err = blk_rq_map_kern(rq, buffer, bytes, GFP_NOIO);
 		if (err)
 			goto error;
 	}
@@ -859,6 +884,8 @@ static int scsi_ioctl_sg_io(struct scsi_device *sdev, bool open_for_write,
  * Description: The scsi_ioctl() function differs from most ioctls in that it
  * does not take a major/minor number as the dev field.  Rather, it takes
  * a pointer to a &struct scsi_device.
+ *
+ * Return: varies depending on the @cmd
  */
 int scsi_ioctl(struct scsi_device *sdev, bool open_for_write, int cmd,
 		void __user *arg)
@@ -941,8 +968,15 @@ int scsi_ioctl(struct scsi_device *sdev, bool open_for_write, int cmd,
 }
 EXPORT_SYMBOL(scsi_ioctl);
 
-/*
+/**
+ * scsi_ioctl_block_when_processing_errors - prevent commands from being queued
+ * @sdev: target scsi device
+ * @cmd: which ioctl is it
+ * @ndelay: no delay (non-blocking)
+ *
  * We can process a reset even when a device isn't fully operable.
+ *
+ * Return: %0 on success, <0 error code.
  */
 int scsi_ioctl_block_when_processing_errors(struct scsi_device *sdev, int cmd,
 		bool ndelay)

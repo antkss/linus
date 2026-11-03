@@ -48,8 +48,7 @@ static inline int rsctrl_enable_rspll_write(void)
 				  RSCTRL_KEY_MASK, RSCTRL_KEY);
 }
 
-static int rsctrl_restart_handler(struct notifier_block *this,
-				  unsigned long mode, void *cmd)
+static int rsctrl_restart_handler(struct sys_off_data *data)
 {
 	/* enable write access to RSTCTRL */
 	rsctrl_enable_rspll_write();
@@ -60,11 +59,6 @@ static int rsctrl_restart_handler(struct notifier_block *this,
 
 	return NOTIFY_DONE;
 }
-
-static struct notifier_block rsctrl_restart_nb = {
-	.notifier_call = rsctrl_restart_handler,
-	.priority = 128,
-};
 
 static const struct of_device_id rsctrl_of_match[] = {
 	{.compatible = "ti,keystone-reset", },
@@ -87,25 +81,15 @@ static int rsctrl_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	/* get regmaps */
-	pllctrl_regs = syscon_regmap_lookup_by_phandle(np, "ti,syscon-pll");
+	pllctrl_regs = syscon_regmap_lookup_by_phandle_args(np, "ti,syscon-pll",
+							    1, &rspll_offset);
 	if (IS_ERR(pllctrl_regs))
 		return PTR_ERR(pllctrl_regs);
 
-	devctrl_regs = syscon_regmap_lookup_by_phandle(np, "ti,syscon-dev");
+	devctrl_regs = syscon_regmap_lookup_by_phandle_args(np, "ti,syscon-dev",
+							    1, &rsmux_offset);
 	if (IS_ERR(devctrl_regs))
 		return PTR_ERR(devctrl_regs);
-
-	ret = of_property_read_u32_index(np, "ti,syscon-pll", 1, &rspll_offset);
-	if (ret) {
-		dev_err(dev, "couldn't read the reset pll offset!\n");
-		return -EINVAL;
-	}
-
-	ret = of_property_read_u32_index(np, "ti,syscon-dev", 1, &rsmux_offset);
-	if (ret) {
-		dev_err(dev, "couldn't read the rsmux offset!\n");
-		return -EINVAL;
-	}
 
 	/* set soft/hard reset */
 	val = of_property_read_bool(np, "ti,soft-reset");
@@ -128,8 +112,7 @@ static int rsctrl_probe(struct platform_device *pdev)
 	for (i = 0; i < WDT_MUX_NUMBER; i++) {
 		ret = of_property_read_u32_index(np, "ti,wdt-list", i, &val);
 		if (ret == -EOVERFLOW && !i) {
-			dev_err(dev, "ti,wdt-list property has to contain at"
-				"least one entry\n");
+			dev_err(dev, "ti,wdt-list property has to contain at least one entry\n");
 			return -EINVAL;
 		} else if (ret) {
 			break;
@@ -150,7 +133,8 @@ static int rsctrl_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	ret = register_restart_handler(&rsctrl_restart_nb);
+	ret = devm_register_sys_off_handler(dev, SYS_OFF_MODE_RESTART, 128,
+					    rsctrl_restart_handler, NULL);
 	if (ret)
 		dev_err(dev, "cannot register restart handler (err=%d)\n", ret);
 

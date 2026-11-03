@@ -39,6 +39,10 @@ number for this vcpu. This interrupt could be a PPI or SPI, but the interrupt
 type must be same for each vcpu. As a PPI, the interrupt number is the same for
 all vcpus, while as an SPI it must be a separate number per vcpu.
 
+For GICv5-based guests, the architected PPI (23) must be used, and must be
+communicated as the full GICv5-style Interrupt ID, i.e., 0x20000017. This ioctl
+can be omitted altogether for a GICv5-based guest.
+
 1.2 ATTRIBUTE: KVM_ARM_VCPU_PMU_V3_INIT
 ---------------------------------------
 
@@ -49,14 +53,18 @@ Returns:
 	 =======  ======================================================
 	 -EEXIST  Interrupt number already used
 	 -ENODEV  PMUv3 not supported or GIC not initialized
-	 -ENXIO   PMUv3 not supported, missing VCPU feature or interrupt
-		  number not set
+	 -ENXIO   PMUv3 not supported, missing VCPU feature, missing
+                  hardware PMU, or interrupt number not set (non-GICv5
+                  guests, only)
 	 -EBUSY   PMUv3 already initialized
 	 =======  ======================================================
 
 Request the initialization of the PMUv3.  If using the PMUv3 with an in-kernel
 virtual GIC implementation, this must be done after initializing the in-kernel
 irqchip.
+
+When the KVM_ARM_VCPU_PMU_V3_STRICT vCPU feature is enabled this must be done
+after selecting a hardware PMU.
 
 1.3 ATTRIBUTE: KVM_ARM_VCPU_PMU_V3_FILTER
 -----------------------------------------
@@ -104,6 +112,9 @@ hardware event. Filtering event 0x1E (CHAIN) has no effect either, as it
 isn't strictly speaking an event. Filtering the cycle counter is possible
 using event 0x11 (CPU_CYCLES).
 
+When the KVM_ARM_VCPU_PMU_V3_STRICT vCPU feature is enabled this must be done
+after selecting a hardware PMU.
+
 1.4 ATTRIBUTE: KVM_ARM_VCPU_PMU_V3_SET_PMU
 ------------------------------------------
 
@@ -124,7 +135,7 @@ using event 0x11 (CPU_CYCLES).
 Request that the VCPU uses the specified hardware PMU when creating guest events
 for the purpose of PMU emulation. The PMU identifier can be read from the "type"
 file for the desired PMU instance under /sys/devices (or, equivalent,
-/sys/bus/even_source). This attribute is particularly useful on heterogeneous
+/sys/bus/event_source). This attribute is particularly useful on heterogeneous
 systems where there are at least two CPU PMUs on the system. The PMU that is set
 for one VCPU will be used by all the other VCPUs. It isn't possible to set a PMU
 if a PMU event filter is already present.
@@ -137,13 +148,37 @@ exit_reason = KVM_EXIT_FAIL_ENTRY and populate the fail_entry struct by setting
 hardare_entry_failure_reason field to KVM_EXIT_FAIL_ENTRY_CPU_UNSUPPORTED and
 the cpu field to the processor id.
 
+1.5 ATTRIBUTE: KVM_ARM_VCPU_PMU_V3_SET_NR_COUNTERS
+--------------------------------------------------
+
+:Parameters: in kvm_device_attr.addr the address to an unsigned int
+	     representing the maximum value taken by PMCR_EL0.N
+
+:Returns:
+
+	 =======  ====================================================
+	 -EBUSY   PMUv3 already initialized, a VCPU has already run or
+                  an event filter has already been set
+	 -EFAULT  Error accessing the value pointed to by addr
+	 -ENODEV  PMUv3 not supported or GIC not initialized
+	 -EINVAL  No PMUv3 explicitly selected, or value of N out of
+	 	  range
+	 =======  ====================================================
+
+Set the number of implemented event counters in the virtual PMU. This
+mandates that a PMU has explicitly been selected via
+KVM_ARM_VCPU_PMU_V3_SET_PMU, and will fail when no PMU has been
+explicitly selected, or the number of counters is out of range for the
+selected PMU. Selecting a new PMU cancels the effect of setting this
+attribute.
+
 2. GROUP: KVM_ARM_VCPU_TIMER_CTRL
 =================================
 
 :Architectures: ARM64
 
-2.1. ATTRIBUTES: KVM_ARM_VCPU_TIMER_IRQ_VTIMER, KVM_ARM_VCPU_TIMER_IRQ_PTIMER
------------------------------------------------------------------------------
+2.1. ATTRIBUTES: KVM_ARM_VCPU_TIMER_IRQ_{VTIMER,PTIMER,HVTIMER,HPTIMER}
+-----------------------------------------------------------------------
 
 :Parameters: in kvm_device_attr.addr the address for the timer interrupt is a
 	     pointer to an int
@@ -159,10 +194,12 @@ A value describing the architected timer interrupt number when connected to an
 in-kernel virtual GIC.  These must be a PPI (16 <= intid < 32).  Setting the
 attribute overrides the default values (see below).
 
-=============================  ==========================================
-KVM_ARM_VCPU_TIMER_IRQ_VTIMER  The EL1 virtual timer intid (default: 27)
-KVM_ARM_VCPU_TIMER_IRQ_PTIMER  The EL1 physical timer intid (default: 30)
-=============================  ==========================================
+==============================  ==========================================
+KVM_ARM_VCPU_TIMER_IRQ_VTIMER   The EL1 virtual timer intid (default: 27)
+KVM_ARM_VCPU_TIMER_IRQ_PTIMER   The EL1 physical timer intid (default: 30)
+KVM_ARM_VCPU_TIMER_IRQ_HVTIMER  The EL2 virtual timer intid (default: 28)
+KVM_ARM_VCPU_TIMER_IRQ_HPTIMER  The EL2 physical timer intid (default: 26)
+==============================  ==========================================
 
 Setting the same PPI for different timers will prevent the VCPUs from running.
 Setting the interrupt number on a VCPU configures all VCPUs created at that
@@ -194,7 +231,8 @@ Returns:
 Specifies the base address of the stolen time structure for this VCPU. The
 base address must be 64 byte aligned and exist within a valid guest memory
 region. See Documentation/virt/kvm/arm/pvtime.rst for more information
-including the layout of the stolen time structure.
+including the layout of the stolen time structure. Stolen time is not
+supported for protected VMs (see Documentation/virt/kvm/arm/pkvm.rst).
 
 4. GROUP: KVM_VCPU_TSC_CTRL
 ===========================

@@ -13,6 +13,7 @@
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/stringify.h>
 #include <linux/types.h>
 #include <linux/watchdog.h>
 #include <uapi/linux/psci.h>
@@ -46,6 +47,8 @@ static int smcwd_call(struct watchdog_device *wdd, enum smcwd_call call,
 		return -ENODEV;
 	if (res->a0 == PSCI_RET_INVALID_PARAMS)
 		return -EINVAL;
+	if (res->a0 == PSCI_RET_DISABLED)
+		return -ENODATA;
 	if (res->a0 != PSCI_RET_SUCCESS)
 		return -EIO;
 	return 0;
@@ -131,10 +134,19 @@ static int smcwd_probe(struct platform_device *pdev)
 
 	wdd->info = &smcwd_info;
 	/* get_timeleft is optional */
-	if (smcwd_call(wdd, SMCWD_GET_TIMELEFT, 0, NULL))
-		wdd->ops = &smcwd_ops;
-	else
+	err = smcwd_call(wdd, SMCWD_GET_TIMELEFT, 0, NULL);
+	switch (err) {
+	case 0:
+		set_bit(WDOG_HW_RUNNING, &wdd->status);
+		fallthrough;
+	case -ENODATA:
 		wdd->ops = &smcwd_timeleft_ops;
+		break;
+	default:
+		wdd->ops = &smcwd_ops;
+		break;
+	}
+
 	wdd->timeout = res.a2;
 	wdd->max_timeout = res.a2;
 	wdd->min_timeout = res.a1;
@@ -180,7 +192,7 @@ MODULE_PARM_DESC(timeout, "Watchdog heartbeat in seconds");
 
 module_param(nowayout, bool, 0);
 MODULE_PARM_DESC(nowayout, "Watchdog cannot be stopped once started (default="
-			__MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
+			__stringify(WATCHDOG_NOWAYOUT) ")");
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Julius Werner <jwerner@chromium.org>");

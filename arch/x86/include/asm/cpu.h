@@ -7,12 +7,12 @@
 #include <linux/topology.h>
 #include <linux/nodemask.h>
 #include <linux/percpu.h>
+
 #include <asm/ibt.h>
+#include <asm/cpuid/leaf_types.h>
 
 #ifndef CONFIG_SMP
 #define cpu_physical_id(cpu)			boot_cpu_physical_apicid
-#define cpu_acpi_id(cpu)			0
-#define safe_smp_processor_id()			0
 #endif /* CONFIG_SMP */
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -26,6 +26,10 @@ int mwait_usable(const struct cpuinfo_x86 *);
 unsigned int x86_family(unsigned int sig);
 unsigned int x86_model(unsigned int sig);
 unsigned int x86_stepping(unsigned int sig);
+
+unsigned int cpuid_family(const struct leaf_0x1_0 *l);
+unsigned int cpuid_model(const struct leaf_0x1_0 *l);
+
 #ifdef CONFIG_X86_BUS_LOCK_DETECT
 extern void __init sld_setup(struct cpuinfo_x86 *c);
 extern bool handle_user_split_lock(struct pt_regs *regs, long error_code);
@@ -50,20 +54,6 @@ static inline void split_lock_init(void) {}
 static inline void bus_lock_init(void) {}
 #endif
 
-#ifdef CONFIG_CPU_SUP_INTEL
-u8 get_this_hybrid_cpu_type(void);
-u32 get_this_hybrid_cpu_native_id(void);
-#else
-static inline u8 get_this_hybrid_cpu_type(void)
-{
-	return 0;
-}
-
-static inline u32 get_this_hybrid_cpu_native_id(void)
-{
-	return 0;
-}
-#endif
 #ifdef CONFIG_IA32_FEAT_CTL
 void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
 #else

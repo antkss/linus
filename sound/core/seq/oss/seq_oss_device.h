@@ -55,7 +55,6 @@ struct seq_oss_chinfo {
 struct seq_oss_synthinfo {
 	struct snd_seq_oss_arg arg;
 	struct seq_oss_chinfo *ch;
-	struct seq_oss_synth_sysex *sysex;
 	int nr_voices;
 	int opened;
 	int is_midi;
@@ -73,6 +72,7 @@ struct seq_oss_devinfo {
 	int cseq;	/* sequencer client number */
 	int port;	/* sequencer port number */
 	int queue;	/* sequencer queue number */
+	bool initialized;
 
 	struct snd_seq_addr addr;	/* address of this device */
 
@@ -138,12 +138,7 @@ snd_seq_oss_dispatch(struct seq_oss_devinfo *dp, struct snd_seq_event *ev, int a
 static inline int
 snd_seq_oss_control(struct seq_oss_devinfo *dp, unsigned int type, void *arg)
 {
-	int err;
-
-	snd_seq_client_ioctl_lock(dp->cseq);
-	err = snd_seq_kernel_client_ctl(dp->cseq, type, arg);
-	snd_seq_client_ioctl_unlock(dp->cseq);
-	return err;
+	return snd_seq_kernel_client_ioctl(dp->cseq, type, arg);
 }
 
 /* fill the addresses in header */
@@ -156,9 +151,5 @@ snd_seq_oss_fill_addr(struct seq_oss_devinfo *dp, struct snd_seq_event *ev,
 	ev->dest.client = dest_client;
 	ev->dest.port = dest_port;
 }
-
-
-/* misc. functions for proc interface */
-char *enabled_str(bool b);
 
 #endif /* __SEQ_OSS_DEVICE_H */

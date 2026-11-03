@@ -81,18 +81,26 @@ nilfs_cpfile_block_add_valid_checkpoints(const struct inode *cpfile,
 	return count;
 }
 
-static unsigned int
+static int
 nilfs_cpfile_block_sub_valid_checkpoints(const struct inode *cpfile,
 					 struct buffer_head *bh,
 					 unsigned int n)
 {
 	struct nilfs_checkpoint *cp;
-	unsigned int count;
+	unsigned int checkpoints_count;
+	int count;
 
 	cp = kmap_local_folio(bh->b_folio,
 			      offset_in_folio(bh->b_folio, bh->b_data));
-	WARN_ON(le32_to_cpu(cp->cp_checkpoints_count) < n);
-	count = le32_to_cpu(cp->cp_checkpoints_count) - n;
+	checkpoints_count = le32_to_cpu(cp->cp_checkpoints_count);
+	if (unlikely(checkpoints_count < n)) {
+		nilfs_error(cpfile->i_sb,
+			    "deleted checkpoints count %u exceeds block count %u",
+			    n, checkpoints_count);
+		kunmap_local(cp);
+		return -EIO;
+	}
+	count = checkpoints_count - n;
 	cp->cp_checkpoints_count = cpu_to_le32(count);
 	kunmap_local(cp);
 	return count;
@@ -191,14 +199,11 @@ static inline int nilfs_cpfile_get_checkpoint_block(struct inode *cpfile,
  * @cnop: place to store the next checkpoint number
  * @bhp: place to store a pointer to buffer_head struct
  *
- * Return Value: On success, it returns 0. On error, the following negative
- * error code is returned.
- *
- * %-ENOMEM - Insufficient memory available.
- *
- * %-EIO - I/O error
- *
- * %-ENOENT - no block exists in the range.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOENT	- no block exists in the range.
+ * * %-ENOMEM	- Insufficient memory available.
  */
 static int nilfs_cpfile_find_checkpoint_block(struct inode *cpfile,
 					      __u64 start_cno, __u64 end_cno,
@@ -239,7 +244,8 @@ static inline int nilfs_cpfile_delete_checkpoint_block(struct inode *cpfile,
  * stores it to the inode file given by @ifile and the nilfs root object
  * given by @root.
  *
- * Return: 0 on success, or the following negative error code on failure.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
  * * %-EINVAL	- Invalid checkpoint.
  * * %-ENOMEM	- Insufficient memory available.
  * * %-EIO	- I/O error (including metadata corruption).
@@ -307,7 +313,8 @@ out_sem:
  * In either case, the buffer of the block containing the checkpoint entry
  * and the cpfile inode are made dirty for inclusion in the write log.
  *
- * Return: 0 on success, or the following negative error code on failure.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
  * * %-ENOMEM	- Insufficient memory available.
  * * %-EIO	- I/O error (including metadata corruption).
  * * %-EROFS	- Read only filesystem
@@ -376,7 +383,8 @@ out_sem:
  * cpfile with the data given by the arguments @root, @blkinc, @ctime, and
  * @minor.
  *
- * Return: 0 on success, or the following negative error code on failure.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
  * * %-ENOMEM	- Insufficient memory available.
  * * %-EIO	- I/O error (including metadata corruption).
  */
@@ -447,14 +455,11 @@ error:
  * the period from @start to @end, excluding @end itself. The checkpoints
  * which have been already deleted are ignored.
  *
- * Return Value: On success, 0 is returned. On error, one of the following
- * negative error codes is returned.
- *
- * %-EIO - I/O error.
- *
- * %-ENOMEM - Insufficient amount of memory available.
- *
- * %-EINVAL - invalid checkpoints.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EINVAL	- Invalid checkpoints.
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOMEM	- Insufficient memory available.
  */
 int nilfs_cpfile_delete_checkpoints(struct inode *cpfile,
 				    __u64 start,
@@ -525,6 +530,10 @@ int nilfs_cpfile_delete_checkpoints(struct inode *cpfile,
 		count = nilfs_cpfile_block_sub_valid_checkpoints(cpfile, cp_bh,
 								 nicps);
 		brelse(cp_bh);
+		if (unlikely(count < 0)) {
+			ret = count;
+			break;
+		}
 		if (count)
 			continue;
 
@@ -718,7 +727,7 @@ static ssize_t nilfs_cpfile_do_get_ssinfo(struct inode *cpfile, __u64 *cnop,
  * number to continue searching.
  *
  * Return: Count of checkpoint info items stored in the output buffer on
- * success, or the following negative error code on failure.
+ * success, or one of the following negative error codes on failure:
  * * %-EINVAL	- Invalid checkpoint mode.
  * * %-ENOMEM	- Insufficient memory available.
  * * %-EIO	- I/O error (including metadata corruption).
@@ -743,7 +752,8 @@ ssize_t nilfs_cpfile_get_cpinfo(struct inode *cpfile, __u64 *cnop, int mode,
  * @cpfile: checkpoint file inode
  * @cno:    checkpoint number to delete
  *
- * Return: 0 on success, or the following negative error code on failure.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
  * * %-EBUSY	- Checkpoint in use (snapshot specified).
  * * %-EIO	- I/O error (including metadata corruption).
  * * %-ENOENT	- No valid checkpoint found.
@@ -1011,7 +1021,7 @@ static int nilfs_cpfile_clear_snapshot(struct inode *cpfile, __u64 cno)
  * @cno:    checkpoint number
  *
  * Return: 1 if the checkpoint specified by @cno is a snapshot, 0 if not, or
- * the following negative error code on failure.
+ * one of the following negative error codes on failure:
  * * %-EIO	- I/O error (including metadata corruption).
  * * %-ENOENT	- No such checkpoint.
  * * %-ENOMEM	- Insufficient memory available.
@@ -1058,14 +1068,11 @@ int nilfs_cpfile_is_snapshot(struct inode *cpfile, __u64 cno)
  * Description: nilfs_change_cpmode() changes the mode of the checkpoint
  * specified by @cno. The mode @mode is NILFS_CHECKPOINT or NILFS_SNAPSHOT.
  *
- * Return Value: On success, 0 is returned. On error, one of the following
- * negative error codes is returned.
- *
- * %-EIO - I/O error.
- *
- * %-ENOMEM - Insufficient amount of memory available.
- *
- * %-ENOENT - No such checkpoint.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOENT	- No such checkpoint.
+ * * %-ENOMEM	- Insufficient memory available.
  */
 int nilfs_cpfile_change_cpmode(struct inode *cpfile, __u64 cno, int mode)
 {
@@ -1097,14 +1104,12 @@ int nilfs_cpfile_change_cpmode(struct inode *cpfile, __u64 cno, int mode)
  * @cpstat: pointer to a structure of checkpoint statistics
  *
  * Description: nilfs_cpfile_get_stat() returns information about checkpoints.
+ * The checkpoint statistics are stored in the location pointed to by @cpstat.
  *
- * Return Value: On success, 0 is returned, and checkpoints information is
- * stored in the place pointed by @cpstat. On error, one of the following
- * negative error codes is returned.
- *
- * %-EIO - I/O error.
- *
- * %-ENOMEM - Insufficient amount of memory available.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOMEM	- Insufficient memory available.
  */
 int nilfs_cpfile_get_stat(struct inode *cpfile, struct nilfs_cpstat *cpstat)
 {
@@ -1135,6 +1140,8 @@ int nilfs_cpfile_get_stat(struct inode *cpfile, struct nilfs_cpstat *cpstat)
  * @cpsize: size of a checkpoint entry
  * @raw_inode: on-disk cpfile inode
  * @inodep: buffer to store the inode
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 int nilfs_cpfile_read(struct super_block *sb, size_t cpsize,
 		      struct nilfs_inode *raw_inode, struct inode **inodep)
@@ -1153,7 +1160,7 @@ int nilfs_cpfile_read(struct super_block *sb, size_t cpsize,
 	cpfile = nilfs_iget_locked(sb, NULL, NILFS_CPFILE_INO);
 	if (unlikely(!cpfile))
 		return -ENOMEM;
-	if (!(cpfile->i_state & I_NEW))
+	if (!(inode_state_read_once(cpfile) & I_NEW))
 		goto out;
 
 	err = nilfs_mdt_init(cpfile, NILFS_MDT_GFP, 0);

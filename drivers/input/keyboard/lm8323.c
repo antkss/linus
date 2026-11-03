@@ -21,6 +21,7 @@
 #include <linux/platform_data/lm8323.h>
 #include <linux/pm.h>
 #include <linux/slab.h>
+#include <linux/string_choices.h>
 
 /* Commands to send to the chip. */
 #define LM8323_CMD_READ_ID		0x80 /* Read chip ID. */
@@ -258,7 +259,7 @@ static void process_keys(struct lm8323_chip *lm)
 	ret = lm8323_read(lm, LM8323_CMD_READ_FIFO, key_fifo, LM8323_FIFO_LEN);
 
 	if (ret < 0) {
-		dev_err(&lm->client->dev, "Failed reading fifo \n");
+		dev_err(&lm->client->dev, "Failed reading fifo\n");
 		return;
 	}
 	key_fifo[ret] = 0;
@@ -269,7 +270,7 @@ static void process_keys(struct lm8323_chip *lm)
 		unsigned short keycode = lm->keymap[key];
 
 		dev_vdbg(&lm->client->dev, "key 0x%02x %s\n",
-			 key, isdown ? "down" : "up");
+			 key, str_down_up(isdown));
 
 		if (lm->kp_enabled) {
 			input_event(lm->idev, EV_MSC, MSC_SCAN, key);
@@ -787,7 +788,7 @@ static int lm8323_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(lm8323_pm_ops, lm8323_suspend, lm8323_resume);
 
 static const struct i2c_device_id lm8323_id[] = {
-	{ "lm8323" },
+	{ .name = "lm8323" },
 	{ }
 };
 

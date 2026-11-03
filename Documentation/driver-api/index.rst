@@ -47,6 +47,7 @@ of interest to most developers working on device drivers.
    vfio-mediated-device
    vfio
    vfio-pci-device-specific-driver-acceptance
+   vfio-selftests
 
 Bus-level documentation
 =======================
@@ -81,19 +82,23 @@ Subsystem-specific APIs
    acpi/index
    backlight/lp855x-driver.rst
    clk
+   coco/index
    console
    crypto/index
    dmaengine/index
    dpll
    edac
+   extcon
    firmware/index
    fpga/index
    frame-buffer
    aperture
    generic-counter
+   generic_pt
    gpio/index
    hsi
    hte/index
+   hw-recoverable-errors
    i2c
    iio/index
    infiniband
@@ -101,6 +106,7 @@ Subsystem-specific APIs
    interconnect
    ipmb
    ipmi
+   issei/index
    libata
    mailbox
    md/index
@@ -134,6 +140,7 @@ Subsystem-specific APIs
    sm501
    soundwire/index
    spi
+   steal-governor
    surface_aggregator/index
    switchtec
    sync_file
@@ -145,10 +152,3 @@ Subsystem-specific APIs
    wmi
    xilinx/index
    zorro
-
-.. only::  subproject and html
-
-   Indices
-   =======
-
-   * :ref:`genindex`

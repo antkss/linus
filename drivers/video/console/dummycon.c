@@ -85,6 +85,20 @@ static bool dummycon_blank(struct vc_data *vc, enum vesa_blank_mode blank,
 	/* Redraw, so that we get putc(s) for output done while blanked */
 	return true;
 }
+
+static bool dummycon_unblank(struct vc_data *vc, bool mode_switch)
+{
+	return true;
+}
+
+static bool dummycon_switch(struct vc_data *vc)
+{
+	/*
+	 * Redraw, so that we get putc(s) for output done while switched
+	 * away. Informs deferred consoles to take over the display.
+	 */
+	return true;
+}
 #else
 static void dummycon_putc(struct vc_data *vc, u16 c, unsigned int y,
 			  unsigned int x) { }
@@ -92,6 +106,16 @@ static void dummycon_putcs(struct vc_data *vc, const u16 *s, unsigned int count,
 			   unsigned int ypos, unsigned int xpos) { }
 static bool dummycon_blank(struct vc_data *vc, enum vesa_blank_mode blank,
 			   bool mode_switch)
+{
+	return false;
+}
+
+static bool dummycon_unblank(struct vc_data *vc, bool mode_switch)
+{
+	return false;
+}
+
+static bool dummycon_switch(struct vc_data *vc)
 {
 	return false;
 }
@@ -124,11 +148,6 @@ static bool dummycon_scroll(struct vc_data *vc, unsigned int top,
 	return false;
 }
 
-static bool dummycon_switch(struct vc_data *vc)
-{
-	return false;
-}
-
 /*
  *  The console `switch' structure for the dummy console
  *
@@ -147,5 +166,6 @@ const struct consw dummy_con = {
 	.con_scroll =	dummycon_scroll,
 	.con_switch =	dummycon_switch,
 	.con_blank =	dummycon_blank,
+	.con_unblank =	dummycon_unblank,
 };
 EXPORT_SYMBOL_GPL(dummy_con);

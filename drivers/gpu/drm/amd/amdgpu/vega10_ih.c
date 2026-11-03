@@ -364,9 +364,8 @@ static u32 vega10_ih_get_wptr(struct amdgpu_device *adev,
 	 * this should allow us to catchup.
 	 */
 	tmp = (wptr + 32) & ih->ptr_mask;
-	dev_warn(adev->dev, "IH ring buffer overflow "
-		 "(0x%08X, 0x%08X, 0x%08X)\n",
-		 wptr, ih->rptr, tmp);
+	dev_warn_ratelimited(adev->dev, "%s ring buffer overflow (0x%08X, 0x%08X, 0x%08X)\n",
+			     amdgpu_ih_ring_name(adev, ih), wptr, ih->rptr, tmp);
 	ih->rptr = tmp;
 
 	tmp = RREG32_NO_KIQ(ih_regs->ih_rb_cntl);
@@ -556,23 +555,10 @@ static int vega10_ih_resume(struct amdgpu_ip_block *ip_block)
 	return vega10_ih_hw_init(ip_block);
 }
 
-static bool vega10_ih_is_idle(void *handle)
-{
-	/* todo */
-	return true;
-}
-
 static int vega10_ih_wait_for_idle(struct amdgpu_ip_block *ip_block)
 {
 	/* todo */
 	return -ETIMEDOUT;
-}
-
-static int vega10_ih_soft_reset(struct amdgpu_ip_block *ip_block)
-{
-	/* todo */
-
-	return 0;
 }
 
 static void vega10_ih_update_clockgating_state(struct amdgpu_device *adev,
@@ -605,10 +591,10 @@ static void vega10_ih_update_clockgating_state(struct amdgpu_device *adev,
 	}
 }
 
-static int vega10_ih_set_clockgating_state(void *handle,
+static int vega10_ih_set_clockgating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_clockgating_state state)
 {
-	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+	struct amdgpu_device *adev = ip_block->adev;
 
 	vega10_ih_update_clockgating_state(adev,
 				state == AMD_CG_STATE_GATE);
@@ -616,7 +602,7 @@ static int vega10_ih_set_clockgating_state(void *handle,
 
 }
 
-static int vega10_ih_set_powergating_state(void *handle,
+static int vega10_ih_set_powergating_state(struct amdgpu_ip_block *ip_block,
 					  enum amd_powergating_state state)
 {
 	return 0;
@@ -631,9 +617,7 @@ const struct amd_ip_funcs vega10_ih_ip_funcs = {
 	.hw_fini = vega10_ih_hw_fini,
 	.suspend = vega10_ih_suspend,
 	.resume = vega10_ih_resume,
-	.is_idle = vega10_ih_is_idle,
 	.wait_for_idle = vega10_ih_wait_for_idle,
-	.soft_reset = vega10_ih_soft_reset,
 	.set_clockgating_state = vega10_ih_set_clockgating_state,
 	.set_powergating_state = vega10_ih_set_powergating_state,
 };

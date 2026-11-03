@@ -141,6 +141,13 @@ static void __maybe_unused sync_exp_reset_tree(void)
 		raw_spin_lock_irqsave_rcu_node(rnp, flags);
 		WARN_ON_ONCE(rnp->expmask);
 		WRITE_ONCE(rnp->expmask, rnp->expmaskinit);
+		/*
+		 * Need to wait for any blocked tasks as well.	Note that
+		 * additional blocking tasks will also block the expedited GP
+		 * until such time as the ->expmask bits are cleared.
+		 */
+		if (rcu_is_leaf_node(rnp) && rcu_preempt_has_tasks(rnp))
+			WRITE_ONCE(rnp->exp_tasks, rnp->blkd_tasks.next);
 		raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 	}
 }
@@ -200,7 +207,7 @@ static void __rcu_report_exp_rnp(struct rcu_node *rnp,
 		if (rnp->parent == NULL) {
 			raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 			if (wake)
-				swake_up_one_online(&rcu_state.expedited_wq);
+				swake_up_one(&rcu_state.expedited_wq);
 
 			break;
 		}
@@ -227,20 +234,22 @@ static void __maybe_unused rcu_report_exp_rnp(struct rcu_node *rnp, bool wake)
 
 /*
  * Report expedited quiescent state for multiple CPUs, all covered by the
- * specified leaf rcu_node structure.
+ * specified leaf rcu_node structure, which is acquired by the caller.
  */
-static void rcu_report_exp_cpu_mult(struct rcu_node *rnp,
-				    unsigned long mask, bool wake)
+static void rcu_report_exp_cpu_mult(struct rcu_node *rnp, unsigned long flags,
+				    unsigned long mask_in, bool wake)
+				    __releases(rnp->lock)
 {
 	int cpu;
-	unsigned long flags;
+	unsigned long mask;
 	struct rcu_data *rdp;
 
-	raw_spin_lock_irqsave_rcu_node(rnp, flags);
-	if (!(rnp->expmask & mask)) {
+	raw_lockdep_assert_held_rcu_node(rnp);
+	if (!(rnp->expmask & mask_in)) {
 		raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 		return;
 	}
+	mask = mask_in & rnp->expmask;
 	WRITE_ONCE(rnp->expmask, rnp->expmask & ~mask);
 	for_each_leaf_node_cpu_mask(rnp, cpu, mask) {
 		rdp = per_cpu_ptr(&rcu_data, cpu);
@@ -257,8 +266,13 @@ static void rcu_report_exp_cpu_mult(struct rcu_node *rnp,
  */
 static void rcu_report_exp_rdp(struct rcu_data *rdp)
 {
+	unsigned long flags;
+	struct rcu_node *rnp = rdp->mynode;
+
+	raw_spin_lock_irqsave_rcu_node(rnp, flags);
 	WRITE_ONCE(rdp->cpu_no_qs.b.exp, false);
-	rcu_report_exp_cpu_mult(rdp->mynode, rdp->grpmask, true);
+	ASSERT_EXCLUSIVE_WRITER(rdp->cpu_no_qs.b.exp);
+	rcu_report_exp_cpu_mult(rnp, flags, rdp->grpmask, true);
 }
 
 /* Common code for work-done checking. */
@@ -386,13 +400,6 @@ static void __sync_rcu_exp_select_node_cpus(struct rcu_exp_work *rewp)
 	}
 	mask_ofl_ipi = rnp->expmask & ~mask_ofl_test;
 
-	/*
-	 * Need to wait for any blocked tasks as well.	Note that
-	 * additional blocking tasks will also block the expedited GP
-	 * until such time as the ->expmask bits are cleared.
-	 */
-	if (rcu_preempt_has_tasks(rnp))
-		WRITE_ONCE(rnp->exp_tasks, rnp->blkd_tasks.next);
 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 
 	/* IPI the remaining CPUs for expedited quiescent state. */
@@ -432,8 +439,10 @@ retry_ipi:
 		raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
 	}
 	/* Report quiescent states for those that went offline. */
-	if (mask_ofl_test)
-		rcu_report_exp_cpu_mult(rnp, mask_ofl_test, false);
+	if (mask_ofl_test) {
+		raw_spin_lock_irqsave_rcu_node(rnp, flags);
+		rcu_report_exp_cpu_mult(rnp, flags, mask_ofl_test, false);
+	}
 }
 
 static void rcu_exp_sel_wait_wake(unsigned long s);
@@ -569,6 +578,7 @@ static void synchronize_rcu_expedited_stall(unsigned long jiffies_start, unsigne
 			if (!(READ_ONCE(rnp->expmask) & mask))
 				continue;
 			ndetected++;
+			cpumask_set_cpu(cpu, &rcu_exp_stall_cpumask);
 			rdp = per_cpu_ptr(&rcu_data, cpu);
 			pr_cont(" %d-%c%c%c%c", cpu,
 				"O."[!!cpu_online(cpu)],
@@ -580,7 +590,12 @@ static void synchronize_rcu_expedited_stall(unsigned long jiffies_start, unsigne
 	pr_cont(" } %lu jiffies s: %lu root: %#lx/%c\n",
 		j - jiffies_start, rcu_state.expedited_sequence, data_race(rnp_root->expmask),
 		".T"[!!data_race(rnp_root->exp_tasks)]);
-	if (ndetected) {
+	if (!ndetected) {
+		// This is invoked from the grace-period worker, so
+		// a new grace period cannot have started.  And if this
+		// worker were stalled, we would not get here.  ;-)
+		pr_err("INFO: Expedited stall ended before state dump start\n");
+	} else {
 		pr_err("blocking rcu_node structures (internal RCU debug):");
 		rcu_for_each_node_breadth_first(rnp) {
 			if (rnp == rnp_root)
@@ -651,6 +666,8 @@ static void synchronize_rcu_expedited_wait(void)
 		if (rcu_stall_is_suppressed())
 			continue;
 
+		cpumask_clear(&rcu_exp_stall_cpumask);
+
 		nbcon_cpu_emergency_enter();
 
 		j = jiffies;
@@ -661,7 +678,7 @@ static void synchronize_rcu_expedited_wait(void)
 
 		nbcon_cpu_emergency_exit();
 
-		panic_on_rcu_stall();
+		panic_on_rcu_stall(&rcu_exp_stall_cpumask, NULL, 0);
 	}
 }
 
@@ -694,6 +711,8 @@ static void rcu_exp_wait_wake(unsigned long s)
 		}
 		smp_mb(); /* All above changes before wakeup. */
 		wake_up_all(&rnp->exp_wq[rcu_seq_ctr(s) & 0x3]);
+		if (rcu_is_leaf_node(rnp))
+			rcu_nocb_exp_cleanup(rnp);
 	}
 	trace_rcu_exp_grace_period(rcu_state.name, s, TPS("endwake"));
 	mutex_unlock(&rcu_state.exp_wake_mutex);
@@ -710,6 +729,17 @@ static void rcu_exp_sel_wait_wake(unsigned long s)
 
 	/* Wait and clean up, including waking everyone. */
 	rcu_exp_wait_wake(s);
+}
+
+/* Request an expedited quiescent state. */
+static void rcu_exp_need_qs(void)
+{
+	lockdep_assert_irqs_disabled();
+	ASSERT_EXCLUSIVE_WRITER_SCOPED(*this_cpu_ptr(&rcu_data.cpu_no_qs.b.exp));
+	this_cpu_write(rcu_data.cpu_no_qs.b.exp, true);
+	/* Store .exp before .rcu_urgent_qs. */
+	smp_store_release(this_cpu_ptr(&rcu_data.rcu_urgent_qs), true);
+	set_need_resched_current();
 }
 
 #ifdef CONFIG_PREEMPT_RCU
@@ -730,24 +760,30 @@ static void rcu_exp_handler(void *unused)
 	struct task_struct *t = current;
 
 	/*
-	 * First, the common case of not being in an RCU read-side
+	 * WARN if the CPU is unexpectedly already looking for a
+	 * QS or has already reported one.
+	 */
+	ASSERT_EXCLUSIVE_WRITER_SCOPED(rdp->cpu_no_qs.b.exp);
+	if (WARN_ON_ONCE(!(READ_ONCE(rnp->expmask) & rdp->grpmask) ||
+			 READ_ONCE(rdp->cpu_no_qs.b.exp)))
+		return;
+
+	/*
+	 * Second, the common case of not being in an RCU read-side
 	 * critical section.  If also enabled or idle, immediately
 	 * report the quiescent state, otherwise defer.
 	 */
 	if (!depth) {
 		if (!(preempt_count() & (PREEMPT_MASK | SOFTIRQ_MASK)) ||
-		    rcu_is_cpu_rrupt_from_idle()) {
+		    rcu_is_cpu_rrupt_from_idle())
 			rcu_report_exp_rdp(rdp);
-		} else {
-			WRITE_ONCE(rdp->cpu_no_qs.b.exp, true);
-			set_tsk_need_resched(t);
-			set_preempt_need_resched();
-		}
+		else
+			rcu_exp_need_qs();
 		return;
 	}
 
 	/*
-	 * Second, the less-common case of being in an RCU read-side
+	 * Third, the less-common case of being in an RCU read-side
 	 * critical section.  In this case we can count on a future
 	 * rcu_read_unlock().  However, this rcu_read_unlock() might
 	 * execute on some other CPU, but in that case there will be
@@ -768,13 +804,8 @@ static void rcu_exp_handler(void *unused)
 		return;
 	}
 
-	// Finally, negative nesting depth should not happen.
+	// Fourth and finally, negative nesting depth should not happen.
 	WARN_ON_ONCE(1);
-}
-
-/* PREEMPTION=y, so no PREEMPTION=n expedited grace period to clean up after. */
-static void sync_sched_exp_online_cleanup(int cpu)
-{
 }
 
 /*
@@ -835,16 +866,6 @@ static void rcu_exp_print_detail_task_stall_rnp(struct rcu_node *rnp)
 
 #else /* #ifdef CONFIG_PREEMPT_RCU */
 
-/* Request an expedited quiescent state. */
-static void rcu_exp_need_qs(void)
-{
-	__this_cpu_write(rcu_data.cpu_no_qs.b.exp, true);
-	/* Store .exp before .rcu_urgent_qs. */
-	smp_store_release(this_cpu_ptr(&rcu_data.rcu_urgent_qs), true);
-	set_tsk_need_resched(current);
-	set_preempt_need_resched();
-}
-
 /* Invoked on each online non-idle CPU for expedited quiescent state. */
 static void rcu_exp_handler(void *unused)
 {
@@ -852,8 +873,9 @@ static void rcu_exp_handler(void *unused)
 	struct rcu_node *rnp = rdp->mynode;
 	bool preempt_bh_enabled = !(preempt_count() & (PREEMPT_MASK | SOFTIRQ_MASK));
 
+	ASSERT_EXCLUSIVE_WRITER_SCOPED(rdp->cpu_no_qs.b.exp);
 	if (!(READ_ONCE(rnp->expmask) & rdp->grpmask) ||
-	    __this_cpu_read(rcu_data.cpu_no_qs.b.exp))
+	    this_cpu_read(rcu_data.cpu_no_qs.b.exp))
 		return;
 	if (rcu_is_cpu_rrupt_from_idle() ||
 	    (IS_ENABLED(CONFIG_PREEMPT_COUNT) && preempt_bh_enabled)) {
@@ -861,38 +883,6 @@ static void rcu_exp_handler(void *unused)
 		return;
 	}
 	rcu_exp_need_qs();
-}
-
-/* Send IPI for expedited cleanup if needed at end of CPU-hotplug operation. */
-static void sync_sched_exp_online_cleanup(int cpu)
-{
-	unsigned long flags;
-	int my_cpu;
-	struct rcu_data *rdp;
-	int ret;
-	struct rcu_node *rnp;
-
-	rdp = per_cpu_ptr(&rcu_data, cpu);
-	rnp = rdp->mynode;
-	my_cpu = get_cpu();
-	/* Quiescent state either not needed or already requested, leave. */
-	if (!(READ_ONCE(rnp->expmask) & rdp->grpmask) ||
-	    READ_ONCE(rdp->cpu_no_qs.b.exp)) {
-		put_cpu();
-		return;
-	}
-	/* Quiescent state needed on current CPU, so set it up locally. */
-	if (my_cpu == cpu) {
-		local_irq_save(flags);
-		rcu_exp_need_qs();
-		local_irq_restore(flags);
-		put_cpu();
-		return;
-	}
-	/* Quiescent state needed on some other CPU, send IPI. */
-	ret = smp_call_function_single(cpu, rcu_exp_handler, NULL, 0);
-	put_cpu();
-	WARN_ON_ONCE(ret);
 }
 
 /*
@@ -1062,18 +1052,18 @@ EXPORT_SYMBOL_GPL(start_poll_synchronize_rcu_expedited);
 
 /**
  * start_poll_synchronize_rcu_expedited_full - Take a full snapshot and start expedited grace period
- * @rgosp: Place to put snapshot of grace-period state
+ * @gsp: Place to put snapshot of grace-period state
  *
- * Places the normal and expedited grace-period states in rgosp.  This
+ * Places the normal and expedited grace-period states in gsp.  This
  * state value can be passed to a later call to cond_synchronize_rcu_full()
  * or poll_state_synchronize_rcu_full() to determine whether or not a
  * grace period (whether normal or expedited) has elapsed in the meantime.
  * If the needed expedited grace period is not already slated to start,
  * initiates that grace period.
  */
-void start_poll_synchronize_rcu_expedited_full(struct rcu_gp_oldstate *rgosp)
+void start_poll_synchronize_rcu_expedited_full(struct rcu_gp_seq *gsp)
 {
-	get_state_synchronize_rcu_full(rgosp);
+	get_state_synchronize_rcu_full(gsp);
 	(void)start_poll_synchronize_rcu_expedited();
 }
 EXPORT_SYMBOL_GPL(start_poll_synchronize_rcu_expedited_full);
@@ -1107,11 +1097,11 @@ EXPORT_SYMBOL_GPL(cond_synchronize_rcu_expedited);
 
 /**
  * cond_synchronize_rcu_expedited_full - Conditionally wait for an expedited RCU grace period
- * @rgosp: value from get_state_synchronize_rcu_full(), start_poll_synchronize_rcu_full(), or start_poll_synchronize_rcu_expedited_full()
+ * @gsp: value from get_state_synchronize_rcu_full(), start_poll_synchronize_rcu_full(), or start_poll_synchronize_rcu_expedited_full()
  *
  * If a full RCU grace period has elapsed since the call to
  * get_state_synchronize_rcu_full(), start_poll_synchronize_rcu_full(),
- * or start_poll_synchronize_rcu_expedited_full() from which @rgosp was
+ * or start_poll_synchronize_rcu_expedited_full() from which @gsp was
  * obtained, just return.  Otherwise, invoke synchronize_rcu_expedited()
  * to wait for a full grace period.
  *
@@ -1122,12 +1112,12 @@ EXPORT_SYMBOL_GPL(cond_synchronize_rcu_expedited);
  *
  * This function provides the same memory-ordering guarantees that
  * would be provided by a synchronize_rcu() that was invoked at the call
- * to the function that provided @rgosp and that returned at the end of
+ * to the function that provided @gsp and that returned at the end of
  * this function.
  */
-void cond_synchronize_rcu_expedited_full(struct rcu_gp_oldstate *rgosp)
+void cond_synchronize_rcu_expedited_full(struct rcu_gp_seq *gsp)
 {
-	if (!poll_state_synchronize_rcu_full(rgosp))
+	if (!poll_state_synchronize_rcu_full(gsp))
 		synchronize_rcu_expedited();
 }
 EXPORT_SYMBOL_GPL(cond_synchronize_rcu_expedited_full);

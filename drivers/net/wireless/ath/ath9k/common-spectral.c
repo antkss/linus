@@ -14,6 +14,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <linux/export.h>
 #include <linux/relay.h>
 #include <linux/random.h>
 #include "ath9k.h"
@@ -628,12 +629,12 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
 				else
 					RX_STAT_INC(sc, rx_spectral_sample_err);
 
-				memset(sample_buf, 0, SPECTRAL_SAMPLE_MAX_LEN);
-
 				/* Mix the received bins to the /dev/random
 				 * pool
 				 */
 				add_device_randomness(sample_buf, num_bins);
+
+				memset(sample_buf, 0, SPECTRAL_SAMPLE_MAX_LEN);
 			}
 
 			/* Process a normal frame */
@@ -734,7 +735,7 @@ void ath9k_cmn_spectral_scan_trigger(struct ath_common *common,
 				 ATH9K_RX_FILTER_PHYRADAR |
 				 ATH9K_RX_FILTER_PHYERR);
 
-	/* TODO: usually this should not be neccesary, but for some reason
+	/* TODO: usually this should not be necessary, but for some reason
 	 * (or in some mode?) the trigger must be called after the
 	 * configuration, otherwise the register will have its values reset
 	 * (on my ar9220 to value 0x01002310)
@@ -803,6 +804,15 @@ static ssize_t write_file_spec_scan_ctl(struct file *file,
 		return -EFAULT;
 
 	buf[len] = '\0';
+
+	/*
+	 * Every command below drives PHY register writes. Refuse them while
+	 * the hardware is disabled (the interface is down): on the AR9271
+	 * that traffic hangs the firmware until the device is re-enumerated.
+	 * The reset control refuses on the same flag.
+	 */
+	if (test_bit(ATH_OP_INVALID, &common->op_flags))
+		return -EBUSY;
 
 	if (strncmp("trigger", buf, 7) == 0) {
 		ath9k_cmn_spectral_scan_trigger(common, spec_priv);

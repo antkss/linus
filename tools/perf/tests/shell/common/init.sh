@@ -11,8 +11,8 @@
 #
 
 
-. ../common/settings.sh
-. ../common/patterns.sh
+. "$(dirname $0)/../common/settings.sh"
+. "$(dirname $0)/../common/patterns.sh"
 
 THIS_TEST_NAME=`basename $0 .sh`
 
@@ -46,10 +46,13 @@ print_results()
 print_overall_results()
 {
 	RETVAL="$1"; shift
+	TASK_COMMENT="$*"
+	test -n "$TASK_COMMENT" && TASK_COMMENT=":: $TASK_COMMENT"
+
 	if [ $RETVAL -eq 0 ]; then
 		_echo "$MALLPASS## [ PASS ] ##$MEND $TEST_NAME :: $THIS_TEST_NAME SUMMARY"
 	else
-		_echo "$MALLFAIL## [ FAIL ] ##$MEND $TEST_NAME :: $THIS_TEST_NAME SUMMARY :: $RETVAL failures found"
+		_echo "$MALLFAIL## [ FAIL ] ##$MEND $TEST_NAME :: $THIS_TEST_NAME SUMMARY :: $RETVAL failures found $TASK_COMMENT"
 	fi
 	return $RETVAL
 }
@@ -85,7 +88,7 @@ consider_skipping()
 	# the runmode of a testcase needs to be at least the current suite's runmode
 	if [ $PERFTOOL_TESTSUITE_RUNMODE -lt $TESTCASE_RUNMODE ]; then
 		print_overall_skipped
-		exit 0
+		exit 2
 	fi
 }
 
@@ -127,9 +130,28 @@ check_uprobes_available()
 	test -e /sys/kernel/debug/tracing/uprobe_events
 }
 
+# Disable every kprobe and uprobe, listed as "TYPE:GROUP/EVENT ARGS...".
+disable_all_probes()
+{
+	PROBE_SPECS=`cat /sys/kernel/debug/tracing/kprobe_events \
+		/sys/kernel/debug/tracing/uprobe_events 2> /dev/null |
+		cut -d ' ' -f 1`
+	for PROBE_SPEC in $PROBE_SPECS
+	do
+		case "$PROBE_SPEC" in
+			*:*/*) ;;
+			*) continue ;;
+		esac
+		PROBE_ENABLE="/sys/kernel/debug/tracing/events/${PROBE_SPEC#*:}/enable"
+		test -e "$PROBE_ENABLE" && echo 0 > "$PROBE_ENABLE"
+	done
+}
+
 clear_all_probes()
 {
-	echo 0 > /sys/kernel/debug/tracing/events/enable
+	# Any enabled probe makes the clearing below fail with EBUSY. Unlike
+	# events/enable, this leaves other sessions' tracepoints alone.
+	disable_all_probes
 	check_kprobes_available && echo > /sys/kernel/debug/tracing/kprobe_events
 	check_uprobes_available && echo > /sys/kernel/debug/tracing/uprobe_events
 }

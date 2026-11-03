@@ -8,7 +8,6 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/clk.h>
@@ -18,6 +17,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/units.h>
 
 #define TRNG_CR		0x00
 #define TRNG_MR		0x04
@@ -37,6 +37,7 @@ struct atmel_trng {
 	struct clk *clk;
 	void __iomem *base;
 	struct hwrng rng;
+	struct device *dev;
 	bool has_half_rate;
 };
 
@@ -59,9 +60,9 @@ static int atmel_trng_read(struct hwrng *rng, void *buf, size_t max,
 	u32 *data = buf;
 	int ret;
 
-	ret = pm_runtime_get_sync((struct device *)trng->rng.priv);
+	ret = pm_runtime_get_sync(trng->dev);
 	if (ret < 0) {
-		pm_runtime_put_sync((struct device *)trng->rng.priv);
+		pm_runtime_put_sync(trng->dev);
 		return ret;
 	}
 
@@ -79,27 +80,20 @@ static int atmel_trng_read(struct hwrng *rng, void *buf, size_t max,
 	ret = 4;
 
 out:
-	pm_runtime_mark_last_busy((struct device *)trng->rng.priv);
-	pm_runtime_put_sync_autosuspend((struct device *)trng->rng.priv);
+	pm_runtime_put_sync_autosuspend(trng->dev);
 	return ret;
 }
 
 static int atmel_trng_init(struct atmel_trng *trng)
 {
-	unsigned long rate;
 	int ret;
 
 	ret = clk_prepare_enable(trng->clk);
 	if (ret)
 		return ret;
 
-	if (trng->has_half_rate) {
-		rate = clk_get_rate(trng->clk);
-
-		/* if peripheral clk is above 100MHz, set HALFR */
-		if (rate > 100000000)
-			writel(TRNG_HALFR, trng->base + TRNG_MR);
-	}
+	if (trng->has_half_rate && clk_get_rate(trng->clk) > 100 * HZ_PER_MHZ)
+		writel(TRNG_HALFR, trng->base + TRNG_MR);
 
 	writel(TRNG_KEY | 1, trng->base + TRNG_CR);
 
@@ -134,9 +128,9 @@ static int atmel_trng_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	trng->has_half_rate = data->has_half_rate;
+	trng->dev = &pdev->dev;
 	trng->rng.name = pdev->name;
 	trng->rng.read = atmel_trng_read;
-	trng->rng.priv = (unsigned long)&pdev->dev;
 	platform_set_drvdata(pdev, trng);
 
 #ifndef CONFIG_PM
@@ -186,7 +180,7 @@ static int __maybe_unused atmel_trng_runtime_resume(struct device *dev)
 	return atmel_trng_init(trng);
 }
 
-static const struct dev_pm_ops __maybe_unused atmel_trng_pm_ops = {
+static const struct dev_pm_ops atmel_trng_pm_ops = {
 	SET_RUNTIME_PM_OPS(atmel_trng_runtime_suspend,
 			   atmel_trng_runtime_resume, NULL)
 	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,

@@ -21,16 +21,13 @@
 #include <linux/irqchip/chained_irq.h>
 #include <linux/of_irq.h>
 #include <linux/regmap.h>
+#include <linux/string_choices.h>
 
 #include "realtek.h"
 #include "realtek-smi.h"
 #include "realtek-mdio.h"
 #include "rtl83xx.h"
-
-#define RTL8366RB_PORT_NUM_CPU		5
-#define RTL8366RB_NUM_PORTS		6
-#define RTL8366RB_PHY_NO_MAX		4
-#define RTL8366RB_PHY_ADDR_MAX		31
+#include "rtl8366rb.h"
 
 /* Switch Global Configuration register */
 #define RTL8366RB_SGCR				0x0000
@@ -175,39 +172,6 @@
  */
 #define RTL8366RB_VLAN_INGRESS_CTRL2_REG	0x037f
 
-/* LED control registers */
-/* The LED blink rate is global; it is used by all triggers in all groups. */
-#define RTL8366RB_LED_BLINKRATE_REG		0x0430
-#define RTL8366RB_LED_BLINKRATE_MASK		0x0007
-#define RTL8366RB_LED_BLINKRATE_28MS		0x0000
-#define RTL8366RB_LED_BLINKRATE_56MS		0x0001
-#define RTL8366RB_LED_BLINKRATE_84MS		0x0002
-#define RTL8366RB_LED_BLINKRATE_111MS		0x0003
-#define RTL8366RB_LED_BLINKRATE_222MS		0x0004
-#define RTL8366RB_LED_BLINKRATE_446MS		0x0005
-
-/* LED trigger event for each group */
-#define RTL8366RB_LED_CTRL_REG			0x0431
-#define RTL8366RB_LED_CTRL_OFFSET(led_group)	\
-	(4 * (led_group))
-#define RTL8366RB_LED_CTRL_MASK(led_group)	\
-	(0xf << RTL8366RB_LED_CTRL_OFFSET(led_group))
-
-/* The RTL8366RB_LED_X_X registers are used to manually set the LED state only
- * when the corresponding LED group in RTL8366RB_LED_CTRL_REG is
- * RTL8366RB_LEDGROUP_FORCE. Otherwise, it is ignored.
- */
-#define RTL8366RB_LED_0_1_CTRL_REG		0x0432
-#define RTL8366RB_LED_2_3_CTRL_REG		0x0433
-#define RTL8366RB_LED_X_X_CTRL_REG(led_group)	\
-	((led_group) <= 1 ? \
-		RTL8366RB_LED_0_1_CTRL_REG : \
-		RTL8366RB_LED_2_3_CTRL_REG)
-#define RTL8366RB_LED_0_X_CTRL_MASK		GENMASK(5, 0)
-#define RTL8366RB_LED_X_1_CTRL_MASK		GENMASK(11, 6)
-#define RTL8366RB_LED_2_X_CTRL_MASK		GENMASK(5, 0)
-#define RTL8366RB_LED_X_3_CTRL_MASK		GENMASK(11, 6)
-
 #define RTL8366RB_MIB_COUNT			33
 #define RTL8366RB_GLOBAL_MIB_COUNT		1
 #define RTL8366RB_MIB_COUNTER_PORT_OFFSET	0x0050
@@ -243,7 +207,6 @@
 #define RTL8366RB_PORT_STATUS_AN_MASK		0x0080
 
 #define RTL8366RB_NUM_VLANS		16
-#define RTL8366RB_NUM_LEDGROUPS		4
 #define RTL8366RB_NUM_VIDS		4096
 #define RTL8366RB_PRIORITYMAX		7
 #define RTL8366RB_NUM_FIDS		8
@@ -349,46 +312,6 @@
 #define RTL8366RB_GREEN_FEATURE_MSK	0x0007
 #define RTL8366RB_GREEN_FEATURE_TX	BIT(0)
 #define RTL8366RB_GREEN_FEATURE_RX	BIT(2)
-
-enum rtl8366_ledgroup_mode {
-	RTL8366RB_LEDGROUP_OFF			= 0x0,
-	RTL8366RB_LEDGROUP_DUP_COL		= 0x1,
-	RTL8366RB_LEDGROUP_LINK_ACT		= 0x2,
-	RTL8366RB_LEDGROUP_SPD1000		= 0x3,
-	RTL8366RB_LEDGROUP_SPD100		= 0x4,
-	RTL8366RB_LEDGROUP_SPD10		= 0x5,
-	RTL8366RB_LEDGROUP_SPD1000_ACT		= 0x6,
-	RTL8366RB_LEDGROUP_SPD100_ACT		= 0x7,
-	RTL8366RB_LEDGROUP_SPD10_ACT		= 0x8,
-	RTL8366RB_LEDGROUP_SPD100_10_ACT	= 0x9,
-	RTL8366RB_LEDGROUP_FIBER		= 0xa,
-	RTL8366RB_LEDGROUP_AN_FAULT		= 0xb,
-	RTL8366RB_LEDGROUP_LINK_RX		= 0xc,
-	RTL8366RB_LEDGROUP_LINK_TX		= 0xd,
-	RTL8366RB_LEDGROUP_MASTER		= 0xe,
-	RTL8366RB_LEDGROUP_FORCE		= 0xf,
-
-	__RTL8366RB_LEDGROUP_MODE_MAX
-};
-
-struct rtl8366rb_led {
-	u8 port_num;
-	u8 led_group;
-	struct realtek_priv *priv;
-	struct led_classdev cdev;
-};
-
-/**
- * struct rtl8366rb - RTL8366RB-specific data
- * @max_mtu: per-port max MTU setting
- * @pvid_enabled: if PVID is set for respective port
- * @leds: per-port and per-ledgroup led info
- */
-struct rtl8366rb {
-	unsigned int max_mtu[RTL8366RB_NUM_PORTS];
-	bool pvid_enabled[RTL8366RB_NUM_PORTS];
-	struct rtl8366rb_led leds[RTL8366RB_NUM_PORTS][RTL8366RB_NUM_LEDGROUPS];
-};
 
 static struct rtl8366_mib_counter rtl8366rb_mib_counters[] = {
 	{ 0,  0, 4, "IfInOctets"				},
@@ -627,10 +550,8 @@ static int rtl8366rb_setup_cascaded_irq(struct realtek_priv *priv)
 		dev_err(priv->dev, "unable to request irq: %d\n", ret);
 		goto out_put_node;
 	}
-	priv->irqdomain = irq_domain_add_linear(intc,
-						RTL8366RB_NUM_INTERRUPT,
-						&rtl8366rb_irqdomain_ops,
-						priv);
+	priv->irqdomain = irq_domain_create_linear(of_fwnode_handle(intc), RTL8366RB_NUM_INTERRUPT,
+						   &rtl8366rb_irqdomain_ops, priv);
 	if (!priv->irqdomain) {
 		dev_err(priv->dev, "failed to create IRQ domain\n");
 		ret = -EINVAL;
@@ -652,8 +573,7 @@ static int rtl8366rb_set_addr(struct realtek_priv *priv)
 
 	eth_random_addr(addr);
 
-	dev_info(priv->dev, "set MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-		 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+	dev_info(priv->dev, "set MAC: %pM\n", addr);
 	val = addr[0] << 8 | addr[1];
 	ret = regmap_write(priv->map, RTL8366RB_SMAR0, val);
 	if (ret)
@@ -830,9 +750,10 @@ static int rtl8366rb_jam_table(const struct rtl8366rb_jam_tbl_entry *jam_table,
 	return 0;
 }
 
-static int rb8366rb_set_ledgroup_mode(struct realtek_priv *priv,
-				      u8 led_group,
-				      enum rtl8366_ledgroup_mode mode)
+/* This code is used also with LEDs disabled */
+int rb8366rb_set_ledgroup_mode(struct realtek_priv *priv,
+			       u8 led_group,
+			       enum rtl8366_ledgroup_mode mode)
 {
 	int ret;
 	u32 val;
@@ -849,144 +770,7 @@ static int rb8366rb_set_ledgroup_mode(struct realtek_priv *priv,
 	return 0;
 }
 
-static inline u32 rtl8366rb_led_group_port_mask(u8 led_group, u8 port)
-{
-	switch (led_group) {
-	case 0:
-		return FIELD_PREP(RTL8366RB_LED_0_X_CTRL_MASK, BIT(port));
-	case 1:
-		return FIELD_PREP(RTL8366RB_LED_0_X_CTRL_MASK, BIT(port));
-	case 2:
-		return FIELD_PREP(RTL8366RB_LED_0_X_CTRL_MASK, BIT(port));
-	case 3:
-		return FIELD_PREP(RTL8366RB_LED_0_X_CTRL_MASK, BIT(port));
-	default:
-		return 0;
-	}
-}
-
-static int rb8366rb_get_port_led(struct rtl8366rb_led *led)
-{
-	struct realtek_priv *priv = led->priv;
-	u8 led_group = led->led_group;
-	u8 port_num = led->port_num;
-	int ret;
-	u32 val;
-
-	ret = regmap_read(priv->map, RTL8366RB_LED_X_X_CTRL_REG(led_group),
-			  &val);
-	if (ret) {
-		dev_err(priv->dev, "error reading LED on port %d group %d\n",
-			led_group, port_num);
-		return ret;
-	}
-
-	return !!(val & rtl8366rb_led_group_port_mask(led_group, port_num));
-}
-
-static int rb8366rb_set_port_led(struct rtl8366rb_led *led, bool enable)
-{
-	struct realtek_priv *priv = led->priv;
-	u8 led_group = led->led_group;
-	u8 port_num = led->port_num;
-	int ret;
-
-	ret = regmap_update_bits(priv->map,
-				 RTL8366RB_LED_X_X_CTRL_REG(led_group),
-				 rtl8366rb_led_group_port_mask(led_group,
-							       port_num),
-				 enable ? 0xffff : 0);
-	if (ret) {
-		dev_err(priv->dev, "error updating LED on port %d group %d\n",
-			led_group, port_num);
-		return ret;
-	}
-
-	/* Change the LED group to manual controlled LEDs if required */
-	ret = rb8366rb_set_ledgroup_mode(priv, led_group,
-					 RTL8366RB_LEDGROUP_FORCE);
-
-	if (ret) {
-		dev_err(priv->dev, "error updating LED GROUP group %d\n",
-			led_group);
-		return ret;
-	}
-
-	return 0;
-}
-
-static int
-rtl8366rb_cled_brightness_set_blocking(struct led_classdev *ldev,
-				       enum led_brightness brightness)
-{
-	struct rtl8366rb_led *led = container_of(ldev, struct rtl8366rb_led,
-						 cdev);
-
-	return rb8366rb_set_port_led(led, brightness == LED_ON);
-}
-
-static int rtl8366rb_setup_led(struct realtek_priv *priv, struct dsa_port *dp,
-			       struct fwnode_handle *led_fwnode)
-{
-	struct rtl8366rb *rb = priv->chip_data;
-	struct led_init_data init_data = { };
-	enum led_default_state state;
-	struct rtl8366rb_led *led;
-	u32 led_group;
-	int ret;
-
-	ret = fwnode_property_read_u32(led_fwnode, "reg", &led_group);
-	if (ret)
-		return ret;
-
-	if (led_group >= RTL8366RB_NUM_LEDGROUPS) {
-		dev_warn(priv->dev, "Invalid LED reg %d defined for port %d",
-			 led_group, dp->index);
-		return -EINVAL;
-	}
-
-	led = &rb->leds[dp->index][led_group];
-	led->port_num = dp->index;
-	led->led_group = led_group;
-	led->priv = priv;
-
-	state = led_init_default_state_get(led_fwnode);
-	switch (state) {
-	case LEDS_DEFSTATE_ON:
-		led->cdev.brightness = 1;
-		rb8366rb_set_port_led(led, 1);
-		break;
-	case LEDS_DEFSTATE_KEEP:
-		led->cdev.brightness =
-			rb8366rb_get_port_led(led);
-		break;
-	case LEDS_DEFSTATE_OFF:
-	default:
-		led->cdev.brightness = 0;
-		rb8366rb_set_port_led(led, 0);
-	}
-
-	led->cdev.max_brightness = 1;
-	led->cdev.brightness_set_blocking =
-		rtl8366rb_cled_brightness_set_blocking;
-	init_data.fwnode = led_fwnode;
-	init_data.devname_mandatory = true;
-
-	init_data.devicename = kasprintf(GFP_KERNEL, "Realtek-%d:0%d:%d",
-					 dp->ds->index, dp->index, led_group);
-	if (!init_data.devicename)
-		return -ENOMEM;
-
-	ret = devm_led_classdev_register_ext(priv->dev, &led->cdev, &init_data);
-	if (ret) {
-		dev_warn(priv->dev, "Failed to init LED %d for port %d",
-			 led_group, dp->index);
-		return ret;
-	}
-
-	return 0;
-}
-
+/* This code is used also with LEDs disabled */
 static int rtl8366rb_setup_all_leds_off(struct realtek_priv *priv)
 {
 	int ret = 0;
@@ -1007,43 +791,86 @@ static int rtl8366rb_setup_all_leds_off(struct realtek_priv *priv)
 	return ret;
 }
 
-static int rtl8366rb_setup_leds(struct realtek_priv *priv)
+static int rtl8366rb_port_set_isolation(struct realtek_priv *priv, int port,
+					u32 mask)
 {
-	struct dsa_switch *ds = &priv->ds;
-	struct device_node *leds_np;
-	struct dsa_port *dp;
-	int ret = 0;
+	/* Bit 0 enables isolation, the mask indicates allowed forwarding
+	 * ports
+	 */
+	mask = RTL8366RB_PORT_ISO_PORTS(mask) | RTL8366RB_PORT_ISO_EN;
 
-	dsa_switch_for_each_port(dp, ds) {
-		if (!dp->dn)
-			continue;
+	return regmap_write(priv->map, RTL8366RB_PORT_ISO(port),
+			    mask);
+}
 
-		leds_np = of_get_child_by_name(dp->dn, "leds");
-		if (!leds_np) {
-			dev_dbg(priv->dev, "No leds defined for port %d",
-				dp->index);
-			continue;
-		}
+static int rtl8366rb_port_add_isolation(struct realtek_priv *priv, int port,
+					u32 mask)
+{
+	/* We assume isolation bit is on */
+	return regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(port),
+				  RTL8366RB_PORT_ISO_PORTS(mask),
+				  RTL8366RB_PORT_ISO_PORTS(mask));
+}
 
-		for_each_child_of_node_scoped(leds_np, led_np) {
-			ret = rtl8366rb_setup_led(priv, dp,
-						  of_fwnode_handle(led_np));
-			if (ret)
-				break;
-		}
+static int rtl8366rb_port_remove_isolation(struct realtek_priv *priv, int port,
+					   u32 mask)
+{
+	return regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(port),
+				  RTL8366RB_PORT_ISO_PORTS(mask), 0);
+}
 
-		of_node_put(leds_np);
-		if (ret)
-			return ret;
+static void
+rtl8366rb_port_stp_state_set(struct dsa_switch *ds, int port, u8 state)
+{
+	struct realtek_priv *priv = ds->priv;
+	u32 val;
+	int i;
+
+	switch (state) {
+	case BR_STATE_DISABLED:
+		val = RTL8366RB_STP_STATE_DISABLED;
+		break;
+	case BR_STATE_BLOCKING:
+	case BR_STATE_LISTENING:
+		val = RTL8366RB_STP_STATE_BLOCKING;
+		break;
+	case BR_STATE_LEARNING:
+		val = RTL8366RB_STP_STATE_LEARNING;
+		break;
+	case BR_STATE_FORWARDING:
+		val = RTL8366RB_STP_STATE_FORWARDING;
+		break;
+	default:
+		dev_err(priv->dev, "unknown bridge state requested\n");
+		return;
 	}
-	return 0;
+
+	/* Set the same status for the port on all the FIDs */
+	for (i = 0; i < RTL8366RB_NUM_FIDS; i++) {
+		regmap_update_bits(priv->map, RTL8366RB_STP_STATE_BASE + i,
+				   RTL8366RB_STP_STATE_MASK(port),
+				   RTL8366RB_STP_STATE(port, val));
+	}
+}
+
+static int rtl8366rb_port_set_learning(struct realtek_priv *priv, int port,
+				       bool enable)
+{
+	/* Notice inverted semantics in this register: setting a bit disables
+	 * learning instead of enabling it.
+	 */
+	return regmap_update_bits(priv->map, RTL8366RB_PORT_LEARNDIS_CTRL,
+				  BIT(port), enable ? 0 : BIT(port));
 }
 
 static int rtl8366rb_setup(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
 	const struct rtl8366rb_jam_tbl_entry *jam_table;
+	u32 downports_mask = 0;
 	struct rtl8366rb *rb;
+	u32 upports_mask = 0;
+	struct dsa_port *dp;
 	u32 chip_ver = 0;
 	u32 chip_id = 0;
 	int jam_size;
@@ -1114,20 +941,58 @@ static int rtl8366rb_setup(struct dsa_switch *ds)
 	if (ret)
 		return ret;
 
-	/* Isolate all user ports so they can only send packets to itself and the CPU port */
-	for (i = 0; i < RTL8366RB_PORT_NUM_CPU; i++) {
-		ret = regmap_write(priv->map, RTL8366RB_PORT_ISO(i),
-				   RTL8366RB_PORT_ISO_PORTS(BIT(RTL8366RB_PORT_NUM_CPU)) |
-				   RTL8366RB_PORT_ISO_EN);
+	/* Start with all ports blocked, including unused ports */
+	dsa_switch_for_each_port(dp, ds) {
+		/* Set the initial STP state of all ports to DISABLED, otherwise
+		 * ports will still forward frames to the CPU despite being
+		 * administratively down by default.
+		 */
+		rtl8366rb_port_stp_state_set(ds, dp->index, BR_STATE_DISABLED);
+
+		/* Start with all ports completely isolated */
+		ret = rtl8366rb_port_set_isolation(priv, dp->index, 0);
+		if (ret)
+			return ret;
+
+		/* Disable learning */
+		ret = rtl8366rb_port_set_learning(priv, dp->index, false);
+		if (ret)
+			return ret;
+
+		/* Collect CPU ports. If we support cascade switches, it should
+		 * also include the upstream DSA ports.
+		 */
+		if (!dsa_port_is_cpu(dp))
+			continue;
+
+		upports_mask |= BIT(dp->index);
+	}
+
+	/* Configure user ports */
+	dsa_switch_for_each_port(dp, ds) {
+		if (!dsa_port_is_user(dp))
+			continue;
+
+		/* Forward only to the CPU(s), isolate from all other ports */
+		ret = rtl8366rb_port_set_isolation(priv, dp->index, upports_mask);
+		if (ret)
+			return ret;
+
+		/* If we support cascade switches, it should also include the
+		 * downstream DSA ports.
+		 */
+		downports_mask |= BIT(dp->index);
+	}
+
+	/* Configure CPU ports. If we support cascade switches, this will also
+	 * include DSA ports.
+	 */
+	dsa_switch_for_each_cpu_port(dp, ds) {
+		/* Forward to all user ports */
+		ret = rtl8366rb_port_set_isolation(priv, dp->index, downports_mask);
 		if (ret)
 			return ret;
 	}
-	/* CPU port can send packets to all ports */
-	ret = regmap_write(priv->map, RTL8366RB_PORT_ISO(RTL8366RB_PORT_NUM_CPU),
-			   RTL8366RB_PORT_ISO_PORTS(dsa_user_ports(ds)) |
-			   RTL8366RB_PORT_ISO_EN);
-	if (ret)
-		return ret;
 
 	/* Set up the "green ethernet" feature */
 	ret = rtl8366rb_jam_table(rtl8366rb_green_jam,
@@ -1185,12 +1050,6 @@ static int rtl8366rb_setup(struct dsa_switch *ds)
 		else
 			rb->max_mtu[i] = ETH_DATA_LEN;
 	}
-
-	/* Disable learning for all ports */
-	ret = regmap_write(priv->map, RTL8366RB_PORT_LEARNDIS_CTRL,
-			   RTL8366RB_PORT_ALL);
-	if (ret)
-		return ret;
 
 	/* Enable auto ageing for all ports */
 	ret = regmap_write(priv->map, RTL8366RB_SECURITY_CTRL, 0);
@@ -1432,70 +1291,6 @@ rtl8366rb_port_disable(struct dsa_switch *ds, int port)
 		return;
 }
 
-static int
-rtl8366rb_port_bridge_join(struct dsa_switch *ds, int port,
-			   struct dsa_bridge bridge,
-			   bool *tx_fwd_offload,
-			   struct netlink_ext_ack *extack)
-{
-	struct realtek_priv *priv = ds->priv;
-	unsigned int port_bitmap = 0;
-	int ret, i;
-
-	/* Loop over all other ports than the current one */
-	for (i = 0; i < RTL8366RB_PORT_NUM_CPU; i++) {
-		/* Current port handled last */
-		if (i == port)
-			continue;
-		/* Not on this bridge */
-		if (!dsa_port_offloads_bridge(dsa_to_port(ds, i), &bridge))
-			continue;
-		/* Join this port to each other port on the bridge */
-		ret = regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(i),
-					 RTL8366RB_PORT_ISO_PORTS(BIT(port)),
-					 RTL8366RB_PORT_ISO_PORTS(BIT(port)));
-		if (ret)
-			dev_err(priv->dev, "failed to join port %d\n", port);
-
-		port_bitmap |= BIT(i);
-	}
-
-	/* Set the bits for the ports we can access */
-	return regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(port),
-				  RTL8366RB_PORT_ISO_PORTS(port_bitmap),
-				  RTL8366RB_PORT_ISO_PORTS(port_bitmap));
-}
-
-static void
-rtl8366rb_port_bridge_leave(struct dsa_switch *ds, int port,
-			    struct dsa_bridge bridge)
-{
-	struct realtek_priv *priv = ds->priv;
-	unsigned int port_bitmap = 0;
-	int ret, i;
-
-	/* Loop over all other ports than this one */
-	for (i = 0; i < RTL8366RB_PORT_NUM_CPU; i++) {
-		/* Current port handled last */
-		if (i == port)
-			continue;
-		/* Not on this bridge */
-		if (!dsa_port_offloads_bridge(dsa_to_port(ds, i), &bridge))
-			continue;
-		/* Remove this port from any other port on the bridge */
-		ret = regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(i),
-					 RTL8366RB_PORT_ISO_PORTS(BIT(port)), 0);
-		if (ret)
-			dev_err(priv->dev, "failed to leave port %d\n", port);
-
-		port_bitmap |= BIT(i);
-	}
-
-	/* Clear the bits for the ports we can not access, leave ourselves */
-	regmap_update_bits(priv->map, RTL8366RB_PORT_ISO(port),
-			   RTL8366RB_PORT_ISO_PORTS(port_bitmap), 0);
-}
-
 /**
  * rtl8366rb_drop_untagged() - make the switch drop untagged and C-tagged frames
  * @priv: SMI state container
@@ -1522,7 +1317,7 @@ static int rtl8366rb_vlan_filtering(struct dsa_switch *ds, int port,
 	rb = priv->chip_data;
 
 	dev_dbg(priv->dev, "port %d: %s VLAN filtering\n", port,
-		vlan_filtering ? "enable" : "disable");
+		str_enable_disable(vlan_filtering));
 
 	/* If the port is not in the member set, the frame will be dropped */
 	ret = regmap_update_bits(priv->map, RTL8366RB_VLAN_INGRESS_CTRL2_REG,
@@ -1552,59 +1347,6 @@ rtl8366rb_port_pre_bridge_flags(struct dsa_switch *ds, int port,
 		return -EINVAL;
 
 	return 0;
-}
-
-static int
-rtl8366rb_port_bridge_flags(struct dsa_switch *ds, int port,
-			    struct switchdev_brport_flags flags,
-			    struct netlink_ext_ack *extack)
-{
-	struct realtek_priv *priv = ds->priv;
-	int ret;
-
-	if (flags.mask & BR_LEARNING) {
-		ret = regmap_update_bits(priv->map, RTL8366RB_PORT_LEARNDIS_CTRL,
-					 BIT(port),
-					 (flags.val & BR_LEARNING) ? 0 : BIT(port));
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-static void
-rtl8366rb_port_stp_state_set(struct dsa_switch *ds, int port, u8 state)
-{
-	struct realtek_priv *priv = ds->priv;
-	u32 val;
-	int i;
-
-	switch (state) {
-	case BR_STATE_DISABLED:
-		val = RTL8366RB_STP_STATE_DISABLED;
-		break;
-	case BR_STATE_BLOCKING:
-	case BR_STATE_LISTENING:
-		val = RTL8366RB_STP_STATE_BLOCKING;
-		break;
-	case BR_STATE_LEARNING:
-		val = RTL8366RB_STP_STATE_LEARNING;
-		break;
-	case BR_STATE_FORWARDING:
-		val = RTL8366RB_STP_STATE_FORWARDING;
-		break;
-	default:
-		dev_err(priv->dev, "unknown bridge state requested\n");
-		return;
-	}
-
-	/* Set the same status for the port on all the FIDs */
-	for (i = 0; i < RTL8366RB_NUM_FIDS; i++) {
-		regmap_update_bits(priv->map, RTL8366RB_STP_STATE_BASE + i,
-				   RTL8366RB_STP_STATE_MASK(port),
-				   RTL8366RB_STP_STATE(port, val));
-	}
 }
 
 static void
@@ -1884,7 +1626,7 @@ static bool rtl8366rb_is_vlan_valid(struct realtek_priv *priv, unsigned int vlan
 
 static int rtl8366rb_enable_vlan(struct realtek_priv *priv, bool enable)
 {
-	dev_dbg(priv->dev, "%s VLAN\n", enable ? "enable" : "disable");
+	dev_dbg(priv->dev, "%s VLAN\n", str_enable_disable(enable));
 	return regmap_update_bits(priv->map,
 				  RTL8366RB_SGCR, RTL8366RB_SGCR_EN_VLAN,
 				  enable ? RTL8366RB_SGCR_EN_VLAN : 0);
@@ -1892,7 +1634,7 @@ static int rtl8366rb_enable_vlan(struct realtek_priv *priv, bool enable)
 
 static int rtl8366rb_enable_vlan4k(struct realtek_priv *priv, bool enable)
 {
-	dev_dbg(priv->dev, "%s VLAN 4k\n", enable ? "enable" : "disable");
+	dev_dbg(priv->dev, "%s VLAN 4k\n", str_enable_disable(enable));
 	return regmap_update_bits(priv->map, RTL8366RB_SGCR,
 				  RTL8366RB_SGCR_EN_VLAN_4KTB,
 				  enable ? RTL8366RB_SGCR_EN_VLAN_4KTB : 0);
@@ -2049,19 +1791,21 @@ static const struct dsa_switch_ops rtl8366rb_switch_ops = {
 	.get_strings = rtl8366_get_strings,
 	.get_ethtool_stats = rtl8366_get_ethtool_stats,
 	.get_sset_count = rtl8366_get_sset_count,
-	.port_bridge_join = rtl8366rb_port_bridge_join,
-	.port_bridge_leave = rtl8366rb_port_bridge_leave,
+	.port_bridge_join = rtl83xx_port_bridge_join,
+	.port_bridge_leave = rtl83xx_port_bridge_leave,
 	.port_vlan_filtering = rtl8366rb_vlan_filtering,
 	.port_vlan_add = rtl8366_vlan_add,
 	.port_vlan_del = rtl8366_vlan_del,
 	.port_enable = rtl8366rb_port_enable,
 	.port_disable = rtl8366rb_port_disable,
 	.port_pre_bridge_flags = rtl8366rb_port_pre_bridge_flags,
-	.port_bridge_flags = rtl8366rb_port_bridge_flags,
+	.port_bridge_flags = rtl83xx_port_bridge_flags,
 	.port_stp_state_set = rtl8366rb_port_stp_state_set,
 	.port_fast_age = rtl8366rb_port_fast_age,
 	.port_change_mtu = rtl8366rb_change_mtu,
 	.port_max_mtu = rtl8366rb_max_mtu,
+	.port_hsr_join = dsa_port_simple_hsr_join,
+	.port_hsr_leave = dsa_port_simple_hsr_leave,
 };
 
 static const struct realtek_ops rtl8366rb_ops = {
@@ -2076,6 +1820,9 @@ static const struct realtek_ops rtl8366rb_ops = {
 	.is_vlan_valid	= rtl8366rb_is_vlan_valid,
 	.enable_vlan	= rtl8366rb_enable_vlan,
 	.enable_vlan4k	= rtl8366rb_enable_vlan4k,
+	.port_add_isolation = rtl8366rb_port_add_isolation,
+	.port_remove_isolation = rtl8366rb_port_remove_isolation,
+	.port_set_learning = rtl8366rb_port_set_learning,
 	.phy_read	= rtl8366rb_phy_read,
 	.phy_write	= rtl8366rb_phy_write,
 };
@@ -2092,7 +1839,7 @@ const struct realtek_variant rtl8366rb_variant = {
 
 static const struct of_device_id rtl8366rb_of_match[] = {
 	{ .compatible = "realtek,rtl8366rb", .data = &rtl8366rb_variant, },
-	{ /* sentinel */ },
+	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, rtl8366rb_of_match);
 

@@ -73,10 +73,8 @@
  * On any mode switch, if the new reg values are smaller than the current values,
  * then update the regs with the new values.
  *
- * Link to the ticket: http://ontrack-internal.amd.com/browse/DEDCN21-142
- *
  */
-void apply_DEDCN21_142_wa_for_hostvm_deadline(
+void apply_hubp21_wa_for_hostvm_deadline(
 		struct hubp *hubp,
 		struct _vcs_dpi_display_dlg_regs_st *dlg_attr)
 {
@@ -133,7 +131,7 @@ void hubp21_program_deadline(
 {
 	hubp2_program_deadline(hubp, dlg_attr, ttu_attr);
 
-	apply_DEDCN21_142_wa_for_hostvm_deadline(hubp, dlg_attr);
+	apply_hubp21_wa_for_hostvm_deadline(hubp, dlg_attr);
 }
 
 void hubp21_program_requestor(
@@ -240,10 +238,10 @@ static void hubp21_set_vm_system_aperture_settings(struct hubp *hubp,
 	mc_vm_apt_high.quad_part = apt->sys_high.quad_part >> 18;
 
 	REG_SET(DCN_VM_SYSTEM_APERTURE_LOW_ADDR, 0,
-			MC_VM_SYSTEM_APERTURE_LOW_ADDR, mc_vm_apt_low.quad_part);
+			MC_VM_SYSTEM_APERTURE_LOW_ADDR, mc_vm_apt_low.low_part);
 
 	REG_SET(DCN_VM_SYSTEM_APERTURE_HIGH_ADDR, 0,
-			MC_VM_SYSTEM_APERTURE_HIGH_ADDR, mc_vm_apt_high.quad_part);
+			MC_VM_SYSTEM_APERTURE_HIGH_ADDR, mc_vm_apt_high.low_part);
 
 	REG_SET_2(DCN_VM_MX_L1_TLB_CNTL, 0,
 			ENABLE_L1_TLB, 1,
@@ -698,9 +696,12 @@ static void dmcub_PLAT_54186_wa(struct hubp *hubp,
 static bool hubp21_program_surface_flip_and_addr(
 		struct hubp *hubp,
 		const struct dc_plane_address *address,
-		bool flip_immediate)
+		bool flip_immediate,
+		bool dcc)
 {
 	struct surface_flip_registers flip_regs = { 0 };
+
+	(void)dcc;
 
 	flip_regs.vmid = address->vmid;
 
@@ -805,12 +806,14 @@ static bool hubp21_program_surface_flip_and_addr(
 
 static void hubp21_init(struct hubp *hubp)
 {
-	// DEDCN21-133: Inconsistent row starting line for flip between DPTE and Meta
+	// Inconsistent row starting line for flip between DPTE and Meta
 	// This is a chicken bit to enable the ECO fix.
 
 	struct dcn21_hubp *hubp21 = TO_DCN21_HUBP(hubp);
 	//hubp[i].HUBPREQ_DEBUG.HUBPREQ_DEBUG[26] = 1;
 	REG_WRITE(HUBPREQ_DEBUG, 1 << 26);
+
+	hubp_reset(hubp);
 }
 static struct hubp_funcs dcn21_hubp_funcs = {
 	.hubp_enable_tripleBuffer = hubp2_enable_triplebuffer,
@@ -823,6 +826,7 @@ static struct hubp_funcs dcn21_hubp_funcs = {
 	.hubp_set_vm_system_aperture_settings = hubp21_set_vm_system_aperture_settings,
 	.set_blank = hubp1_set_blank,
 	.dcc_control = hubp1_dcc_control,
+	.hubp_reset = hubp_reset,
 	.mem_program_viewport = hubp21_set_viewport,
 	.set_cursor_attributes	= hubp2_cursor_set_attributes,
 	.set_cursor_position	= hubp1_cursor_set_position,
@@ -837,6 +841,7 @@ static struct hubp_funcs dcn21_hubp_funcs = {
 	.hubp_init = hubp21_init,
 	.validate_dml_output = hubp21_validate_dml_output,
 	.hubp_set_flip_int = hubp1_set_flip_int,
+	.hubp_clear_tiling = hubp1_clear_tiling,
 };
 
 bool hubp21_construct(

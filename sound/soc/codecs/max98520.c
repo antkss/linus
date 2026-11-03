@@ -16,7 +16,7 @@
 #include <sound/tlv.h>
 #include "max98520.h"
 
-static struct reg_default max98520_reg[] = {
+static const struct reg_default max98520_reg[] = {
 	{MAX98520_R2000_SW_RESET, 0x00},
 	{MAX98520_R2001_STATUS_1, 0x00},
 	{MAX98520_R2002_STATUS_2, 0x00},
@@ -326,10 +326,20 @@ static int max98520_dai_tdm_slot(struct snd_soc_dai *dai,
 #define MAX98520_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | \
 	SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE)
 
+static const u64 max98520_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops max98520_dai_ops = {
 	.set_fmt = max98520_dai_set_fmt,
 	.hw_params = max98520_dai_hw_params,
 	.set_tdm_slot = max98520_dai_tdm_slot,
+	.auto_selectable_formats = &max98520_selectable_formats,
+	.num_auto_selectable_formats = 1,
 };
 
 static int max98520_dac_event(struct snd_soc_dapm_widget *w,
@@ -621,7 +631,7 @@ static int max98520_probe(struct snd_soc_component *component)
 	return 0;
 }
 
-static int __maybe_unused max98520_suspend(struct device *dev)
+static int max98520_suspend(struct device *dev)
 {
 	struct max98520_priv *max98520 = dev_get_drvdata(dev);
 
@@ -630,7 +640,7 @@ static int __maybe_unused max98520_suspend(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused max98520_resume(struct device *dev)
+static int max98520_resume(struct device *dev)
 {
 	struct max98520_priv *max98520 = dev_get_drvdata(dev);
 
@@ -641,7 +651,7 @@ static int __maybe_unused max98520_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops max98520_pm = {
-	SET_SYSTEM_SLEEP_PM_OPS(max98520_suspend, max98520_resume)
+	SYSTEM_SLEEP_PM_OPS(max98520_suspend, max98520_resume)
 };
 
 static const struct snd_soc_component_driver soc_codec_dev_max98520 = {
@@ -681,8 +691,8 @@ static int max98520_i2c_probe(struct i2c_client *i2c)
 	struct max98520_priv *max98520;
 	struct i2c_adapter *adapter = to_i2c_adapter(i2c->dev.parent);
 
-	ret = i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE | I2C_FUNC_SMBUS_BYTE_DATA);
-	if (!ret) {
+	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE |
+					      I2C_FUNC_SMBUS_BYTE_DATA)) {
 		dev_err(&i2c->dev, "I2C check functionality failed\n");
 		return -ENXIO;
 	}
@@ -734,8 +744,8 @@ static int max98520_i2c_probe(struct i2c_client *i2c)
 }
 
 static const struct i2c_device_id max98520_i2c_id[] = {
-	{ "max98520"},
-	{ },
+	{ .name = "max98520" },
+	{ }
 };
 
 MODULE_DEVICE_TABLE(i2c, max98520_i2c_id);
@@ -752,7 +762,7 @@ static struct i2c_driver max98520_i2c_driver = {
 	.driver = {
 		.name = "max98520",
 		.of_match_table = of_match_ptr(max98520_of_match),
-		.pm = &max98520_pm,
+		.pm = pm_ptr(&max98520_pm),
 	},
 	.probe = max98520_i2c_probe,
 	.id_table = max98520_i2c_id,

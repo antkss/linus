@@ -191,7 +191,7 @@ static void start_ep_timer(struct c4iw_ep *ep)
 static int stop_ep_timer(struct c4iw_ep *ep)
 {
 	pr_debug("ep %p stopping\n", ep);
-	del_timer_sync(&ep->timer);
+	timer_delete_sync(&ep->timer);
 	if (!test_and_set_bit(TIMEOUT, &ep->com.flags)) {
 		c4iw_put_ep(&ep->com);
 		return 0;
@@ -4006,8 +4006,10 @@ static void send_fw_pass_open_req(struct c4iw_dev *dev, struct sk_buff *skb,
 	int ret;
 
 	req_skb = alloc_skb(sizeof(struct fw_ofld_connection_wr), GFP_KERNEL);
-	if (!req_skb)
+	if (!req_skb) {
+		kfree_skb(skb);
 		return;
+	}
 	req = __skb_put_zero(req_skb, sizeof(*req));
 	req->op_compl = htonl(WR_OP_V(FW_OFLD_CONNECTION_WR) | FW_WR_COMPL_F);
 	req->len16_pkd = htonl(FW_WR_LEN16_V(DIV_ROUND_UP(sizeof(*req), 16)));
@@ -4156,6 +4158,7 @@ static int rx_pkt(struct c4iw_dev *dev, struct sk_buff *skb)
 		pdev = ip_dev_find(&init_net, iph->daddr);
 		if (!pdev) {
 			pr_err("%s - failed to find device!\n", __func__);
+			neigh_release(neigh);
 			goto free_dst;
 		}
 		e = cxgb4_l2t_get(dev->rdev.lldi.l2t, neigh,
@@ -4327,7 +4330,7 @@ static DECLARE_WORK(skb_work, process_work);
 
 static void ep_timeout(struct timer_list *t)
 {
-	struct c4iw_ep *ep = from_timer(ep, t, timer);
+	struct c4iw_ep *ep = timer_container_of(ep, t, timer);
 	int kickit = 0;
 
 	spin_lock(&timeout_lock);

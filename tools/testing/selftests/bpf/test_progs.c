@@ -14,12 +14,14 @@
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <linux/keyctl.h>
 #include <sys/un.h>
 #include <bpf/btf.h>
 #include <time.h>
 #include "json_writer.h"
 
 #include "network_helpers.h"
+#include "verification_cert.h"
 
 /* backtrace() and backtrace_symbols_fd() are glibc specific,
  * use header file when glibc is available and provide stub
@@ -88,27 +90,7 @@ static void stdio_hijack(char **log_buf, size_t *log_cnt)
 #endif
 }
 
-static void stdio_restore_cleanup(void)
-{
-#ifdef __GLIBC__
-	if (verbose() && env.worker_id == -1) {
-		/* nothing to do, output to stdout by default */
-		return;
-	}
-
-	fflush(stdout);
-
-	if (env.subtest_state) {
-		fclose(env.subtest_state->stdout_saved);
-		env.subtest_state->stdout_saved = NULL;
-		stdout = env.test_state->stdout_saved;
-		stderr = env.test_state->stdout_saved;
-	} else {
-		fclose(env.test_state->stdout_saved);
-		env.test_state->stdout_saved = NULL;
-	}
-#endif
-}
+static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void stdio_restore(void)
 {
@@ -118,14 +100,35 @@ static void stdio_restore(void)
 		return;
 	}
 
-	if (stdout == env.stdout_saved)
-		return;
+	fflush(stdout);
 
-	stdio_restore_cleanup();
+	pthread_mutex_lock(&stdout_lock);
 
-	stdout = env.stdout_saved;
-	stderr = env.stderr_saved;
+	if (env.subtest_state) {
+		if (env.subtest_state->stdout_saved)
+			fclose(env.subtest_state->stdout_saved);
+		env.subtest_state->stdout_saved = NULL;
+		stdout = env.test_state->stdout_saved;
+		stderr = env.test_state->stdout_saved;
+	} else {
+		if (env.test_state->stdout_saved)
+			fclose(env.test_state->stdout_saved);
+		env.test_state->stdout_saved = NULL;
+		stdout = env.stdout_saved;
+		stderr = env.stderr_saved;
+	}
+
+	pthread_mutex_unlock(&stdout_lock);
 #endif
+}
+
+static int traffic_monitor_print_fn(const char *format, va_list args)
+{
+	pthread_mutex_lock(&stdout_lock);
+	vfprintf(stdout, format, args);
+	pthread_mutex_unlock(&stdout_lock);
+
+	return 0;
 }
 
 /* Adapted from perf/util/string.c */
@@ -162,6 +165,8 @@ struct prog_test_def {
 	void (*run_test)(void);
 	void (*run_serial_test)(void);
 	bool should_run;
+	bool not_built;
+	bool selected;
 	bool need_cgroup_cleanup;
 	bool should_tmon;
 };
@@ -305,16 +310,34 @@ static bool match_subtest(struct test_filter_set *filter,
 	return false;
 }
 
+static bool match_subtest_desc(struct test_filter_set *filter,
+			       const char *test_name,
+			       const char *subtest_name,
+			       const char *subtest_desc)
+{
+	if (match_subtest(filter, test_name, subtest_name))
+		return true;
+
+	if (!subtest_desc || !subtest_desc[0] ||
+	    strcmp(subtest_name, subtest_desc) == 0)
+		return false;
+
+	return match_subtest(filter, test_name, subtest_desc);
+}
+
 static bool should_run_subtest(struct test_selector *sel,
 			       struct test_selector *subtest_sel,
 			       int subtest_num,
 			       const char *test_name,
-			       const char *subtest_name)
+			       const char *subtest_name,
+			       const char *subtest_desc)
 {
-	if (match_subtest(&sel->blacklist, test_name, subtest_name))
+	if (match_subtest_desc(&sel->blacklist, test_name,
+			       subtest_name, subtest_desc))
 		return false;
 
-	if (match_subtest(&sel->whitelist, test_name, subtest_name))
+	if (match_subtest_desc(&sel->whitelist, test_name,
+			       subtest_name, subtest_desc))
 		return true;
 
 	if (!sel->whitelist.cnt && !subtest_sel->num_set)
@@ -351,6 +374,8 @@ static void print_test_result(const struct prog_test_def *test, const struct tes
 	fprintf(env.stdout_saved, "#%-*d %s:", TEST_NUM_WIDTH, test->test_num, test->test_name);
 	if (test_state->error_cnt)
 		fprintf(env.stdout_saved, "FAIL");
+	else if (test->not_built)
+		fprintf(env.stdout_saved, "SKIP (not built)");
 	else if (!skipped_cnt)
 		fprintf(env.stdout_saved, "OK");
 	else if (skipped_cnt == subtests_cnt || !subtests_cnt)
@@ -399,10 +424,12 @@ static void jsonw_write_log_message(json_writer_t *w, char *log_buf, size_t log_
 	}
 }
 
+/* @quiet elides the human readable output, the JSON report is unaffected */
 static void dump_test_log(const struct prog_test_def *test,
 			  const struct test_state *test_state,
 			  bool skip_ok_subtests,
 			  bool par_exec_result,
+			  bool quiet,
 			  json_writer_t *w)
 {
 	bool test_failed = test_state->error_cnt > 0;
@@ -424,7 +451,7 @@ static void dump_test_log(const struct prog_test_def *test,
 	if (verbose() && !par_exec_result)
 		return;
 
-	if (test_state->log_cnt && print_test)
+	if (test_state->log_cnt && print_test && !quiet)
 		print_test_log(test_state->log_buf, test_state->log_cnt);
 
 	if (w && print_test) {
@@ -446,15 +473,16 @@ static void dump_test_log(const struct prog_test_def *test,
 		if ((skip_ok_subtests && !subtest_failed) || subtest_filtered)
 			continue;
 
-		if (subtest_state->log_cnt && print_subtest) {
+		if (subtest_state->log_cnt && print_subtest && !quiet) {
 			print_test_log(subtest_state->log_buf,
 				       subtest_state->log_cnt);
 		}
 
-		print_subtest_name(test->test_num, i + 1,
-				   test->test_name, subtest_state->name,
-				   test_result(subtest_state->error_cnt,
-					       subtest_state->skipped));
+		if (!quiet)
+			print_subtest_name(test->test_num, i + 1,
+					   test->test_name, subtest_state->name,
+					   test_result(subtest_state->error_cnt,
+						       subtest_state->skipped));
 
 		if (w && print_subtest) {
 			jsonw_start_object(w);
@@ -471,10 +499,9 @@ static void dump_test_log(const struct prog_test_def *test,
 		jsonw_end_object(w);
 	}
 
-	print_test_result(test, test_state);
+	if (!quiet)
+		print_test_result(test, test_state);
 }
-
-static void stdio_restore(void);
 
 /* A bunch of tests set custom affinity per-thread and/or per-process. Reset
  * it after each test/sub-test.
@@ -490,13 +517,11 @@ static void reset_affinity(void)
 
 	err = sched_setaffinity(0, sizeof(cpuset), &cpuset);
 	if (err < 0) {
-		stdio_restore();
 		fprintf(stderr, "Failed to reset process affinity: %d!\n", err);
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
 	err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 	if (err < 0) {
-		stdio_restore();
 		fprintf(stderr, "Failed to reset thread affinity: %d!\n", err);
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
@@ -514,7 +539,6 @@ static void save_netns(void)
 static void restore_netns(void)
 {
 	if (setns(env.saved_netns_fd, CLONE_NEWNET) == -1) {
-		stdio_restore();
 		perror("setns(CLONE_NEWNS)");
 		exit(EXIT_ERR_SETUP_INFRA);
 	}
@@ -541,28 +565,31 @@ void test__end_subtest(void)
 				   test_result(subtest_state->error_cnt,
 					       subtest_state->skipped));
 
-	stdio_restore_cleanup();
+	stdio_restore();
+
 	env.subtest_state = NULL;
 }
 
-bool test__start_subtest(const char *subtest_name)
+bool test__start_subtest_with_desc(const char *subtest_name, const char *subtest_desc)
 {
 	struct prog_test_def *test = env.test;
 	struct test_state *state = env.test_state;
 	struct subtest_state *subtest_state;
+	const char *subtest_display_name;
 	size_t sub_state_size = sizeof(*subtest_state);
+	void *tmp;
 
 	if (env.subtest_state)
 		test__end_subtest();
 
 	state->subtest_num++;
-	state->subtest_states =
-		realloc(state->subtest_states,
-			state->subtest_num * sub_state_size);
-	if (!state->subtest_states) {
+	tmp = realloc(state->subtest_states, state->subtest_num * sub_state_size);
+	if (!tmp) {
+		state->subtest_num--;
 		fprintf(stderr, "Not enough memory to allocate subtest result\n");
 		return false;
 	}
+	state->subtest_states = tmp;
 
 	subtest_state = &state->subtest_states[state->subtest_num - 1];
 
@@ -575,7 +602,9 @@ bool test__start_subtest(const char *subtest_name)
 		return false;
 	}
 
-	subtest_state->name = strdup(subtest_name);
+	subtest_display_name = subtest_desc ? subtest_desc : subtest_name;
+
+	subtest_state->name = strdup(subtest_display_name);
 	if (!subtest_state->name) {
 		fprintf(env.stderr_saved,
 			"Subtest #%d: failed to copy subtest name!\n",
@@ -587,20 +616,26 @@ bool test__start_subtest(const char *subtest_name)
 				&env.subtest_selector,
 				state->subtest_num,
 				test->test_name,
-				subtest_name)) {
+				subtest_name,
+				subtest_desc)) {
 		subtest_state->filtered = true;
 		return false;
 	}
 
-	subtest_state->should_tmon = match_subtest(&env.tmon_selector.whitelist,
-						   test->test_name,
-						   subtest_name);
+	subtest_state->should_tmon = match_subtest_desc(&env.tmon_selector.whitelist,
+							test->test_name, subtest_name,
+							subtest_desc);
 
 	env.subtest_state = subtest_state;
 	stdio_hijack_init(&subtest_state->log_buf, &subtest_state->log_cnt);
 	watchdog_start();
 
 	return true;
+}
+
+bool test__start_subtest(const char *subtest_name)
+{
+	return test__start_subtest_with_desc(subtest_name, NULL);
 }
 
 void test__force_log(void)
@@ -700,11 +735,14 @@ int compare_map_keys(int map1_fd, int map2_fd)
 int compare_stack_ips(int smap_fd, int amap_fd, int stack_trace_len)
 {
 	__u32 key, next_key, *cur_key_p, *next_key_p;
-	char *val_buf1, *val_buf2;
-	int i, err = 0;
+	char *val_buf1 = NULL, *val_buf2 = NULL;
+	int i, err = -ENOMEM;
 
 	val_buf1 = malloc(stack_trace_len);
 	val_buf2 = malloc(stack_trace_len);
+	if (!val_buf1 || !val_buf2)
+		goto out;
+	err = 0;
 	cur_key_p = NULL;
 	next_key_p = &key;
 	while (bpf_map_get_next_key(smap_fd, cur_key_p, next_key_p) == 0) {
@@ -865,6 +903,7 @@ enum ARG_KEYS {
 	ARG_JSON_SUMMARY = 'J',
 	ARG_TRAFFIC_MONITOR = 'm',
 	ARG_WATCHDOG_TIMEOUT = 'w',
+	ARG_NO_ERROR_SUMMARY = -2,
 };
 
 static const struct argp_option opts[] = {
@@ -897,6 +936,8 @@ static const struct argp_option opts[] = {
 #endif
 	{ "watchdog-timeout", ARG_WATCHDOG_TIMEOUT, "SECONDS", 0,
 	  "Kill the process if tests are not making progress for specified number of seconds." },
+	{ "no-error-summary", ARG_NO_ERROR_SUMMARY, NULL, 0,
+	  "Do not re-print the aggregated error logs of failed tests at the end of the run." },
 	{},
 };
 
@@ -1098,6 +1139,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	case ARG_DEBUG:
 		env->debug = true;
 		break;
+	case ARG_NO_ERROR_SUMMARY:
+		env->error_summary = false;
+		break;
 	case ARG_JSON_SUMMARY:
 		env->json = fopen(arg, "w");
 		if (env->json == NULL) {
@@ -1231,7 +1275,7 @@ int get_bpf_max_tramp_links_from(struct btf *btf)
 	const struct btf_type *t;
 	__u32 i, type_cnt;
 	const char *name;
-	__u16 j, vlen;
+	__u32 j, vlen;
 
 	for (i = 1, type_cnt = btf__type_cnt(btf); i < type_cnt; i++) {
 		t = btf__type_by_id(btf, i);
@@ -1262,7 +1306,20 @@ int get_bpf_max_tramp_links(void)
 	return ret;
 }
 
+static void dump_crash_log(void)
+{
+	fflush(stdout);
+	stdout = env.stdout_saved;
+	stderr = env.stderr_saved;
+
+	if (env.test) {
+		env.test_state->error_cnt++;
+		dump_test_log(env.test, env.test_state, true, false, false, NULL);
+	}
+}
+
 #define MAX_BACKTRACE_SZ 128
+
 void crash_handler(int signum)
 {
 	void *bt[MAX_BACKTRACE_SZ];
@@ -1270,16 +1327,34 @@ void crash_handler(int signum)
 
 	sz = backtrace(bt, ARRAY_SIZE(bt));
 
-	if (env.stdout_saved)
-		stdio_restore();
-	if (env.test) {
-		env.test_state->error_cnt++;
-		dump_test_log(env.test, env.test_state, true, false, NULL);
-	}
+	dump_crash_log();
+
 	if (env.worker_id != -1)
 		fprintf(stderr, "[%d]: ", env.worker_id);
 	fprintf(stderr, "Caught signal #%d!\nStack trace:\n", signum);
 	backtrace_symbols_fd(bt, sz, STDERR_FILENO);
+}
+
+#ifdef __SANITIZE_ADDRESS__
+void __asan_on_error(void)
+{
+	dump_crash_log();
+}
+#endif
+
+void hexdump(const char *prefix, const void *buf, size_t len)
+{
+	for (int i = 0; i < len; i++) {
+		if (!(i % 16)) {
+			if (i)
+				fprintf(stdout, "\n");
+			fprintf(stdout, "%s", prefix);
+		}
+		if (i && !(i % 8) && (i % 16))
+			fprintf(stdout, "\t");
+		fprintf(stdout, "%02X ", ((uint8_t *)(buf))[i]);
+	}
+	fprintf(stdout, "\n");
 }
 
 static void sigint_handler(int signum)
@@ -1350,10 +1425,19 @@ static int recv_message(int sock, struct msg *msg)
 	return ret;
 }
 
+static bool ns_is_needed(const char *test_name)
+{
+	if (strlen(test_name) < 3)
+		return false;
+
+	return !strncmp(test_name, "ns_", 3);
+}
+
 static void run_one_test(int test_num)
 {
 	struct prog_test_def *test = &prog_test_defs[test_num];
 	struct test_state *state = &test_states[test_num];
+	struct netns_obj *ns = NULL;
 
 	env.test = test;
 	env.test_state = state;
@@ -1361,10 +1445,13 @@ static void run_one_test(int test_num)
 	stdio_hijack(&state->log_buf, &state->log_cnt);
 
 	watchdog_start();
+	if (ns_is_needed(test->test_name))
+		ns = netns_new(test->test_name, true);
 	if (test->run_test)
 		test->run_test();
 	else if (test->run_serial_test)
 		test->run_serial_test();
+	netns_free(ns);
 	watchdog_stop();
 
 	/* ensure last sub-test is finalized properly */
@@ -1372,6 +1459,8 @@ static void run_one_test(int test_num)
 		test__end_subtest();
 
 	state->tested = true;
+
+	stdio_restore();
 
 	if (verbose() && env.worker_id == -1)
 		print_test_result(test, state);
@@ -1381,10 +1470,9 @@ static void run_one_test(int test_num)
 	if (test->need_cgroup_cleanup)
 		cleanup_cgroup_environment();
 
-	stdio_restore();
 	free(stop_libbpf_log_capture());
 
-	dump_test_log(test, state, false, false, NULL);
+	dump_test_log(test, state, false, false, false, NULL);
 }
 
 struct dispatch_data {
@@ -1439,12 +1527,14 @@ static int dispatch_thread_send_subtests(int sock_fd, struct test_state *state)
 	struct subtest_state *subtest_state;
 	int subtest_num = state->subtest_num;
 
-	state->subtest_states = malloc(subtest_num * sizeof(*subtest_state));
+	state->subtest_states = calloc(subtest_num, sizeof(*subtest_state));
+	if (!state->subtest_states) {
+		state->subtest_num = 0;
+		return -ENOMEM;
+	}
 
 	for (int i = 0; i < subtest_num; i++) {
 		subtest_state = &state->subtest_states[i];
-
-		memset(subtest_state, 0, sizeof(*subtest_state));
 
 		if (read_prog_test_msg(sock_fd, &msg, MSG_SUBTEST_DONE))
 			return 1;
@@ -1543,7 +1633,7 @@ static void *dispatch_thread(void *ctx)
 		} while (false);
 
 		pthread_mutex_lock(&stdout_output_lock);
-		dump_test_log(test, state, false, true, NULL);
+		dump_test_log(test, state, false, true, false, NULL);
 		pthread_mutex_unlock(&stdout_output_lock);
 	} /* while (true) */
 error:
@@ -1566,11 +1656,12 @@ done:
 
 static void calculate_summary_and_print_errors(struct test_env *env)
 {
-	int i;
-	int succ_cnt = 0, fail_cnt = 0, sub_succ_cnt = 0, skip_cnt = 0;
+	int i, j;
+	int succ_cnt = 0, fail_cnt = 0, sub_succ_cnt = 0, sub_fail_cnt = 0, skip_cnt = 0;
 	json_writer_t *w = NULL;
 
 	for (i = 0; i < prog_test_cnt; i++) {
+		struct prog_test_def *test = &prog_test_defs[i];
 		struct test_state *state = &test_states[i];
 
 		if (!state->tested)
@@ -1579,10 +1670,14 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 		sub_succ_cnt += state->sub_succ_cnt;
 		skip_cnt += state->skip_cnt;
 
-		if (state->error_cnt)
+		if (state->error_cnt) {
 			fail_cnt++;
-		else
+			for (j = 0; j < state->subtest_num; j++)
+				if (state->subtest_states[j].error_cnt)
+					sub_fail_cnt++;
+		} else if (!test->not_built) {
 			succ_cnt++;
+		}
 	}
 
 	if (env->json) {
@@ -1597,6 +1692,7 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 		jsonw_uint_field(w, "success_subtest", sub_succ_cnt);
 		jsonw_uint_field(w, "skipped", skip_cnt);
 		jsonw_uint_field(w, "failed", fail_cnt);
+		jsonw_uint_field(w, "failed_subtest", sub_fail_cnt);
 		jsonw_name(w, "results");
 		jsonw_start_array(w);
 	}
@@ -1605,9 +1701,14 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 	 * We only print error logs summary when there are failed tests and
 	 * verbose mode is not enabled. Otherwise, results may be inconsistent.
 	 *
+	 * --no-error-summary elides the human readable dump. The walk still
+	 * happens when a JSON report was requested, so the JSON output keeps
+	 * its per-test results; with no JSON report there is nothing left to
+	 * do and the whole loop is skipped.
 	 */
-	if (!verbose() && fail_cnt) {
-		printf("\nAll error logs:\n");
+	if (!verbose() && fail_cnt && (env->error_summary || w)) {
+		if (env->error_summary)
+			printf("\nAll error logs:\n");
 
 		/* print error logs again */
 		for (i = 0; i < prog_test_cnt; i++) {
@@ -1617,7 +1718,8 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 			if (!state->tested || !state->error_cnt)
 				continue;
 
-			dump_test_log(test, state, true, true, w);
+			dump_test_log(test, state, true, true,
+				      !env->error_summary, w);
 		}
 	}
 
@@ -1630,8 +1732,13 @@ static void calculate_summary_and_print_errors(struct test_env *env)
 	if (env->json)
 		fclose(env->json);
 
-	printf("Summary: %d/%d PASSED, %d SKIPPED, %d FAILED\n",
-	       succ_cnt, sub_succ_cnt, skip_cnt, fail_cnt);
+	if (env->not_built_cnt)
+		printf("Summary: %d/%d PASSED, %d SKIPPED (%d not built), %d/%d FAILED\n",
+		       succ_cnt, sub_succ_cnt, skip_cnt, env->not_built_cnt,
+		       fail_cnt, sub_fail_cnt);
+	else
+		printf("Summary: %d/%d PASSED, %d SKIPPED, %d/%d FAILED\n",
+		       succ_cnt, sub_succ_cnt, skip_cnt, fail_cnt, sub_fail_cnt);
 
 	env->succ_cnt = succ_cnt;
 	env->sub_succ_cnt = sub_succ_cnt;
@@ -1661,7 +1768,7 @@ static void server_main(void)
 		data[i].worker_id = i;
 		data[i].sock_fd = env.worker_socks[i];
 		rc = pthread_create(&dispatcher_threads[i], NULL, dispatch_thread, &data[i]);
-		if (rc < 0) {
+		if (rc) {
 			perror("Failed to launch dispatcher thread");
 			exit(EXIT_ERR_SETUP_INFRA);
 		}
@@ -1700,6 +1807,19 @@ static void server_main(void)
 			continue;
 
 		run_one_test(i);
+	}
+
+	/* mark not-built tests as skipped */
+	for (int i = 0; i < prog_test_cnt; i++) {
+		struct prog_test_def *test = &prog_test_defs[i];
+		struct test_state *state = &test_states[i];
+
+		if (test->not_built && test->selected) {
+			state->tested = true;
+			state->skip_cnt = 1;
+			env.not_built_cnt++;
+			print_test_result(test, state);
+		}
 	}
 
 	/* generate summary */
@@ -1770,7 +1890,7 @@ static int worker_main_send_subtests(int sock, struct test_state *state)
 
 		msg.subtest_done.num = i;
 
-		strncpy(msg.subtest_done.name, subtest_state->name, MAX_SUBTEST_NAME);
+		strscpy(msg.subtest_done.name, subtest_state->name, MAX_SUBTEST_NAME);
 
 		msg.subtest_done.error_cnt = subtest_state->error_cnt;
 		msg.subtest_done.skipped = subtest_state->skipped;
@@ -1793,7 +1913,6 @@ static int worker_main_send_subtests(int sock, struct test_state *state)
 			worker_main_send_log(sock, subtest_state->log_buf, subtest_state->log_cnt);
 
 		free_subtest_state(subtest_state);
-		free(subtest_state->name);
 	}
 
 out:
@@ -1901,6 +2020,13 @@ static void free_test_states(void)
 	}
 }
 
+static __u32 register_session_key(const char *key_data, size_t key_data_size)
+{
+	return syscall(__NR_add_key, "asymmetric", "libbpf_session_key",
+			(const void *)key_data, key_data_size,
+			KEY_SPEC_SESSION_KEYRING);
+}
+
 int main(int argc, char **argv)
 {
 	static const struct argp argp = {
@@ -1908,16 +2034,22 @@ int main(int argc, char **argv)
 		.parser = parse_arg,
 		.doc = argp_program_doc,
 	};
+	int err, i;
+
+#ifndef __SANITIZE_ADDRESS__
 	struct sigaction sigact = {
 		.sa_handler = crash_handler,
 		.sa_flags = SA_RESETHAND,
-		};
-	int err, i;
-
+	};
 	sigaction(SIGSEGV, &sigact, NULL);
+#endif
+
+	env.stdout_saved = stdout;
+	env.stderr_saved = stderr;
 
 	env.secs_till_notify = 10;
 	env.secs_till_kill = 120;
+	env.error_summary = true;
 	err = argp_parse(&argp, argc, argv, 0, NULL, &env);
 	if (err)
 		return err;
@@ -1931,6 +2063,15 @@ int main(int argc, char **argv)
 	/* Use libbpf 1.0 API mode */
 	libbpf_set_strict_mode(LIBBPF_STRICT_ALL);
 	libbpf_set_print(libbpf_print_fn);
+	err = register_session_key((const char *)test_progs_verification_cert,
+				   test_progs_verification_cert_len);
+	if (err < 0) {
+		fprintf(stderr, "Failed to add libbpf_session_key to the session keyring: %s\n",
+			strerror(errno));
+		return err;
+	}
+
+	traffic_monitor_set_print(traffic_monitor_print_fn);
 
 	srand(time(NULL));
 
@@ -1941,9 +2082,6 @@ int main(int argc, char **argv)
 			env.nr_cpus);
 		return -1;
 	}
-
-	env.stdout_saved = stdout;
-	env.stderr_saved = stderr;
 
 	env.has_testmod = true;
 	if (!env.list_test_names) {
@@ -1961,14 +2099,19 @@ int main(int argc, char **argv)
 		struct prog_test_def *test = &prog_test_defs[i];
 
 		test->test_num = i + 1;
-		test->should_run = should_run(&env.test_selector,
-					      test->test_num, test->test_name);
+		test->selected = should_run(&env.test_selector,
+					    test->test_num, test->test_name);
+		test->should_run = test->selected;
 
-		if ((test->run_test == NULL && test->run_serial_test == NULL) ||
-		    (test->run_test != NULL && test->run_serial_test != NULL)) {
+		if (test->run_test && test->run_serial_test) {
 			fprintf(stderr, "Test %d:%s must have either test_%s() or serial_test_%sl() defined.\n",
 				test->test_num, test->test_name, test->test_name, test->test_name);
 			exit(EXIT_ERR_SETUP_INFRA);
+		}
+		if (!test->run_test && !test->run_serial_test) {
+			test->not_built = true;
+			test->should_run = false;
+			continue;
 		}
 		if (test->should_run)
 			test->should_tmon = should_tmon(&env.tmon_selector, test->test_name);
@@ -2021,9 +2164,18 @@ int main(int argc, char **argv)
 
 	for (i = 0; i < prog_test_cnt; i++) {
 		struct prog_test_def *test = &prog_test_defs[i];
+		struct test_state *state = &test_states[i];
 
-		if (!test->should_run)
+		if (!test->should_run) {
+			if (test->not_built && test->selected &&
+			    !env.get_test_cnt && !env.list_test_names) {
+				state->tested = true;
+				state->skip_cnt = 1;
+				env.not_built_cnt++;
+				print_test_result(test, state);
+			}
 			continue;
+		}
 
 		if (env.get_test_cnt) {
 			env.succ_cnt++;

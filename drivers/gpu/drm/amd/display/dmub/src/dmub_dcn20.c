@@ -63,9 +63,9 @@ static void dmub_dcn20_get_fb_base_offset(struct dmub_srv *dmub,
 {
 	uint32_t tmp;
 
-	if (dmub->fb_base || dmub->fb_offset) {
-		*fb_base = dmub->fb_base;
-		*fb_offset = dmub->fb_offset;
+	if (dmub->soc_fb_info.fb_base || dmub->soc_fb_info.fb_offset) {
+		*fb_base = dmub->soc_fb_info.fb_base;
+		*fb_offset = dmub->soc_fb_info.fb_offset;
 		return;
 	}
 
@@ -194,6 +194,7 @@ void dmub_dcn20_setup_windows(struct dmub_srv *dmub,
 			      const struct dmub_window *cw6,
 			      const struct dmub_window *region6)
 {
+	(void)region6;
 	union dmub_addr offset;
 	uint64_t fb_base, fb_offset;
 
@@ -396,6 +397,7 @@ union dmub_fw_boot_status dmub_dcn20_get_fw_boot_status(struct dmub_srv *dmub)
 
 void dmub_dcn20_enable_dmub_boot_options(struct dmub_srv *dmub, const struct dmub_srv_hw_params *params)
 {
+	(void)params;
 	union dmub_fw_boot_options boot_options = {0};
 
 	REG_WRITE(DMCUB_SCRATCH14, boot_options.all);
@@ -414,63 +416,68 @@ uint32_t dmub_dcn20_get_current_time(struct dmub_srv *dmub)
 	return REG_READ(DMCUB_TIMER_CURRENT);
 }
 
-void dmub_dcn20_get_diagnostic_data(struct dmub_srv *dmub, struct dmub_diagnostic_data *diag_data)
+void dmub_dcn20_get_diagnostic_data(struct dmub_srv *dmub, struct dmub_hw_diagnostic_data *hw_data)
 {
 	uint32_t is_dmub_enabled, is_soft_reset, is_sec_reset;
 	uint32_t is_traceport_enabled, is_cw0_enabled, is_cw6_enabled;
 
-	if (!dmub || !diag_data)
+	if (!dmub || !hw_data)
 		return;
 
-	memset(diag_data, 0, sizeof(*diag_data));
+	memset(hw_data, 0, sizeof(*hw_data));
 
-	diag_data->dmcub_version = dmub->fw_version;
+	hw_data->dmcub_version = dmub->fw_version;
 
-	diag_data->scratch[0] = REG_READ(DMCUB_SCRATCH0);
-	diag_data->scratch[1] = REG_READ(DMCUB_SCRATCH1);
-	diag_data->scratch[2] = REG_READ(DMCUB_SCRATCH2);
-	diag_data->scratch[3] = REG_READ(DMCUB_SCRATCH3);
-	diag_data->scratch[4] = REG_READ(DMCUB_SCRATCH4);
-	diag_data->scratch[5] = REG_READ(DMCUB_SCRATCH5);
-	diag_data->scratch[6] = REG_READ(DMCUB_SCRATCH6);
-	diag_data->scratch[7] = REG_READ(DMCUB_SCRATCH7);
-	diag_data->scratch[8] = REG_READ(DMCUB_SCRATCH8);
-	diag_data->scratch[9] = REG_READ(DMCUB_SCRATCH9);
-	diag_data->scratch[10] = REG_READ(DMCUB_SCRATCH10);
-	diag_data->scratch[11] = REG_READ(DMCUB_SCRATCH11);
-	diag_data->scratch[12] = REG_READ(DMCUB_SCRATCH12);
-	diag_data->scratch[13] = REG_READ(DMCUB_SCRATCH13);
-	diag_data->scratch[14] = REG_READ(DMCUB_SCRATCH14);
-	diag_data->scratch[15] = REG_READ(DMCUB_SCRATCH15);
+	hw_data->scratch[0] = REG_READ(DMCUB_SCRATCH0);
+	hw_data->scratch[1] = REG_READ(DMCUB_SCRATCH1);
+	hw_data->scratch[2] = REG_READ(DMCUB_SCRATCH2);
+	hw_data->scratch[3] = REG_READ(DMCUB_SCRATCH3);
+	hw_data->scratch[4] = REG_READ(DMCUB_SCRATCH4);
+	hw_data->scratch[5] = REG_READ(DMCUB_SCRATCH5);
+	hw_data->scratch[6] = REG_READ(DMCUB_SCRATCH6);
+	hw_data->scratch[7] = REG_READ(DMCUB_SCRATCH7);
+	hw_data->scratch[8] = REG_READ(DMCUB_SCRATCH8);
+	hw_data->scratch[9] = REG_READ(DMCUB_SCRATCH9);
+	hw_data->scratch[10] = REG_READ(DMCUB_SCRATCH10);
+	hw_data->scratch[11] = REG_READ(DMCUB_SCRATCH11);
+	hw_data->scratch[12] = REG_READ(DMCUB_SCRATCH12);
+	hw_data->scratch[13] = REG_READ(DMCUB_SCRATCH13);
+	hw_data->scratch[14] = REG_READ(DMCUB_SCRATCH14);
+	hw_data->scratch[15] = REG_READ(DMCUB_SCRATCH15);
 
-	diag_data->undefined_address_fault_addr = REG_READ(DMCUB_UNDEFINED_ADDRESS_FAULT_ADDR);
-	diag_data->inst_fetch_fault_addr = REG_READ(DMCUB_INST_FETCH_FAULT_ADDR);
-	diag_data->data_write_fault_addr = REG_READ(DMCUB_DATA_WRITE_FAULT_ADDR);
+	hw_data->undefined_address_fault_addr = REG_READ(DMCUB_UNDEFINED_ADDRESS_FAULT_ADDR);
+	hw_data->inst_fetch_fault_addr = REG_READ(DMCUB_INST_FETCH_FAULT_ADDR);
+	hw_data->data_write_fault_addr = REG_READ(DMCUB_DATA_WRITE_FAULT_ADDR);
 
-	diag_data->inbox1_rptr = REG_READ(DMCUB_INBOX1_RPTR);
-	diag_data->inbox1_wptr = REG_READ(DMCUB_INBOX1_WPTR);
-	diag_data->inbox1_size = REG_READ(DMCUB_INBOX1_SIZE);
+	hw_data->inbox1_rptr = REG_READ(DMCUB_INBOX1_RPTR);
+	hw_data->inbox1_wptr = REG_READ(DMCUB_INBOX1_WPTR);
+	hw_data->inbox1_size = REG_READ(DMCUB_INBOX1_SIZE);
 
-	diag_data->inbox0_rptr = REG_READ(DMCUB_INBOX0_RPTR);
-	diag_data->inbox0_wptr = REG_READ(DMCUB_INBOX0_WPTR);
-	diag_data->inbox0_size = REG_READ(DMCUB_INBOX0_SIZE);
+	hw_data->inbox0_rptr = REG_READ(DMCUB_INBOX0_RPTR);
+	hw_data->inbox0_wptr = REG_READ(DMCUB_INBOX0_WPTR);
+	hw_data->inbox0_size = REG_READ(DMCUB_INBOX0_SIZE);
 
 	REG_GET(DMCUB_CNTL, DMCUB_ENABLE, &is_dmub_enabled);
-	diag_data->is_dmcub_enabled = is_dmub_enabled;
+	ASSERT(is_dmub_enabled <= 0xFF);
+	hw_data->is_dmcub_enabled = (uint8_t)is_dmub_enabled;
 
 	REG_GET(DMCUB_CNTL, DMCUB_SOFT_RESET, &is_soft_reset);
-	diag_data->is_dmcub_soft_reset = is_soft_reset;
+	ASSERT(is_soft_reset <= 0xFF);
+	hw_data->is_dmcub_soft_reset = (uint8_t)is_soft_reset;
 
 	REG_GET(DMCUB_SEC_CNTL, DMCUB_SEC_RESET_STATUS, &is_sec_reset);
-	diag_data->is_dmcub_secure_reset = is_sec_reset;
+	ASSERT(is_sec_reset <= 0xFF);
+	hw_data->is_dmcub_secure_reset = (uint8_t)is_sec_reset;
 
 	REG_GET(DMCUB_CNTL, DMCUB_TRACEPORT_EN, &is_traceport_enabled);
-	diag_data->is_traceport_en  = is_traceport_enabled;
+	ASSERT(is_traceport_enabled <= 0xFF);
+	hw_data->is_traceport_en  = (uint8_t)is_traceport_enabled;
 
 	REG_GET(DMCUB_REGION3_CW0_TOP_ADDRESS, DMCUB_REGION3_CW0_ENABLE, &is_cw0_enabled);
-	diag_data->is_cw0_enabled = is_cw0_enabled;
+	ASSERT(is_cw0_enabled <= 0xFF);
+	hw_data->is_cw0_enabled = (uint8_t)is_cw0_enabled;
 
 	REG_GET(DMCUB_REGION3_CW6_TOP_ADDRESS, DMCUB_REGION3_CW6_ENABLE, &is_cw6_enabled);
-	diag_data->is_cw6_enabled = is_cw6_enabled;
-	diag_data->timeout_info = dmub->debug;
+	ASSERT(is_cw6_enabled <= 0xFF);
+	hw_data->is_cw6_enabled = (uint8_t)is_cw6_enabled;
 }

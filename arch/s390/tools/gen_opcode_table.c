@@ -237,10 +237,10 @@ static void print_opcode(struct insn *insn, int nr)
 		opcode += 2;
 	printf("\t[%4d] = { .opfrag = 0x%s, .format = INSTR_%s, ", nr, opcode, insn->format);
 	if (insn->name_len < 6)
-		printf(".name = \"%s\" ", insn->name);
+		printf(".name = \"%s\"", insn->name);
 	else
-		printf(".offset = LONG_INSN_%s ", insn->upper);
-	printf("}, \\\n");
+		printf(".offset = LONG_INSN_%s", insn->upper);
+	printf(" }, \\\n");
 }
 
 static void add_to_group(struct gen_opcode *desc, struct insn *insn, int offset)

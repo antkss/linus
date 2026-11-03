@@ -39,9 +39,9 @@ static unsigned long clk_pll_recalc_rate(struct clk_hw *hwclk,
 					 unsigned long parent_rate)
 {
 	struct socfpga_pll *socfpgaclk = to_socfpga_clk(hwclk);
-	unsigned long divf, divq, reg;
+	u32 divf, divq, reg;
 	unsigned long long vco_freq;
-	unsigned long bypass;
+	u32 bypass;
 
 	reg = readl(socfpgaclk->hw.reg);
 	bypass = readl(clk_mgr_base_addr + CLKMGR_BYPASS);
@@ -78,13 +78,13 @@ static void __init __socfpga_pll_init(struct device_node *node,
 	struct socfpga_pll *pll_clk;
 	const char *clk_name = node->name;
 	const char *parent_name[SOCFPGA_MAX_PARENTS];
-	struct clk_init_data init;
+	struct clk_init_data init = {};
 	struct device_node *clkmgr_np;
 	int rc;
 
 	of_property_read_u32(node, "reg", &reg);
 
-	pll_clk = kzalloc(sizeof(*pll_clk), GFP_KERNEL);
+	pll_clk = kzalloc_obj(*pll_clk);
 	if (WARN_ON(!pll_clk))
 		return;
 

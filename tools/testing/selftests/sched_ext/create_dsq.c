@@ -14,11 +14,11 @@ static enum scx_test_status setup(void **ctx)
 {
 	struct create_dsq *skel;
 
-	skel = create_dsq__open_and_load();
-	if (!skel) {
-		SCX_ERR("Failed to open and load skel");
-		return SCX_TEST_FAIL;
-	}
+	skel = create_dsq__open();
+	SCX_FAIL_IF(!skel, "Failed to open");
+	SCX_ENUM_INIT(skel);
+	SCX_FAIL_IF(create_dsq__load(skel), "Failed to load skel");
+
 	*ctx = skel;
 
 	return SCX_TEST_PASS;
@@ -35,7 +35,11 @@ static enum scx_test_status run(void *ctx)
 		return SCX_TEST_FAIL;
 	}
 
+	SCX_ASSERT_ALIVE(skel, uei);
+
 	bpf_link__destroy(link);
+
+	SCX_EQ(skel->bss->nr_lifecycle_tests, 1024);
 
 	return SCX_TEST_PASS;
 }
@@ -49,7 +53,7 @@ static void cleanup(void *ctx)
 
 struct scx_test create_dsq = {
 	.name = "create_dsq",
-	.description = "Create and destroy a dsq in a loop",
+	.description = "Create, reject duplicates, destroy and recreate DSQs",
 	.setup = setup,
 	.run = run,
 	.cleanup = cleanup,

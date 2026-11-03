@@ -4,12 +4,19 @@
 
 # Shell functions for the rest of the scripts.
 
+export LC_ALL=C
+
 MAX_RETRIES=600
 RETRY_INTERVAL=".1"	# seconds
 SYSFS_KERNEL_DIR="/sys/kernel"
 SYSFS_KLP_DIR="$SYSFS_KERNEL_DIR/livepatch"
 SYSFS_DEBUG_DIR="$SYSFS_KERNEL_DIR/debug"
 SYSFS_KPROBES_DIR="$SYSFS_DEBUG_DIR/kprobes"
+if [[ -e /sys/kernel/tracing/trace ]]; then
+	SYSFS_TRACING_DIR="$SYSFS_KERNEL_DIR/tracing"
+else
+	SYSFS_TRACING_DIR="$SYSFS_DEBUG_DIR/tracing"
+fi
 
 # Kselftest framework requirement - SKIP code is 4
 ksft_skip=4
@@ -62,6 +69,9 @@ function push_config() {
 			awk -F'[: ]' '{print "file " $1 " line " $2 " " $4}')
 	FTRACE_ENABLED=$(sysctl --values kernel.ftrace_enabled)
 	KPROBE_ENABLED=$(cat "$SYSFS_KPROBES_DIR/enabled")
+	TRACING_ON=$(cat "$SYSFS_TRACING_DIR/tracing_on")
+	CURRENT_TRACER=$(cat "$SYSFS_TRACING_DIR/current_tracer")
+	FTRACE_FILTER=$(cat "$SYSFS_TRACING_DIR/set_ftrace_filter")
 }
 
 function pop_config() {
@@ -73,6 +83,17 @@ function pop_config() {
 	fi
 	if [[ -n "$KPROBE_ENABLED" ]]; then
 		echo "$KPROBE_ENABLED" > "$SYSFS_KPROBES_DIR/enabled"
+	fi
+	if [[ -n "$TRACING_ON" ]]; then
+		echo "$TRACING_ON" > "$SYSFS_TRACING_DIR/tracing_on"
+	fi
+	if [[ -n "$CURRENT_TRACER" ]]; then
+		echo "$CURRENT_TRACER" > "$SYSFS_TRACING_DIR/current_tracer"
+	fi
+	if [[ -n "$FTRACE_FILTER" ]]; then
+		echo "$FTRACE_FILTER" \
+			| sed -e "/#### all functions enabled ####/d" \
+			> "$SYSFS_TRACING_DIR/set_ftrace_filter"
 	fi
 }
 
@@ -103,6 +124,20 @@ function set_ftrace_enabled() {
 	fi
 
 	echo "livepatch: kernel.ftrace_enabled = $result" > /dev/kmsg
+}
+
+# ftrace_disable_supported() - probe whether kernel.ftrace_enabled=0
+#	can still disable ftrace on this kernel. Newer kernels deprecate
+#	the knob and always refuse the write with -EOPNOTSUPP.
+function ftrace_disable_supported() {
+	local orig result
+
+	orig=$(sysctl --values kernel.ftrace_enabled)
+	sysctl -q kernel.ftrace_enabled=0 &> /dev/null
+	result=$(sysctl --values kernel.ftrace_enabled)
+	sysctl -q "kernel.ftrace_enabled=$orig" &> /dev/null
+
+	[[ "$result" == "0" ]]
 }
 
 function cleanup() {
@@ -285,9 +320,9 @@ function start_test {
 	# find new kernel messages since the test started.
 	local last_dmesg_msg="livepatch kselftest timestamp: $(date --rfc-3339=ns)"
 	log "$last_dmesg_msg"
-	loop_until 'dmesg | grep -q "$last_dmesg_msg"' ||
+	loop_until 'dmesg -r | grep -q "$last_dmesg_msg"' ||
 		die "buffer busy? can't find canary dmesg message: $last_dmesg_msg"
-	LAST_DMESG=$(dmesg | grep "$last_dmesg_msg")
+	LAST_DMESG=$(dmesg -r | grep "$last_dmesg_msg")
 
 	echo -n "TEST: $test ... "
 	log "===== TEST: $test ====="
@@ -300,13 +335,20 @@ function check_result {
 	local result
 
 	# Test results include any new dmesg entry since LAST_DMESG, then:
+	# - exclude debug messages except with "livepatch:" prefix
 	# - include lines matching keywords
 	# - exclude lines matching keywords
 	# - filter out dmesg timestamp prefixes
-	result=$(dmesg | awk -v last_dmesg="$LAST_DMESG" 'p; $0 == last_dmesg { p=1 }' | \
+	# - exclude the delayed kobject release messages when CONFIG_DEBUG_KOBJECT_RELEASE is on
+	result=$(dmesg -r | \
+		 awk -v last_dmesg="$LAST_DMESG" \
+		 'p { if ($0 !~ /^<7>/ || $0 ~ /livepatch:/) print; next } $0 == last_dmesg { p = 1 }' | \
 		 grep -e 'livepatch:' -e 'test_klp' | \
 		 grep -v '\(tainting\|taints\) kernel' | \
-		 sed 's/^\[[ 0-9.]*\] //')
+		 grep -v 'kobject: .*parent.*(delayed' | \
+		 sed 's/^<[0-9]*>//' | \
+		 sed 's/^\[[ 0-9.]*\] //' | \
+		 sed 's/^\[[ ]*[CT][0-9]*\] //')
 
 	if [[ "$expect" == "$result" ]] ; then
 		echo "ok"
@@ -317,6 +359,16 @@ function check_result {
 		echo -e "not ok\n\n$(diff -upr --label expected --label result <(echo "$expect") <(echo "$result"))\n"
 		die "livepatch kselftest(s) failed"
 	fi
+}
+
+# does_sysfs_exist(modname, attr) - check sysfs attribute existence
+#	modname - livepatch module creating the sysfs interface
+#	attr - attribute name to be checked
+function does_sysfs_exist() {
+	local mod="$1"; shift
+	local attr="$1"; shift
+
+	[[ -f "$SYSFS_KLP_DIR/$mod/$attr" ]]
 }
 
 # check_sysfs_rights(modname, rel_path, expected_rights) - check sysfs
@@ -350,4 +402,38 @@ function check_sysfs_value() {
 	if test "$value" != "$expected_value" ; then
 		die "Unexpected value in $path: $expected_value vs. $value"
 	fi
+}
+
+# cleanup_tracing() - stop and clean up function tracing
+function cleanup_tracing() {
+	echo 0 > "$SYSFS_TRACING_DIR/tracing_on"
+	echo "" > "$SYSFS_TRACING_DIR/set_ftrace_filter"
+	echo "nop" > "$SYSFS_TRACING_DIR/current_tracer"
+	echo "" > "$SYSFS_TRACING_DIR/trace"
+}
+
+# trace_function(function) - start tracing of a function
+#	function - to be traced function
+function trace_function() {
+	local function="$1"; shift
+
+	cleanup_tracing
+
+	echo "function" > "$SYSFS_TRACING_DIR/current_tracer"
+	echo "$function" > "$SYSFS_TRACING_DIR/set_ftrace_filter"
+	echo 1 > "$SYSFS_TRACING_DIR/tracing_on"
+}
+
+# check_traced_functions(functions...) - check whether each function appeared in the trace log
+#	functions - list of functions to be checked
+function check_traced_functions() {
+	local function
+
+	for function in "$@"; do
+		if ! grep -Fwq "$function" "$SYSFS_TRACING_DIR/trace" ; then
+			die "Function ($function) did not appear in the trace"
+		fi
+	done
+
+	cleanup_tracing
 }

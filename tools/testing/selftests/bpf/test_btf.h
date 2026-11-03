@@ -7,7 +7,7 @@
 #define BTF_END_RAW 0xdeadbeef
 
 #define BTF_INFO_ENC(kind, kind_flag, vlen)			\
-	((!!(kind_flag) << 31) | ((kind) << 24) | ((vlen) & BTF_MAX_VLEN))
+	(((__u32)(!!(kind_flag)) << 31) | ((kind) << 24) | ((vlen) & BTF_MAX_VLEN))
 
 #define BTF_TYPE_ENC(name, info, size_or_type)	\
 	(name), (info), (size_or_type)
@@ -72,8 +72,14 @@
 #define BTF_TYPE_FLOAT_ENC(name, sz) \
 	BTF_TYPE_ENC(name, BTF_INFO_ENC(BTF_KIND_FLOAT, 0, 0), sz)
 
+#define BTF_DECL_ATTR_ENC(value, type, component_idx)	\
+	BTF_TYPE_ENC(value, BTF_INFO_ENC(BTF_KIND_DECL_TAG, 1, 0), type), (component_idx)
+
 #define BTF_DECL_TAG_ENC(value, type, component_idx)	\
 	BTF_TYPE_ENC(value, BTF_INFO_ENC(BTF_KIND_DECL_TAG, 0, 0), type), (component_idx)
+
+#define BTF_TYPE_ATTR_ENC(value, type)	\
+	BTF_TYPE_ENC(value, BTF_INFO_ENC(BTF_KIND_TYPE_TAG, 1, 0), type)
 
 #define BTF_TYPE_TAG_ENC(value, type)	\
 	BTF_TYPE_ENC(value, BTF_INFO_ENC(BTF_KIND_TYPE_TAG, 0, 0), type)

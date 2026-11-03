@@ -14,6 +14,7 @@
 #include <linux/in.h>
 #include <linux/etherdevice.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <net/sock.h>
 #include <net/ip.h>
 #include <net/icmp.h>
@@ -25,6 +26,7 @@
 #include <net/xfrm.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
+#include <net/netdev_lock.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/udp.h>
@@ -73,9 +75,9 @@ static netdev_tx_t l2tp_eth_dev_xmit(struct sk_buff *skb, struct net_device *dev
 	int ret = l2tp_xmit_skb(session, skb);
 
 	if (likely(ret == NET_XMIT_SUCCESS))
-		dev_sw_netstats_tx_add(dev, 1, len);
+		dev_dstats_tx_add(dev, len);
 	else
-		DEV_STATS_INC(dev, tx_dropped);
+		dev_dstats_tx_dropped(dev);
 
 	return NETDEV_TX_OK;
 }
@@ -84,7 +86,6 @@ static const struct net_device_ops l2tp_eth_netdev_ops = {
 	.ndo_init		= l2tp_eth_dev_init,
 	.ndo_uninit		= l2tp_eth_dev_uninit,
 	.ndo_start_xmit		= l2tp_eth_dev_xmit,
-	.ndo_get_stats64	= dev_get_tstats64,
 	.ndo_set_mac_address	= eth_mac_addr,
 };
 
@@ -100,7 +101,7 @@ static void l2tp_eth_dev_setup(struct net_device *dev)
 	dev->lltx		= true;
 	dev->netdev_ops		= &l2tp_eth_netdev_ops;
 	dev->needs_free_netdev	= true;
-	dev->pcpu_stat_type	= NETDEV_PCPU_STAT_TSTATS;
+	dev->pcpu_stat_type	= NETDEV_PCPU_STAT_DSTATS;
 }
 
 static void l2tp_eth_dev_recv(struct l2tp_session *session, struct sk_buff *skb, int data_len)
@@ -128,7 +129,7 @@ static void l2tp_eth_dev_recv(struct l2tp_session *session, struct sk_buff *skb,
 		goto error_rcu;
 
 	if (dev_forward_skb(dev, skb) == NET_RX_SUCCESS)
-		dev_sw_netstats_rx_add(dev, data_len);
+		dev_dstats_rx_add(dev, data_len);
 	else
 		DEV_STATS_INC(dev, rx_errors);
 
@@ -235,10 +236,10 @@ static int l2tp_eth_create(struct net *net, struct l2tp_tunnel *tunnel,
 	int rc;
 
 	if (cfg->ifname) {
-		strscpy(name, cfg->ifname, IFNAMSIZ);
+		strscpy(name, cfg->ifname);
 		name_assign_type = NET_NAME_USER;
 	} else {
-		strcpy(name, L2TP_ETH_DEV_NAME);
+		strscpy(name, L2TP_ETH_DEV_NAME);
 		name_assign_type = NET_NAME_ENUM;
 	}
 

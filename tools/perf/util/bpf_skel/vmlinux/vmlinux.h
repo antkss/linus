@@ -48,6 +48,10 @@ enum {
 };
 
 typedef struct {
+	int	counter;
+} __attribute__((preserve_access_index)) atomic_t;
+
+typedef struct {
 	s64	counter;
 } __attribute__((preserve_access_index)) atomic64_t;
 
@@ -65,6 +69,10 @@ typedef struct {
 
 struct sighand_struct {
 	spinlock_t siglock;
+} __attribute__((preserve_access_index));
+
+struct signal_struct {
+	atomic_t live;
 } __attribute__((preserve_access_index));
 
 struct rw_semaphore {
@@ -103,6 +111,7 @@ struct task_struct {
 	pid_t		      pid;
 	pid_t		      tgid;
 	char		      comm[16];
+	struct signal_struct  *signal;
 	struct sighand_struct *sighand;
 	struct css_set	      *cgroups;
 } __attribute__((preserve_access_index));
@@ -194,5 +203,22 @@ struct bpf_perf_event_data_kern {
  * lock_contention.bpf.c for consistency with a generated vmlinux.h.
  */
 struct rq {};
+
+struct kmem_cache {
+	const char *name;
+} __attribute__((preserve_access_index));
+
+struct bpf_iter__kmem_cache {
+	struct kmem_cache *s;
+} __attribute__((preserve_access_index));
+
+struct zone {
+	spinlock_t lock;
+} __attribute__((preserve_access_index));
+
+struct pglist_data {
+	struct zone node_zones[6]; /* value for all possible config */
+	int nr_zones;
+} __attribute__((preserve_access_index));
 
 #endif // __VMLINUX_H

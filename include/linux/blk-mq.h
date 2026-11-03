@@ -9,9 +9,11 @@
 #include <linux/prefetch.h>
 #include <linux/srcu.h>
 #include <linux/rw_hint.h>
+#include <linux/rwsem.h>
 
 struct blk_mq_tags;
 struct blk_flush_queue;
+struct io_comp_batch;
 
 #define BLKDEV_MIN_RQ	4
 #define BLKDEV_DEFAULT_RQ	128
@@ -21,14 +23,15 @@ enum rq_end_io_ret {
 	RQ_END_IO_FREE,
 };
 
-typedef enum rq_end_io_ret (rq_end_io_fn)(struct request *, blk_status_t);
+typedef enum rq_end_io_ret (rq_end_io_fn)(struct request *, blk_status_t,
+					  const struct io_comp_batch *);
 
 /*
  * request flags */
 typedef __u32 __bitwise req_flags_t;
 
 /* Keep rqf_name[] in sync with the definitions below */
-enum {
+enum rqf_flags {
 	/* drive already may have started this one */
 	__RQF_STARTED,
 	/* request for flush sequence */
@@ -151,6 +154,14 @@ struct request {
 	unsigned short nr_phys_segments;
 	unsigned short nr_integrity_segments;
 
+	/*
+	 * The lowest set bit for address gaps between physical segments. This
+	 * provides information necessary for dma optimization opprotunities,
+	 * like for testing if the segments can be coalesced against the
+	 * device's iommu granule.
+	 */
+	unsigned char phys_gap_bit;
+
 #ifdef CONFIG_BLK_INLINE_ENCRYPTION
 	struct bio_crypt_ctx *crypt_ctx;
 	struct blk_crypto_keyslot *crypt_keyslot;
@@ -206,6 +217,14 @@ struct request {
 	rq_end_io_fn *end_io;
 	void *end_io_data;
 };
+
+/*
+ * Returns a mask with all bits starting at req->phys_gap_bit set to 1.
+ */
+static inline unsigned long req_phys_gap_mask(const struct request *req)
+{
+	return ~(((1 << req->phys_gap_bit) >> 1) - 1);
+}
 
 static inline enum req_op req_op(const struct request *req)
 {
@@ -294,13 +313,6 @@ static inline struct request *rq_list_peek(struct rq_list *rl)
 enum blk_eh_timer_return {
 	BLK_EH_DONE,
 	BLK_EH_RESET_TIMER,
-};
-
-/* Keep alloc_policy_name[] in sync with the definitions below */
-enum {
-	BLK_TAG_ALLOC_FIFO,	/* allocate starting from 0 */
-	BLK_TAG_ALLOC_RR,	/* allocate starting from last allocated tag */
-	BLK_TAG_ALLOC_MAX
 };
 
 /**
@@ -416,7 +428,7 @@ struct blk_mq_hw_ctx {
 	struct blk_mq_tags	*sched_tags;
 
 	/** @numa_node: NUMA node the storage adapter has been connected to. */
-	unsigned int		numa_node;
+	int			numa_node;
 	/** @queue_num: Index of this hardware queue. */
 	unsigned int		queue_num;
 
@@ -511,8 +523,15 @@ enum hctx_type {
  * @tag_list_lock: Serializes tag_list accesses.
  * @tag_list:	   List of the request queues that use this tag set. See also
  *		   request_queue.tag_set_list.
+ * @quiesce_lock:  Serializes blk_mq_[un]quiesce_tagset() against each other
+ *		   and against a request queue being added to @tag_list.
+ * @quiesce_depth: How often blk_mq_quiesce_tagset() has been called without
+ *		   blk_mq_unquiesce_tagset().
  * @srcu:	   Use as lock when type of the request queue is blocking
  *		   (BLK_MQ_F_BLOCKING).
+ * @update_nr_hwq_lock:
+ * 		   Synchronize updating nr_hw_queues with add/del disk &
+ * 		   switching elevator.
  */
 struct blk_mq_tag_set {
 	const struct blk_mq_ops	*ops;
@@ -533,7 +552,11 @@ struct blk_mq_tag_set {
 
 	struct mutex		tag_list_lock;
 	struct list_head	tag_list;
+	spinlock_t		quiesce_lock;
+	unsigned int		quiesce_depth;
 	struct srcu_struct	*srcu;
+
+	struct rw_semaphore	update_nr_hwq_lock;
 };
 
 /**
@@ -633,7 +656,7 @@ struct blk_mq_ops {
 	 * flush request.
 	 */
 	int (*init_request)(struct blk_mq_tag_set *set, struct request *,
-			    unsigned int, unsigned int);
+			    unsigned int, int);
 	/**
 	 * @exit_request: Ditto for exit/teardown.
 	 */
@@ -668,7 +691,6 @@ struct blk_mq_ops {
 
 /* Keep hctx_flag_name[] in sync with the definitions below */
 enum {
-	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
 	BLK_MQ_F_TAG_QUEUE_SHARED = 1 << 1,
 	/*
 	 * Set when this device requires underlying blk-mq device for
@@ -677,23 +699,20 @@ enum {
 	BLK_MQ_F_STACKING	= 1 << 2,
 	BLK_MQ_F_TAG_HCTX_SHARED = 1 << 3,
 	BLK_MQ_F_BLOCKING	= 1 << 4,
-	/* Do not allow an I/O scheduler to be configured. */
-	BLK_MQ_F_NO_SCHED	= 1 << 5,
+
+	/*
+	 * Alloc tags on a round-robin base instead of the first available one.
+	 */
+	BLK_MQ_F_TAG_RR		= 1 << 5,
 
 	/*
 	 * Select 'none' during queue registration in case of a single hwq
 	 * or shared hwqs instead of 'mq-deadline'.
 	 */
 	BLK_MQ_F_NO_SCHED_BY_DEFAULT	= 1 << 6,
-	BLK_MQ_F_ALLOC_POLICY_START_BIT = 7,
-	BLK_MQ_F_ALLOC_POLICY_BITS = 1,
+
+	BLK_MQ_F_MAX = 1 << 7,
 };
-#define BLK_MQ_FLAG_TO_ALLOC_POLICY(flags) \
-	((flags >> BLK_MQ_F_ALLOC_POLICY_START_BIT) & \
-		((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1))
-#define BLK_ALLOC_POLICY_TO_MQ_FLAG(policy) \
-	((policy & ((1 << BLK_MQ_F_ALLOC_POLICY_BITS) - 1)) \
-		<< BLK_MQ_F_ALLOC_POLICY_START_BIT)
 
 #define BLK_MQ_MAX_DEPTH	(10240)
 #define BLK_MQ_NO_HCTX_IDX	(-1U)
@@ -772,6 +791,7 @@ struct blk_mq_tags {
 	 * request pool
 	 */
 	spinlock_t lock;
+	struct rcu_head rcu_head;
 };
 
 static inline struct request *blk_mq_tag_to_rq(struct blk_mq_tags *tags,
@@ -863,21 +883,39 @@ static inline bool blk_mq_is_reserved_rq(struct request *rq)
 	return rq->rq_flags & RQF_RESV;
 }
 
-/*
+/**
+ * blk_mq_add_to_batch() - add a request to the completion batch
+ * @req: The request to add to batch
+ * @iob: The batch to add the request
+ * @is_error: Specify true if the request failed with an error
+ * @complete: The completaion handler for the request
+ *
  * Batched completions only work when there is no I/O error and no special
  * ->end_io handler.
+ *
+ * Return: true when the request was added to the batch, otherwise false
  */
 static inline bool blk_mq_add_to_batch(struct request *req,
-				       struct io_comp_batch *iob, int ioerror,
+				       struct io_comp_batch *iob, bool is_error,
 				       void (*complete)(struct io_comp_batch *))
 {
 	/*
-	 * blk_mq_end_request_batch() can't end request allocated from
-	 * sched tags
+	 * Check various conditions that exclude batch processing:
+	 * 1) No batch container
+	 * 2) Has scheduler data attached
+	 * 3) Not a passthrough request and end_io set
+	 * 4) Not a passthrough request and failed with an error
 	 */
-	if (!iob || (req->rq_flags & RQF_SCHED_TAGS) || ioerror ||
-			(req->end_io && !blk_rq_is_passthrough(req)))
+	if (!iob)
 		return false;
+	if (req->rq_flags & RQF_SCHED_TAGS)
+		return false;
+	if (!blk_rq_is_passthrough(req)) {
+		if (req->end_io)
+			return false;
+		if (is_error)
+			return false;
+	}
 
 	if (!iob->complete)
 		iob->complete = complete;
@@ -911,8 +949,22 @@ void blk_mq_delay_run_hw_queues(struct request_queue *q, unsigned long msecs);
 void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
 		busy_tag_iter_fn *fn, void *priv);
 void blk_mq_tagset_wait_completed_request(struct blk_mq_tag_set *tagset);
-void blk_mq_freeze_queue(struct request_queue *q);
-void blk_mq_unfreeze_queue(struct request_queue *q);
+void blk_mq_freeze_queue_nomemsave(struct request_queue *q);
+void blk_mq_unfreeze_queue_nomemrestore(struct request_queue *q);
+static inline unsigned int __must_check
+blk_mq_freeze_queue(struct request_queue *q)
+{
+	unsigned int memflags = memalloc_noio_save();
+
+	blk_mq_freeze_queue_nomemsave(q);
+	return memflags;
+}
+static inline void
+blk_mq_unfreeze_queue(struct request_queue *q, unsigned int memflags)
+{
+	blk_mq_unfreeze_queue_nomemrestore(q);
+	memalloc_noio_restore(memflags);
+}
 void blk_freeze_queue_start(struct request_queue *q);
 void blk_mq_freeze_queue_wait(struct request_queue *q);
 int blk_mq_freeze_queue_wait_timeout(struct request_queue *q,
@@ -920,7 +972,11 @@ int blk_mq_freeze_queue_wait_timeout(struct request_queue *q,
 void blk_mq_unfreeze_queue_non_owner(struct request_queue *q);
 void blk_freeze_queue_start_non_owner(struct request_queue *q);
 
+unsigned int blk_mq_num_possible_queues(unsigned int max_queues);
+unsigned int blk_mq_num_online_queues(unsigned int max_queues);
 void blk_mq_map_queues(struct blk_mq_queue_map *qmap);
+void blk_mq_map_hw_queues(struct blk_mq_queue_map *qmap,
+			  struct device *dev, unsigned int offset);
 void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues);
 
 void blk_mq_quiesce_queue_nowait(struct request_queue *q);
@@ -964,8 +1020,27 @@ static inline void *blk_mq_rq_to_pdu(struct request *rq)
 	return rq + 1;
 }
 
+static inline bool blk_mq_rq_is_dmabuf(struct request *rq)
+{
+	if (!IS_ENABLED(CONFIG_DMA_SHARED_BUFFER))
+		return false;
+	return rq->bio && op_is_dmabuf(rq->bio->bi_opf);
+}
+
+static inline struct blk_mq_hw_ctx *queue_hctx(struct request_queue *q, int id)
+{
+	struct blk_mq_hw_ctx *hctx;
+
+	rcu_read_lock();
+	hctx = rcu_dereference(q->queue_hw_ctx)[id];
+	rcu_read_unlock();
+
+	return hctx;
+}
+
 #define queue_for_each_hw_ctx(q, hctx, i)				\
-	xa_for_each(&(q)->hctx_table, (i), (hctx))
+	for ((i) = 0; (i) < (q)->nr_hw_queues &&			\
+	     ({ hctx = queue_hctx((q), i); 1; }); (i)++)
 
 #define hctx_for_each_ctx(hctx, ctx, i)					\
 	for ((i) = 0; (i) < (hctx)->nr_ctx &&				\
@@ -975,14 +1050,6 @@ static inline void blk_mq_cleanup_rq(struct request *rq)
 {
 	if (rq->q->mq_ops->cleanup_rq)
 		rq->q->mq_ops->cleanup_rq(rq);
-}
-
-static inline void blk_rq_bio_prep(struct request *rq, struct bio *bio,
-		unsigned int nr_segs)
-{
-	rq->nr_phys_segments = nr_segs;
-	rq->__data_len = bio->bi_iter.bi_size;
-	rq->bio = rq->biotail = bio;
 }
 
 void blk_mq_hctx_set_fq_lock_class(struct blk_mq_hw_ctx *hctx,
@@ -1016,8 +1083,8 @@ int blk_rq_map_user_io(struct request *, struct rq_map_data *,
 int blk_rq_map_user_iov(struct request_queue *, struct request *,
 		struct rq_map_data *, const struct iov_iter *, gfp_t);
 int blk_rq_unmap_user(struct bio *);
-int blk_rq_map_kern(struct request_queue *, struct request *, void *,
-		unsigned int, gfp_t);
+int blk_rq_map_kern(struct request *rq, void *kbuf, unsigned int len,
+		gfp_t gfp);
 int blk_rq_append_bio(struct request *rq, struct bio *bio);
 void blk_execute_rq_nowait(struct request *rq, bool at_head);
 blk_status_t blk_execute_rq(struct request *rq, bool at_head);
@@ -1047,6 +1114,7 @@ struct req_iterator {
 /*
  * blk_rq_pos()			: the current sector
  * blk_rq_bytes()		: bytes left in the entire request
+ * blk_rq_has_data()		: whether the request carries data
  * blk_rq_cur_bytes()		: bytes left in the current segment
  * blk_rq_sectors()		: sectors left in the entire request
  * blk_rq_cur_sectors()		: sectors left in the current segment
@@ -1060,6 +1128,14 @@ static inline sector_t blk_rq_pos(const struct request *rq)
 static inline unsigned int blk_rq_bytes(const struct request *rq)
 {
 	return rq->__data_len;
+}
+
+static inline bool blk_rq_has_data(const struct request *rq)
+{
+	return blk_rq_bytes(rq) &&
+	       req_op(rq) != REQ_OP_DISCARD &&
+	       req_op(rq) != REQ_OP_SECURE_ERASE &&
+	       req_op(rq) != REQ_OP_WRITE_ZEROES;
 }
 
 static inline int blk_rq_cur_bytes(const struct request *rq)
@@ -1158,15 +1234,72 @@ static inline unsigned short blk_rq_nr_discard_segments(struct request *rq)
 	return max_t(unsigned short, rq->nr_phys_segments, 1);
 }
 
-int __blk_rq_map_sg(struct request_queue *q, struct request *rq,
-		struct scatterlist *sglist, struct scatterlist **last_sg);
-static inline int blk_rq_map_sg(struct request_queue *q, struct request *rq,
-		struct scatterlist *sglist)
+/**
+ * blk_rq_nr_bvec - return number of bvecs in a request
+ * @rq: request to calculate bvecs for
+ *
+ * Returns the number of bvecs.
+ */
+static inline unsigned int blk_rq_nr_bvec(struct request *rq)
+{
+	struct req_iterator rq_iter;
+	struct bio_vec bv;
+	unsigned int nr_bvec = 0;
+
+	rq_for_each_bvec(bv, rq, rq_iter)
+		nr_bvec++;
+
+	return nr_bvec;
+}
+
+int __blk_rq_map_sg(struct request *rq, struct scatterlist *sglist,
+		struct scatterlist **last_sg);
+static inline int blk_rq_map_sg(struct request *rq, struct scatterlist *sglist)
 {
 	struct scatterlist *last_sg = NULL;
 
-	return __blk_rq_map_sg(q, rq, sglist, &last_sg);
+	return __blk_rq_map_sg(rq, sglist, &last_sg);
 }
 void blk_dump_rq_flags(struct request *, char *);
 
+/**
+ * blk_rq_passthrough_stats - check if this request should account stats
+ * @rq: request to check
+ * @q: the queue accumulating the stats
+ *
+ * Note, @q does not necessarily need to be the request_queue that provides
+ * @rq.
+ *
+ * Return: true if stats should be accounted.
+ */
+static inline bool blk_rq_passthrough_stats(struct request *rq,
+					    struct request_queue *q)
+{
+	struct bio *bio = rq->bio;
+
+	if (!blk_queue_passthrough_stat(q))
+		return false;
+
+	/* Requests without a bio do not transfer data. */
+	if (!bio)
+		return false;
+
+	/*
+	 * Stats are accumulated in the bdev, so must have one attached to a
+	 * bio to track stats. Most drivers do not set the bdev for passthrough
+	 * requests, but nvme is one that will set it.
+	 */
+	if (!bio->bi_bdev)
+		return false;
+
+	/*
+	 * We don't know what a passthrough command does, but we know the
+	 * payload size and data direction. Ensuring the size is aligned to the
+	 * block size filters out most commands with payloads that don't
+	 * represent sector access.
+	 */
+	if (blk_rq_bytes(rq) & (bdev_logical_block_size(bio->bi_bdev) - 1))
+		return false;
+	return true;
+}
 #endif /* BLK_MQ_H */

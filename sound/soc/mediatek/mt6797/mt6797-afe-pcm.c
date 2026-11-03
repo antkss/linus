@@ -754,10 +754,8 @@ static int mt6797_afe_pcm_dev_probe(struct platform_device *pdev)
 
 	/* initial audio related clock */
 	ret = mt6797_init_clock(afe);
-	if (ret) {
-		dev_err(dev, "init clock error\n");
+	if (ret)
 		return ret;
-	}
 
 	/* regmap init */
 	afe->base_addr = devm_platform_ioremap_resource(pdev, 0);
@@ -800,10 +798,8 @@ static int mt6797_afe_pcm_dev_probe(struct platform_device *pdev)
 
 	ret = devm_request_irq(dev, irq_id, mt6797_afe_irq_handler,
 			       IRQF_TRIGGER_NONE, "asys-isr", (void *)afe);
-	if (ret) {
-		dev_err(dev, "could not request_irq for asys-isr\n");
+	if (ret)
 		return ret;
-	}
 
 	/* init sub_dais */
 	INIT_LIST_HEAD(&afe->sub_dais);
@@ -879,15 +875,15 @@ static const struct of_device_id mt6797_afe_pcm_dt_match[] = {
 MODULE_DEVICE_TABLE(of, mt6797_afe_pcm_dt_match);
 
 static const struct dev_pm_ops mt6797_afe_pm_ops = {
-	SET_RUNTIME_PM_OPS(mt6797_afe_runtime_suspend,
-			   mt6797_afe_runtime_resume, NULL)
+	RUNTIME_PM_OPS(mt6797_afe_runtime_suspend,
+		       mt6797_afe_runtime_resume, NULL)
 };
 
 static struct platform_driver mt6797_afe_pcm_driver = {
 	.driver = {
 		   .name = "mt6797-audio",
 		   .of_match_table = mt6797_afe_pcm_dt_match,
-		   .pm = &mt6797_afe_pm_ops,
+		   .pm = pm_ptr(&mt6797_afe_pm_ops),
 	},
 	.probe = mt6797_afe_pcm_dev_probe,
 	.remove = mt6797_afe_pcm_dev_remove,

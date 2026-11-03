@@ -64,7 +64,9 @@ struct rpc_clnt {
 				cl_noretranstimeo: 1,/* No retransmit timeouts */
 				cl_autobind : 1,/* use getport() */
 				cl_chatty   : 1,/* be verbose */
-				cl_shutdown : 1;/* rpc immediate -EIO */
+				cl_shutdown : 1,/* rpc immediate -EIO */
+				cl_netunreach_fatal : 1;
+						/* Treat ENETUNREACH errors as fatal */
 	struct xprtsec_parms	cl_xprtsec;	/* transport security policy */
 
 	struct rpc_rtt *	cl_rtt;		/* RTO estimator data */
@@ -93,6 +95,7 @@ struct rpc_clnt {
 	const struct cred	*cl_cred;
 	unsigned int		cl_max_connect; /* max number of transports not to the same IP */
 	struct super_block *pipefs_sb;
+	atomic_t		cl_task_count;
 };
 
 /*
@@ -174,6 +177,7 @@ struct rpc_add_xprt_test {
 #define RPC_CLNT_CREATE_SOFTERR		(1UL << 10)
 #define RPC_CLNT_CREATE_REUSEPORT	(1UL << 11)
 #define RPC_CLNT_CREATE_CONNECTED	(1UL << 12)
+#define RPC_CLNT_CREATE_NETUNREACH_FATAL	(1UL << 13)
 
 struct rpc_clnt *rpc_create(struct rpc_create_args *args);
 struct rpc_clnt	*rpc_bind_new_program(struct rpc_clnt *,
@@ -186,6 +190,7 @@ int		rpc_switch_client_transport(struct rpc_clnt *,
 				const struct rpc_timeout *);
 
 void		rpc_shutdown_client(struct rpc_clnt *);
+void		rpc_hold_client(struct rpc_clnt *);
 void		rpc_release_client(struct rpc_clnt *);
 void		rpc_task_release_transport(struct rpc_task *);
 void		rpc_task_release_client(struct rpc_task *);
@@ -194,7 +199,8 @@ struct rpc_xprt	*rpc_task_get_xprt(struct rpc_clnt *clnt,
 
 int		rpcb_create_local(struct net *);
 void		rpcb_put_local(struct net *);
-int		rpcb_register(struct net *, u32, u32, int, unsigned short);
+int		rpcb_register(struct net *net, u32 prog, u32 vers, int prot,
+			      unsigned short port);
 int		rpcb_v4_register(struct net *net, const u32 program,
 				 const u32 version,
 				 const struct sockaddr *address,

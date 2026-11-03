@@ -51,9 +51,9 @@ in place, but there are several corner cases that are pending closure.
 
 * [2] CXL Window Enumeration
 
-  * [0] :ref:`Extended-linear memory-side cache <extended-linear>`
+  * [2] :ref:`Extended-linear memory-side cache <extended-linear>`
   * [0] Low Memory-hole
-  * [0] Hetero-interleave
+  * [X] Hetero-interleave
 
 * [2] Switch Enumeration
 
@@ -130,7 +130,7 @@ Mailbox commands
 * [0] Switch CCI
 * [3] Timestamp
 * [1] PMEM labels
-* [0] PMEM GPF / Dirty Shutdown
+* [3] PMEM GPF / Dirty Shutdown
 * [0] Scan Media
 
 PMU
@@ -149,6 +149,10 @@ Memory-pooling
 
 * [1] Hotplug of LDs (via PCI hotplug)
 * [0] Dynamic Capacity Device (DCD) Support
+
+  * [1] DC partition enumeration / configuration (Get DC Config, CDAT DSMAS, event interrupts)
+  * [0] Extent add / release event handling
+  * [0] DC-backed DAX regions
 
 Multi-host sharing
 ------------------
@@ -173,7 +177,7 @@ Accelerator
 User Flow Support
 -----------------
 
-* [0] HPA->DPA Address translation (need xormaps export solution)
+* [2] Inject & clear poison by region offset
 
 Details
 =======

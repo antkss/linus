@@ -14,7 +14,6 @@
 #include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
@@ -264,9 +263,12 @@ static ssize_t ad8460_write_toggle_en(struct iio_dev *indio_dev, uintptr_t priva
 	if (ret)
 		return ret;
 
-	iio_device_claim_direct_scoped(return -EBUSY, indio_dev)
-		return ad8460_enable_apg_mode(state, toggle_en);
-	unreachable();
+	if (!iio_device_claim_direct(indio_dev))
+		return -EBUSY;
+
+	ret = ad8460_enable_apg_mode(state, toggle_en);
+	iio_device_release_direct(indio_dev);
+	return ret;
 }
 
 static ssize_t ad8460_read_powerdown(struct iio_dev *indio_dev, uintptr_t private,
@@ -302,7 +304,7 @@ static ssize_t ad8460_write_powerdown(struct iio_dev *indio_dev, uintptr_t priva
 	 * If powerdown is set, HVDAC is enabled and the HV driver is
 	 * enabled via HV_RESET in case it is in shutdown mode,
 	 * If powerdown is cleared, HVDAC is set to shutdown state
-	 * as well as the HV driver. Quiescent current decreases and ouput is
+	 * as well as the HV driver. Quiescent current decreases and output is
 	 * floating (high impedance).
 	 */
 
@@ -421,14 +423,17 @@ static int ad8460_write_raw(struct iio_dev *indio_dev,
 			    long mask)
 {
 	struct ad8460_state *state = iio_priv(indio_dev);
+	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
 		switch (chan->type) {
 		case IIO_VOLTAGE:
-			iio_device_claim_direct_scoped(return -EBUSY, indio_dev)
-				return ad8460_set_sample(state, val);
-			unreachable();
+			if (!iio_device_claim_direct(indio_dev))
+				return -EBUSY;
+			ret = ad8460_set_sample(state, val);
+			iio_device_release_direct(indio_dev);
+			return ret;
 		case IIO_CURRENT:
 			return regmap_write(state->regmap, AD8460_CTRL_REG(0x04),
 					    FIELD_PREP(AD8460_QUIESCENT_CURRENT_MSK, val));
@@ -949,3 +954,4 @@ MODULE_AUTHOR("Mariel Tinaco <mariel.tinaco@analog.com");
 MODULE_DESCRIPTION("AD8460 DAC driver");
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("IIO_DMAENGINE_BUFFER");
+MODULE_IMPORT_NS("IIO_CONSUMER");

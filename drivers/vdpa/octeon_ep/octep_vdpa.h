@@ -8,6 +8,7 @@
 #include <linux/pci_regs.h>
 #include <linux/vdpa.h>
 #include <linux/virtio_pci_modern.h>
+#include <uapi/linux/virtio_crypto.h>
 #include <uapi/linux/virtio_net.h>
 #include <uapi/linux/virtio_blk.h>
 #include <uapi/linux/virtio_config.h>
@@ -29,12 +30,14 @@
 #define OCTEP_EPF_RINFO(x) (0x000209f0 | ((x) << 25))
 #define OCTEP_VF_MBOX_DATA(x) (0x00010210 | ((x) << 17))
 #define OCTEP_PF_MBOX_DATA(x) (0x00022000 | ((x) << 4))
-
-#define OCTEP_EPF_RINFO_RPVF(val) (((val) >> 32) & 0xF)
-#define OCTEP_EPF_RINFO_NVFS(val) (((val) >> 48) & 0x7F)
+#define OCTEP_VF_EVENT_STATE(x) (0x00010030 | ((x) << 17))
+#define OCTEP_VF_EVENT_REG(x) (0x00010060 | ((x) << 17))
+#define OCTEP_VF_IN_CTRL(x)        (0x00010000 | ((x) << 17))
+#define OCTEP_VF_IN_CTRL_RPVF(val) (FIELD_GET(GENMASK_ULL(51, 48), val))
 
 #define OCTEP_FW_READY_SIGNATURE0  0xFEEDFEED
 #define OCTEP_FW_READY_SIGNATURE1  0x3355ffaa
+#define OCTEP_MAX_CB_INTR          8
 
 enum octep_vdpa_dev_status {
 	OCTEP_VDPA_DEV_STATUS_INVALID,
@@ -42,15 +45,49 @@ enum octep_vdpa_dev_status {
 	OCTEP_VDPA_DEV_STATUS_WAIT_FOR_BAR_INIT,
 	OCTEP_VDPA_DEV_STATUS_INIT,
 	OCTEP_VDPA_DEV_STATUS_READY,
+	OCTEP_VDPA_DEV_STATUS_ADDED,
+	OCTEP_VDPA_DEV_STATUS_REMOVED,
 	OCTEP_VDPA_DEV_STATUS_UNINIT
+};
+
+enum octep_vdpa_dev_event_state {
+	OCTEP_VDPA_DEV_NO_EVENT,
+	OCTEP_VDPA_DEV_NEW_EVENT,
+	OCTEP_VDPA_DEV_EVENT_ACTIVE,
+	OCTEP_VDPA_DEV_EVENT_DONE,
+};
+
+enum octep_vdpa_dev_event {
+	OCTEP_VDPA_DEV_EVENT_NONE,
+	OCTEP_VDPA_DEV_EVENT_ACK,
+	OCTEP_VDPA_DEV_EVENT_NACK,
+	OCTEP_VDPA_DEV_ADD_EVENT,
+	OCTEP_VDPA_DEV_DEL_EVENT,
 };
 
 struct octep_vring_info {
 	struct vdpa_callback cb;
 	void __iomem *notify_addr;
-	u32 __iomem *cb_notify_addr;
+	void __iomem *cb_notify_addr;
 	phys_addr_t notify_pa;
-	char msix_name[256];
+};
+
+enum octep_pci_vndr_cfg_type {
+	OCTEP_PCI_VNDR_CFG_TYPE_VIRTIO_ID,
+	OCTEP_PCI_VNDR_CFG_TYPE_MAX,
+};
+
+struct octep_pci_vndr_data {
+	struct virtio_pci_vndr_data hdr;
+	u8 id;
+	u8 bar;
+	union {
+		u64 data;
+		struct {
+			u32 offset;
+			u32 length;
+		};
+	};
 };
 
 struct octep_hw {
@@ -68,7 +105,10 @@ struct octep_hw {
 	u64 features;
 	u16 nr_vring;
 	u32 config_size;
-	int irq;
+	int requested_irqs;
+	int nb_irqs;
+	int *irqs;
+	u8 dev_id;
 };
 
 u8 octep_hw_get_status(struct octep_hw *oct_hw);

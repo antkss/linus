@@ -194,8 +194,8 @@
 # after the IPv6 header. At this point, the packet with IPv6 DA=cafe::1 is sent
 # to the destination, i.e. hs-1.
 
-# Kselftest framework requirement - SKIP code is 4.
-readonly ksft_skip=4
+# shellcheck source=lib.sh
+source lib.sh
 
 readonly RDMSUFF="$(mktemp -u XXXXXXXX)"
 readonly DUMMY_DEVNAME="dum0"
@@ -224,24 +224,7 @@ nfail=0
 
 log_test()
 {
-	local rc="$1"
-	local expected="$2"
-	local msg="$3"
-
-	if [ "${rc}" -eq "${expected}" ]; then
-		nsuccess=$((nsuccess+1))
-		printf "\n    TEST: %-60s  [ OK ]\n" "${msg}"
-	else
-		ret=1
-		nfail=$((nfail+1))
-		printf "\n    TEST: %-60s  [FAIL]\n" "${msg}"
-		if [ "${PAUSE_ON_FAIL}" = "yes" ]; then
-			echo
-			echo "hit enter to continue, 'q' to quit"
-			read a
-			[ "$a" = "q" ] && exit 1
-		fi
-	fi
+	log_test_expected "$1" "$2" "$3"
 }
 
 print_log_test_results()
@@ -399,7 +382,7 @@ __get_srv6_rtcfg_id()
 
 # Given the description of a router <id:op> as an input, the function returns
 # the <op> token which represents the operation (e.g. End behavior with or
-# withouth flavors) configured for the node.
+# without flavors) configured for the node.
 
 # Note that when the operation represents an End behavior with a list of
 # flavors, the output is the ordered version of that list.
@@ -480,7 +463,7 @@ setup_rt_local_sids()
 
 
 	# all SIDs start with a common locator. Routes and SRv6 Endpoint
-	# behavior instaces are grouped together in the 'localsid' table.
+	# behavior instances are grouped together in the 'localsid' table.
 	ip -netns "${nsname}" -6 rule \
 		add to "${LOCATOR_SERVICE}::/16" \
 		lookup "${LOCALSID_TABLE_ID}" prio 999

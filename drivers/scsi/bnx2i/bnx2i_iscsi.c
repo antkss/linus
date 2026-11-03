@@ -1154,6 +1154,7 @@ static void bnx2i_cpy_scsi_cdb(struct scsi_cmnd *sc, struct bnx2i_cmd *cmd)
 }
 
 static void bnx2i_cleanup_task(struct iscsi_task *task)
+	__must_hold(&task->conn->session->back_lock)
 {
 	struct iscsi_conn *conn = task->conn;
 	struct bnx2i_conn *bnx2i_conn = conn->dd_data;
@@ -1626,7 +1627,7 @@ static int bnx2i_conn_start(struct iscsi_cls_conn *cls_conn)
 
 	if (signal_pending(current))
 		flush_signals(current);
-	del_timer_sync(&bnx2i_conn->ep->ofld_timer);
+	timer_delete_sync(&bnx2i_conn->ep->ofld_timer);
 
 	iscsi_conn_start(cls_conn);
 	return 0;
@@ -1749,7 +1750,7 @@ static int bnx2i_tear_down_conn(struct bnx2i_hba *hba,
 
 	if (signal_pending(current))
 		flush_signals(current);
-	del_timer_sync(&ep->ofld_timer);
+	timer_delete_sync(&ep->ofld_timer);
 
 	bnx2i_ep_destroy_list_del(hba, ep);
 
@@ -1861,7 +1862,7 @@ static struct iscsi_endpoint *bnx2i_ep_connect(struct Scsi_Host *shost,
 
 	if (signal_pending(current))
 		flush_signals(current);
-	del_timer_sync(&bnx2i_ep->ofld_timer);
+	timer_delete_sync(&bnx2i_ep->ofld_timer);
 
 	bnx2i_ep_ofld_list_del(hba, bnx2i_ep);
 
@@ -2100,7 +2101,7 @@ int bnx2i_hw_ep_disconnect(struct bnx2i_endpoint *bnx2i_ep)
 
 	if (signal_pending(current))
 		flush_signals(current);
-	del_timer_sync(&bnx2i_ep->ofld_timer);
+	timer_delete_sync(&bnx2i_ep->ofld_timer);
 
 destroy_conn:
 	bnx2i_ep_active_list_del(hba, bnx2i_ep);

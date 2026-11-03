@@ -137,10 +137,8 @@ int ocfs2_inode_lock_full_nested(struct inode *inode,
 			 int ex,
 			 int arg_flags,
 			 int subclass);
-int ocfs2_inode_lock_with_page(struct inode *inode,
-			      struct buffer_head **ret_bh,
-			      int ex,
-			      struct page *page);
+int ocfs2_inode_lock_with_folio(struct inode *inode,
+		struct buffer_head **ret_bh, int ex, struct folio *folio);
 /* Variants without special locking class or flags */
 #define ocfs2_inode_lock_full(i, r, e, f)\
 		ocfs2_inode_lock_full_nested(i, r, e, f, OI_LS_NORMAL)
@@ -163,8 +161,9 @@ void ocfs2_orphan_scan_unlock(struct ocfs2_super *osb, u32 seqno);
 
 int ocfs2_rename_lock(struct ocfs2_super *osb);
 void ocfs2_rename_unlock(struct ocfs2_super *osb);
-int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex);
-void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex);
+int ocfs2_nfs_sync_lock(struct ocfs2_super *osb, int ex, unsigned int *nofs_flag);
+void ocfs2_nfs_sync_unlock(struct ocfs2_super *osb, int ex,
+			   unsigned int nofs_flag);
 void ocfs2_trim_fs_lock_res_init(struct ocfs2_super *osb);
 void ocfs2_trim_fs_lock_res_uninit(struct ocfs2_super *osb);
 int ocfs2_trim_fs_lock(struct ocfs2_super *osb,

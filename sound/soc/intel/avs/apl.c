@@ -6,12 +6,15 @@
 //          Amadeusz Slawinski <amadeuszx.slawinski@linux.intel.com>
 //
 
+#include <linux/cleanup.h>
 #include <linux/devcoredump.h>
 #include <linux/slab.h>
 #include <sound/hdaudio_ext.h>
 #include "avs.h"
+#include "debug.h"
 #include "messages.h"
 #include "path.h"
+#include "registers.h"
 #include "topology.h"
 
 static irqreturn_t avs_apl_dsp_interrupt(struct avs_dev *adev)
@@ -125,7 +128,7 @@ int avs_apl_coredump(struct avs_dev *adev, union avs_notify_msg *msg)
 	struct avs_apl_log_buffer_layout layout;
 	void __iomem *addr, *buf;
 	size_t dump_size;
-	u16 offset = 0;
+	u32 offset = 0;
 	u8 *dump, *pos;
 
 	dump_size = AVS_FW_REGS_SIZE + msg->ext.coredump.stack_dump_size;
@@ -188,7 +191,7 @@ static bool avs_apl_lp_streaming(struct avs_dev *adev)
 {
 	struct avs_path *path;
 
-	spin_lock(&adev->path_list_lock);
+	guard(spinlock)(&adev->path_list_lock);
 	/* Any gateway without buffer allocated in LP area disqualifies D0IX. */
 	list_for_each_entry(path, &adev->path_list, node) {
 		struct avs_path_pipeline *ppl;
@@ -208,14 +211,11 @@ static bool avs_apl_lp_streaming(struct avs_dev *adev)
 				if (cfg->copier.dma_type == INVALID_OBJECT_ID)
 					continue;
 
-				if (!mod->gtw_attrs.lp_buffer_alloc) {
-					spin_unlock(&adev->path_list_lock);
+				if (!mod->gtw_attrs.lp_buffer_alloc)
 					return false;
-				}
 			}
 		}
 	}
-	spin_unlock(&adev->path_list_lock);
 
 	return true;
 }

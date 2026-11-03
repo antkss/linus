@@ -289,7 +289,7 @@ static int r592_transfer_fifo_dma(struct r592_device *dev)
 	dev->dma_error = 0;
 	reinit_completion(&dev->dma_done);
 
-	/* TODO: hidden assumption about nenth beeing always 1 */
+	/* TODO: hidden assumption about nenth being always 1 */
 	sg_count = dma_map_sg(&dev->pci_dev->dev, &dev->req->sg, 1, is_write ?
 			      DMA_TO_DEVICE : DMA_FROM_DEVICE);
 
@@ -614,7 +614,7 @@ static void r592_update_card_detect(struct r592_device *dev)
 /* Timer routine that fires 1 second after last card detection event, */
 static void r592_detect_timer(struct timer_list *t)
 {
-	struct r592_device *dev = from_timer(dev, t, detect_timer);
+	struct r592_device *dev = timer_container_of(dev, t, detect_timer);
 	r592_update_card_detect(dev);
 	memstick_detect_change(dev->host);
 }
@@ -827,7 +827,7 @@ static void r592_remove(struct pci_dev *pdev)
 	/* Stop the processing thread.
 	That ensures that we won't take any more requests */
 	kthread_stop(dev->io_thread);
-	del_timer_sync(&dev->detect_timer);
+	timer_delete_sync(&dev->detect_timer);
 	r592_enable_device(dev, false);
 
 	while (!error && dev->req) {
@@ -854,7 +854,7 @@ static int r592_suspend(struct device *core_dev)
 
 	r592_clear_interrupts(dev);
 	memstick_suspend_host(dev->host);
-	del_timer_sync(&dev->detect_timer);
+	timer_delete_sync(&dev->detect_timer);
 	return 0;
 }
 

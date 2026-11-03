@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -35,6 +35,9 @@
 #include "xfs_exchmaps.h"
 #include "xfs_rtbitmap.h"
 #include "xfs_rtgroup.h"
+#include "xfs_rtrmap_btree.h"
+#include "xfs_bmap_util.h"
+#include "xfs_rtrefcount_btree.h"
 #include "scrub/scrub.h"
 #include "scrub/common.h"
 #include "scrub/trace.h"
@@ -100,10 +103,13 @@ __xchk_process_error(
 		break;
 	case -EFSBADCRC:
 	case -EFSCORRUPTED:
+	case -EIO:
+	case -ENODATA:
 		/* Note the badness but don't abort. */
 		sc->sm->sm_flags |= errflag;
+		trace_xchk_op_error(sc, agno, bno, *error, ret_ip);
 		*error = 0;
-		fallthrough;
+		break;
 	default:
 		trace_xchk_op_error(sc, agno, bno, *error, ret_ip);
 		break;
@@ -174,10 +180,14 @@ __xchk_fblock_process_error(
 		break;
 	case -EFSBADCRC:
 	case -EFSCORRUPTED:
+	case -EIO:
+	case -ENODATA:
 		/* Note the badness but don't abort. */
 		sc->sm->sm_flags |= errflag;
+		trace_xchk_file_op_error(sc, whichfork, offset, *error,
+				ret_ip);
 		*error = 0;
-		fallthrough;
+		break;
 	default:
 		trace_xchk_file_op_error(sc, whichfork, offset, *error,
 				ret_ip);
@@ -244,6 +254,17 @@ xchk_ino_set_preen(
 	trace_xchk_ino_preen(sc, ino, __return_address);
 }
 
+/* Record a block indexed by a file fork that could be optimized. */
+void
+xchk_fblock_set_preen(
+	struct xfs_scrub        *sc,
+	int                     whichfork,
+	xfs_fileoff_t           offset)
+{
+	sc->sm->sm_flags |= XFS_SCRUB_OFLAG_PREEN;
+	trace_xchk_fblock_preen(sc, whichfork, offset, __return_address);
+}
+
 /* Record something being wrong with the filesystem primary superblock. */
 void
 xchk_set_corrupt(
@@ -302,12 +323,12 @@ xchk_ino_set_corrupt(
 
 /* Record a corruption while cross-referencing with an inode. */
 void
-xchk_ino_xref_set_corrupt(
+xchk_ip_xref_set_corrupt(
 	struct xfs_scrub	*sc,
-	xfs_ino_t		ino)
+	struct xfs_inode	*ip)
 {
 	sc->sm->sm_flags |= XFS_SCRUB_OFLAG_XCORRUPT;
-	trace_xchk_ino_error(sc, ino, __return_address);
+	trace_xchk_ino_error(sc, I_INO(ip), __return_address);
 }
 
 /* Record corruption in a block indexed by a file fork. */
@@ -557,10 +578,10 @@ xchk_perag_drain_and_lock(
 int
 xchk_ag_read_headers(
 	struct xfs_scrub	*sc,
-	xfs_agnumber_t		agno,
-	struct xchk_ag		*sa)
+	xfs_agnumber_t		agno)
 {
 	struct xfs_mount	*mp = sc->mp;
+	struct xchk_ag		*sa = &sc->sa;
 
 	ASSERT(!sa->pag);
 	sa->pag = xfs_perag_get(mp, agno);
@@ -573,8 +594,10 @@ xchk_ag_read_headers(
 /* Release all the AG btree cursors. */
 void
 xchk_ag_btcur_free(
-	struct xchk_ag		*sa)
+	struct xfs_scrub	*sc)
 {
+	struct xchk_ag		*sa = &sc->sa;
+
 	if (sa->refc_cur)
 		xfs_btree_del_cursor(sa->refc_cur, XFS_BTREE_ERROR);
 	if (sa->rmap_cur)
@@ -599,10 +622,10 @@ xchk_ag_btcur_free(
 /* Initialize all the btree cursors for an AG. */
 void
 xchk_ag_btcur_init(
-	struct xfs_scrub	*sc,
-	struct xchk_ag		*sa)
+	struct xfs_scrub	*sc)
 {
 	struct xfs_mount	*mp = sc->mp;
+	struct xchk_ag		*sa = &sc->sa;
 
 	if (sa->agf_bp) {
 		/* Set up a bnobt cursor for cross-referencing. */
@@ -654,10 +677,11 @@ xchk_ag_btcur_init(
 /* Release the AG header context and btree cursors. */
 void
 xchk_ag_free(
-	struct xfs_scrub	*sc,
-	struct xchk_ag		*sa)
+	struct xfs_scrub	*sc)
 {
-	xchk_ag_btcur_free(sa);
+	struct xchk_ag		*sa = &sc->sa;
+
+	xchk_ag_btcur_free(sc);
 	xrep_reset_perag_resv(sc);
 	if (sa->agf_bp) {
 		xfs_trans_brelse(sc->tp, sa->agf_bp);
@@ -683,16 +707,15 @@ xchk_ag_free(
 int
 xchk_ag_init(
 	struct xfs_scrub	*sc,
-	xfs_agnumber_t		agno,
-	struct xchk_ag		*sa)
+	xfs_agnumber_t		agno)
 {
 	int			error;
 
-	error = xchk_ag_read_headers(sc, agno, sa);
+	error = xchk_ag_read_headers(sc, agno);
 	if (error)
 		return error;
 
-	xchk_ag_btcur_init(sc, sa);
+	xchk_ag_btcur_init(sc);
 	return 0;
 }
 
@@ -707,9 +730,10 @@ xchk_ag_init(
 int
 xchk_rtgroup_init(
 	struct xfs_scrub	*sc,
-	xfs_rgnumber_t		rgno,
-	struct xchk_rt		*sr)
+	xfs_rgnumber_t		rgno)
 {
+	struct xchk_rt		*sr = &sc->sr;
+
 	ASSERT(sr->rtg == NULL);
 	ASSERT(sr->rtlock_flags == 0);
 
@@ -719,23 +743,118 @@ xchk_rtgroup_init(
 	return 0;
 }
 
-void
+/* Lock all the rt group metadata inode ILOCKs and wait for intents. */
+int
 xchk_rtgroup_lock(
-	struct xchk_rt		*sr,
+	struct xfs_scrub	*sc,
 	unsigned int		rtglock_flags)
 {
-	xfs_rtgroup_lock(sr->rtg, rtglock_flags);
+	struct xchk_rt		*sr = &sc->sr;
+	int			error = 0;
+
+	ASSERT(sr->rtg != NULL);
+
+	/*
+	 * If we're /only/ locking the rtbitmap in shared mode, then we're
+	 * obviously not trying to compare records in two metadata inodes.
+	 * There's no need to drain intents here because the caller (most
+	 * likely the rgsuper scanner) doesn't need that level of consistency.
+	 */
+	if (rtglock_flags == XFS_RTGLOCK_BITMAP_SHARED) {
+		xfs_rtgroup_lock(sr->rtg, rtglock_flags);
+		sr->rtlock_flags = rtglock_flags;
+		return 0;
+	}
+
+	do {
+		if (xchk_should_terminate(sc, &error))
+			return error;
+
+		xfs_rtgroup_lock(sr->rtg, rtglock_flags);
+
+		/*
+		 * If we've grabbed a non-metadata file for scrubbing, we
+		 * assume that holding its ILOCK will suffice to coordinate
+		 * with any rt intent chains involving this inode.
+		 */
+		if (sc->ip && !xfs_is_internal_inode(sc->ip))
+			break;
+
+		/*
+		 * Decide if the rt group is quiet enough for all metadata to
+		 * be consistent with each other.  Regular file IO doesn't get
+		 * to lock all the rt inodes at the same time, which means that
+		 * there could be other threads in the middle of processing a
+		 * chain of deferred ops.
+		 *
+		 * We just locked all the metadata inodes for this rt group;
+		 * now take a look to see if there are any intents in progress.
+		 * If there are, drop the rt group inode locks and wait for the
+		 * intents to drain.  Since we hold the rt group inode locks
+		 * for the duration of the scrub, this is the only time we have
+		 * to sample the intents counter; any threads increasing it
+		 * after this point can't possibly be in the middle of a chain
+		 * of rt metadata updates.
+		 *
+		 * Obviously, this should be slanted against scrub and in favor
+		 * of runtime threads.
+		 */
+		if (!xfs_group_intent_busy(rtg_group(sr->rtg)))
+			break;
+
+		xfs_rtgroup_unlock(sr->rtg, rtglock_flags);
+
+		if (!(sc->flags & XCHK_FSGATES_DRAIN))
+			return -ECHRNG;
+		error = xfs_group_intent_drain(rtg_group(sr->rtg));
+		if (error) {
+			if (error == -ERESTARTSYS)
+				error = -EINTR;
+			return error;
+		}
+	} while (1);
+
 	sr->rtlock_flags = rtglock_flags;
+
+	if (xfs_has_rtrmapbt(sc->mp) && (rtglock_flags & XFS_RTGLOCK_RMAP))
+		sr->rmap_cur = xfs_rtrmapbt_init_cursor(sc->tp, sr->rtg);
+
+	if (xfs_has_rtreflink(sc->mp) && (rtglock_flags & XFS_RTGLOCK_REFCOUNT))
+		sr->refc_cur = xfs_rtrefcountbt_init_cursor(sc->tp, sr->rtg);
+
+	return 0;
+}
+
+/*
+ * Free all the btree cursors and other incore data relating to the realtime
+ * group.  This has to be done /before/ committing (or cancelling) the scrub
+ * transaction.
+ */
+void
+xchk_rtgroup_btcur_free(
+	struct xfs_scrub	*sc)
+{
+	struct xchk_rt		*sr = &sc->sr;
+
+	if (sr->rmap_cur)
+		xfs_btree_del_cursor(sr->rmap_cur, XFS_BTREE_ERROR);
+	if (sr->refc_cur)
+		xfs_btree_del_cursor(sr->refc_cur, XFS_BTREE_ERROR);
+
+	sr->refc_cur = NULL;
+	sr->rmap_cur = NULL;
 }
 
 /*
  * Unlock the realtime group.  This must be done /after/ committing (or
  * cancelling) the scrub transaction.
  */
-static void
+void
 xchk_rtgroup_unlock(
-	struct xchk_rt		*sr)
+	struct xfs_scrub	*sc)
 {
+	struct xchk_rt		*sr = &sc->sr;
+
 	ASSERT(sr->rtg != NULL);
 
 	if (sr->rtlock_flags) {
@@ -750,12 +869,13 @@ xchk_rtgroup_unlock(
  */
 void
 xchk_rtgroup_free(
-	struct xfs_scrub	*sc,
-	struct xchk_rt		*sr)
+	struct xfs_scrub	*sc)
 {
+	struct xchk_rt		*sr = &sc->sr;
+
 	ASSERT(sr->rtg != NULL);
 
-	xchk_rtgroup_unlock(sr);
+	xchk_rtgroup_unlock(sc);
 
 	xfs_rtgroup_put(sr->rtg);
 	sr->rtg = NULL;
@@ -772,11 +892,11 @@ xchk_trans_cancel(
 	sc->tp = NULL;
 }
 
-int
+void
 xchk_trans_alloc_empty(
 	struct xfs_scrub	*sc)
 {
-	return xfs_trans_alloc_empty(sc->mp, &sc->tp);
+	sc->tp = xfs_trans_alloc_empty(sc->mp);
 }
 
 /*
@@ -798,7 +918,8 @@ xchk_trans_alloc(
 		return xfs_trans_alloc(sc->mp, &M_RES(sc->mp)->tr_itruncate,
 				resblks, 0, 0, &sc->tp);
 
-	return xchk_trans_alloc_empty(sc);
+	xchk_trans_alloc_empty(sc);
+	return 0;
 }
 
 /* Set us up with a transaction and an empty context. */
@@ -810,6 +931,14 @@ xchk_setup_fs(
 
 	resblks = xrep_calc_ag_resblks(sc);
 	return xchk_trans_alloc(sc, resblks);
+}
+
+/* Set us up with a transaction and an empty context to repair rt metadata. */
+int
+xchk_setup_rt(
+	struct xfs_scrub	*sc)
+{
+	return xchk_trans_alloc(sc, xrep_calc_rtgroup_resblks(sc));
 }
 
 /* Set us up with AG headers and btree cursors. */
@@ -837,7 +966,7 @@ xchk_setup_ag_btree(
 	if (error)
 		return error;
 
-	return xchk_ag_init(sc, sc->sm->sm_agno, &sc->sa);
+	return xchk_ag_init(sc, sc->sm->sm_agno);
 }
 
 /* Push everything out of the log onto disk. */
@@ -992,7 +1121,7 @@ xchk_install_live_inode(
 	struct xfs_inode	*ip)
 {
 	if (!igrab(VFS_I(ip))) {
-		xchk_ino_set_corrupt(sc, ip->i_ino);
+		xchk_ip_set_corrupt(sc, ip);
 		return -EFSCORRUPTED;
 	}
 
@@ -1023,7 +1152,7 @@ xchk_iget_for_scrubbing(
 	ASSERT(sc->tp == NULL);
 
 	/* We want to scan the inode we already had opened. */
-	if (sc->sm->sm_ino == 0 || sc->sm->sm_ino == ip_in->i_ino)
+	if (sc->sm->sm_ino == 0 || sc->sm->sm_ino == I_INO(ip_in))
 		return xchk_install_live_inode(sc, ip_in);
 
 	/*
@@ -1146,7 +1275,7 @@ xchk_irele(
 		 * hits do not clear DONTCACHE, so we must do it here.
 		 */
 		spin_lock(&VFS_I(ip)->i_lock);
-		VFS_I(ip)->i_state &= ~I_DONTCACHE;
+		inode_state_clear(VFS_I(ip), I_DONTCACHE);
 		spin_unlock(&VFS_I(ip)->i_lock);
 	}
 
@@ -1292,6 +1421,9 @@ xchk_metadata_inode_subtype(
 	int			error;
 
 	sub = xchk_scrub_create_subord(sc, scrub_type);
+	if (!sub)
+		return -ENOMEM;
+
 	error = sub->sc.ops->scrub(&sub->sc);
 	xchk_scrub_free_subord(sub);
 	return error;
@@ -1318,13 +1450,13 @@ xchk_metadata_inode_forks(
 
 	/* Metadata inodes don't live on the rt device. */
 	if (sc->ip->i_diflags & XFS_DIFLAG_REALTIME) {
-		xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ip_set_corrupt(sc, sc->ip);
 		return 0;
 	}
 
 	/* They should never participate in reflink. */
 	if (xfs_is_reflink_inode(sc->ip)) {
-		xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ip_set_corrupt(sc, sc->ip);
 		return 0;
 	}
 
@@ -1341,7 +1473,7 @@ xchk_metadata_inode_forks(
 				&error))
 			return error;
 		if (shared)
-			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+			xchk_ip_set_corrupt(sc, sc->ip);
 	}
 
 	/*
@@ -1350,7 +1482,7 @@ xchk_metadata_inode_forks(
 	 */
 	if (xfs_inode_hasattr(sc->ip)) {
 		if (!xfs_has_metadir(sc->mp)) {
-			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+			xchk_ip_set_corrupt(sc, sc->ip);
 			return 0;
 		}
 
@@ -1379,7 +1511,7 @@ xchk_fsgates_enable(
 	trace_xchk_fsgates_enable(sc, scrub_fsgates);
 
 	if (scrub_fsgates & XCHK_FSGATES_DRAIN)
-		xfs_drain_wait_enable();
+		xfs_defer_drain_wait_enable();
 
 	if (scrub_fsgates & XCHK_FSGATES_QUOTA)
 		xfs_dqtrx_hook_enable();
@@ -1452,7 +1584,7 @@ xchk_inode_is_allocated(
 	 * This isn't the inode we want.
 	 */
 	spin_lock(&ip->i_flags_lock);
-	if (ip->i_ino != ino)
+	if (I_INO(ip) != ino)
 		goto out_skip;
 
 	trace_xchk_inode_is_allocated(ip);
@@ -1560,7 +1692,7 @@ bool
 xchk_inode_is_sb_rooted(const struct xfs_inode *ip)
 {
 	return xchk_inode_is_dirtree_root(ip) ||
-	       xfs_is_sb_inum(ip->i_mount, ip->i_ino);
+	       xfs_is_sb_inum(ip->i_mount, I_INO(ip));
 }
 
 /* What is the root directory inumber for this inode? */
@@ -1570,6 +1702,66 @@ xchk_inode_rootdir_inum(const struct xfs_inode *ip)
 	struct xfs_mount	*mp = ip->i_mount;
 
 	if (xfs_is_metadir_inode(ip))
-		return mp->m_metadirip->i_ino;
-	return mp->m_rootip->i_ino;
+		return I_INO(mp->m_metadirip);
+	return I_INO(mp->m_rootip);
+}
+
+static int
+xchk_meta_btree_count_blocks(
+	struct xfs_scrub	*sc,
+	xfs_extnum_t		*nextents,
+	xfs_filblks_t		*count)
+{
+	struct xfs_btree_cur	*cur;
+	int			error;
+
+	if (!sc->sr.rtg) {
+		ASSERT(0);
+		return -EFSCORRUPTED;
+	}
+
+	switch (sc->ip->i_metatype) {
+	case XFS_METAFILE_RTRMAP:
+		cur = xfs_rtrmapbt_init_cursor(sc->tp, sc->sr.rtg);
+		break;
+	case XFS_METAFILE_RTREFCOUNT:
+		cur = xfs_rtrefcountbt_init_cursor(sc->tp, sc->sr.rtg);
+		break;
+	default:
+		ASSERT(0);
+		return -EFSCORRUPTED;
+	}
+
+	error = xfs_btree_count_blocks(cur, count);
+	xfs_btree_del_cursor(cur, error);
+	if (!error) {
+		*nextents = 0;
+		(*count)--;	/* don't count the btree iroot */
+	}
+	return error;
+}
+
+/* Count the blocks used by a file, even if it's a metadata inode. */
+int
+xchk_inode_count_blocks(
+	struct xfs_scrub	*sc,
+	int			whichfork,
+	xfs_extnum_t		*nextents,
+	xfs_filblks_t		*count)
+{
+	struct xfs_ifork	*ifp = xfs_ifork_ptr(sc->ip, whichfork);
+
+	if (!ifp) {
+		*nextents = 0;
+		*count = 0;
+		return 0;
+	}
+
+	if (ifp->if_format == XFS_DINODE_FMT_META_BTREE) {
+		ASSERT(whichfork == XFS_DATA_FORK);
+		return xchk_meta_btree_count_blocks(sc, nextents, count);
+	}
+
+	return xfs_bmap_count_blocks(sc->tp, sc->ip, whichfork, nextents,
+			count);
 }

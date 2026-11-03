@@ -1,9 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * FUSE: Filesystem in Userspace
  * Copyright (C) 2001-2016  Miklos Szeredi <miklos@szeredi.hu>
- *
- * This program can be distributed under the terms of the GNU GPL.
- * See the file COPYING.
  */
 
 #include "fuse_i.h"
@@ -164,9 +162,10 @@ int fuse_removexattr(struct inode *inode, const char *name)
 
 	args.opcode = FUSE_REMOVEXATTR;
 	args.nodeid = get_node_id(inode);
-	args.in_numargs = 1;
-	args.in_args[0].size = strlen(name) + 1;
-	args.in_args[0].value = name;
+	args.in_numargs = 2;
+	fuse_set_zero_arg0(&args);
+	args.in_args[1].size = strlen(name) + 1;
+	args.in_args[1].value = name;
 	err = fuse_simple_request(fm, &args);
 	if (err == -ENOSYS) {
 		fm->fc->no_removexattr = 1;
@@ -189,7 +188,7 @@ static int fuse_xattr_get(const struct xattr_handler *handler,
 }
 
 static int fuse_xattr_set(const struct xattr_handler *handler,
-			  struct mnt_idmap *idmap,
+			  const struct mnt_idmap *idmap,
 			  struct dentry *dentry, struct inode *inode,
 			  const char *name, const void *value, size_t size,
 			  int flags)

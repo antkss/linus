@@ -6,6 +6,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/delay.h>
 #include <linux/clockchips.h>
 #include <linux/clocksource.h>
 #include <linux/interrupt.h>
@@ -17,7 +18,6 @@
 #include <linux/of_irq.h>
 #include <linux/module.h>
 
-#include <asm/delay.h>
 #include <asm/hexagon_vm.h>
 #include <asm/time.h>
 
@@ -170,8 +170,7 @@ static void __init time_init_deferred(void)
 
 	ce_dev->cpumask = cpu_all_mask;
 
-	if (!resource)
-		resource = rtos_timer_device.resource;
+	resource = rtos_timer_device.resource;
 
 	/*  ioremap here means this has to run later, after paging init  */
 	rtos_timer = ioremap(resource->start, resource_size(resource));
@@ -232,3 +231,9 @@ void __udelay(unsigned long usecs)
 		cpu_relax(); /*  not sure how this improves readability  */
 }
 EXPORT_SYMBOL(__udelay);
+
+bool delay_read_timer(unsigned long *timer_val)
+{
+	*timer_val = __vmgettime();
+	return true;
+}

@@ -169,6 +169,23 @@ static int iter_limit_cb(__u32 idx, struct num_context *ctx)
 }
 
 SEC("?raw_tp")
+__failure __msg("R1 type=ctx expected=scalar")
+__naked void bpf_loop_reject_pointer(void)
+{
+	asm volatile (
+		"r2 = %[iter_limit_cb];"
+		"r3 = 0;"
+		"r4 = 0;"
+		"call %[bpf_loop];"
+		"exit;"
+		:
+		: __imm_ptr(iter_limit_cb),
+		  __imm(bpf_loop)
+		: __clobber_common
+	);
+}
+
+SEC("?raw_tp")
 __success
 int bpf_loop_iter_limit_ok(void *unused)
 {
@@ -407,11 +424,7 @@ l0_%=:	call %[bpf_jiffies64];		\
 	: __clobber_all);
 }
 
-#if (defined(__TARGET_ARCH_arm64) || defined(__TARGET_ARCH_x86) || \
-	(defined(__TARGET_ARCH_riscv) && __riscv_xlen == 64) || \
-	defined(__TARGET_ARCH_arm) || defined(__TARGET_ARCH_s390) || \
-	defined(__TARGET_ARCH_loongarch)) && \
-	__clang_major__ >= 18
+#ifdef CAN_USE_GOTOL
 SEC("socket")
 __success __retval(0)
 __naked void gotol_and_may_goto(void)

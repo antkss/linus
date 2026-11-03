@@ -14,6 +14,7 @@
 // foundation of this driver
 //
 
+#include <linux/cleanup.h>
 #include <linux/acpi.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -27,6 +28,7 @@
 #include "../../codecs/hda.h"
 #include "avs.h"
 #include "cldma.h"
+#include "debug.h"
 #include "messages.h"
 #include "pcm.h"
 
@@ -54,14 +56,17 @@ void avs_hda_power_gating_enable(struct avs_dev *adev, bool enable)
 {
 	u32 value = enable ? 0 : pgctl_mask;
 
-	avs_hda_update_config_dword(&adev->base.core, AZX_PCIREG_PGCTL, pgctl_mask, value);
+	if (!avs_platattr_test(adev, ACE))
+		avs_hda_update_config_dword(&adev->base.core, AZX_PCIREG_PGCTL, pgctl_mask, value);
 }
 
 static void avs_hdac_clock_gating_enable(struct hdac_bus *bus, bool enable)
 {
+	struct avs_dev *adev = hdac_to_avs(bus);
 	u32 value = enable ? cgctl_mask : 0;
 
-	avs_hda_update_config_dword(bus, AZX_PCIREG_CGCTL, cgctl_mask, value);
+	if (!avs_platattr_test(adev, ACE))
+		avs_hda_update_config_dword(bus, AZX_PCIREG_CGCTL, cgctl_mask, value);
 }
 
 void avs_hda_clock_gating_enable(struct avs_dev *adev, bool enable)
@@ -71,6 +76,8 @@ void avs_hda_clock_gating_enable(struct avs_dev *adev, bool enable)
 
 void avs_hda_l1sen_enable(struct avs_dev *adev, bool enable)
 {
+	if (avs_platattr_test(adev, ACE))
+		return;
 	if (enable) {
 		if (atomic_inc_and_test(&adev->l1sen_counter))
 			snd_hdac_chip_updatel(&adev->base.core, VS_EM2, AZX_VS_EM2_L1SEN,
@@ -85,20 +92,33 @@ static int avs_hdac_bus_init_streams(struct hdac_bus *bus)
 {
 	unsigned int cp_streams, pb_streams;
 	unsigned int gcap;
+	int ret;
 
 	gcap = snd_hdac_chip_readw(bus, GCAP);
 	cp_streams = (gcap >> 8) & 0x0F;
 	pb_streams = (gcap >> 12) & 0x0F;
 	bus->num_streams = cp_streams + pb_streams;
 
-	snd_hdac_ext_stream_init_all(bus, 0, cp_streams, SNDRV_PCM_STREAM_CAPTURE);
-	snd_hdac_ext_stream_init_all(bus, cp_streams, pb_streams, SNDRV_PCM_STREAM_PLAYBACK);
+	ret = snd_hdac_ext_stream_init_all(bus, 0, cp_streams, SNDRV_PCM_STREAM_CAPTURE);
+	if (ret)
+		return ret;
+	ret = snd_hdac_ext_stream_init_all(bus, cp_streams, pb_streams, SNDRV_PCM_STREAM_PLAYBACK);
+	if (ret)
+		goto err;
 
-	return snd_hdac_bus_alloc_stream_pages(bus);
+	ret = snd_hdac_bus_alloc_stream_pages(bus);
+	if (ret)
+		goto err;
+
+	return 0;
+err:
+	snd_hdac_ext_stream_free_all(bus);
+	return ret;
 }
 
 static bool avs_hdac_bus_init_chip(struct hdac_bus *bus, bool full_reset)
 {
+	struct avs_dev *adev = hdac_to_avs(bus);
 	struct hdac_ext_link *hlink;
 	bool ret;
 
@@ -114,7 +134,8 @@ static bool avs_hdac_bus_init_chip(struct hdac_bus *bus, bool full_reset)
 	/* Set DUM bit to address incorrect position reporting for capture
 	 * streams. In order to do so, CTRL needs to be out of reset state
 	 */
-	snd_hdac_chip_updatel(bus, VS_EM2, AZX_VS_EM2_DUM, AZX_VS_EM2_DUM);
+	if (!avs_platattr_test(adev, ACE))
+		snd_hdac_chip_updatel(bus, VS_EM2, AZX_VS_EM2_DUM, AZX_VS_EM2_DUM);
 
 	return ret;
 }
@@ -224,7 +245,6 @@ static void avs_hda_probe_work(struct work_struct *work)
 	/* configure PM */
 	pm_runtime_set_autosuspend_delay(bus->dev, 2000);
 	pm_runtime_use_autosuspend(bus->dev);
-	pm_runtime_mark_last_busy(bus->dev);
 	pm_runtime_put_autosuspend(bus->dev);
 	pm_runtime_allow(bus->dev);
 }
@@ -266,7 +286,7 @@ static irqreturn_t avs_hda_interrupt(struct hdac_bus *bus)
 	if (snd_hdac_bus_handle_stream_irq(bus, status, hdac_update_stream))
 		ret = IRQ_HANDLED;
 
-	spin_lock_irq(&bus->reg_lock);
+	guard(spinlock_irq)(&bus->reg_lock);
 	/* Clear RIRB interrupt. */
 	status = snd_hdac_chip_readb(bus, RIRBSTS);
 	if (status & RIRB_INT_MASK) {
@@ -276,7 +296,6 @@ static irqreturn_t avs_hda_interrupt(struct hdac_bus *bus)
 		ret = IRQ_HANDLED;
 	}
 
-	spin_unlock_irq(&bus->reg_lock);
 	return ret;
 }
 
@@ -376,6 +395,18 @@ static int avs_bus_init(struct avs_dev *adev, struct pci_dev *pci, const struct 
 	struct device *dev = &pci->dev;
 	int ret;
 
+	ipc = devm_kzalloc(dev, sizeof(*ipc), GFP_KERNEL);
+	if (!ipc)
+		return -ENOMEM;
+
+	adev->modcfg_buf = devm_kzalloc(dev, AVS_MAILBOX_SIZE, GFP_KERNEL);
+	if (!adev->modcfg_buf)
+		return -ENOMEM;
+
+	ret = avs_ipc_init(ipc, dev);
+	if (ret < 0)
+		return ret;
+
 	ret = snd_hdac_ext_bus_init(&bus->core, dev, NULL, &soc_hda_ext_bus_ops);
 	if (ret < 0)
 		return ret;
@@ -386,17 +417,6 @@ static int avs_bus_init(struct avs_dev *adev, struct pci_dev *pci, const struct 
 	bus->pci = pci;
 	bus->mixer_assigned = -1;
 	mutex_init(&bus->prepare_mutex);
-
-	ipc = devm_kzalloc(dev, sizeof(*ipc), GFP_KERNEL);
-	if (!ipc)
-		return -ENOMEM;
-	ret = avs_ipc_init(ipc, dev);
-	if (ret < 0)
-		return ret;
-
-	adev->modcfg_buf = devm_kzalloc(dev, AVS_MAILBOX_SIZE, GFP_KERNEL);
-	if (!adev->modcfg_buf)
-		return -ENOMEM;
 
 	adev->dev = dev;
 	adev->spec = (const struct avs_spec *)id->driver_data;
@@ -439,23 +459,24 @@ static int avs_pci_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	adev = devm_kzalloc(dev, sizeof(*adev), GFP_KERNEL);
 	if (!adev)
 		return -ENOMEM;
+	bus = &adev->base.core;
+
 	ret = avs_bus_init(adev, pci, id);
 	if (ret < 0) {
 		dev_err(dev, "failed to init avs bus: %d\n", ret);
 		return ret;
 	}
 
-	ret = pci_request_regions(pci, "AVS HDAudio");
+	ret = pcim_request_all_regions(pci, "AVS HDAudio");
 	if (ret < 0)
-		return ret;
+		goto err_request_regions;
 
-	bus = &adev->base.core;
 	bus->addr = pci_resource_start(pci, 0);
 	bus->remap_addr = pci_ioremap_bar(pci, 0);
 	if (!bus->remap_addr) {
 		dev_err(bus->dev, "ioremap error\n");
 		ret = -ENXIO;
-		goto err_remap_bar0;
+		goto err_request_regions;
 	}
 
 	adev->dsp_ba = pci_ioremap_bar(pci, 4);
@@ -466,8 +487,13 @@ static int avs_pci_probe(struct pci_dev *pci, const struct pci_device_id *id)
 	}
 
 	snd_hdac_bus_parse_capabilities(bus);
-	if (bus->mlcap)
-		snd_hdac_ext_bus_get_ml_capabilities(bus);
+	if (bus->mlcap) {
+		ret = snd_hdac_ext_bus_get_ml_capabilities(bus);
+		if (ret < 0) {
+			dev_err(dev, "failed to get ml capabilities: %d\n", ret);
+			goto err_ml_cap;
+		}
+	}
 
 	if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64)))
 		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
@@ -509,11 +535,13 @@ err_acquire_irq:
 	snd_hdac_bus_free_stream_pages(bus);
 	snd_hdac_ext_stream_free_all(bus);
 err_init_streams:
+	snd_hdac_ext_link_free_all(bus);
+err_ml_cap:
 	iounmap(adev->dsp_ba);
 err_remap_bar4:
 	iounmap(bus->remap_addr);
-err_remap_bar0:
-	pci_release_regions(pci);
+err_request_regions:
+	snd_hdac_ext_bus_exit(bus);
 	return ret;
 }
 
@@ -584,7 +612,6 @@ static void avs_pci_remove(struct pci_dev *pci)
 	pci_free_irq_vectors(pci);
 	iounmap(bus->remap_addr);
 	iounmap(adev->dsp_ba);
-	pci_release_regions(pci);
 
 	/* Firmware is not needed anymore */
 	avs_release_firmwares(adev);
@@ -612,7 +639,7 @@ static int avs_suspend_standby(struct avs_dev *adev)
 	return 0;
 }
 
-static int __maybe_unused avs_suspend_common(struct avs_dev *adev, bool low_power)
+static int avs_suspend_common(struct avs_dev *adev, bool low_power)
 {
 	struct hdac_bus *bus = &adev->base.core;
 	int ret;
@@ -673,7 +700,7 @@ static int avs_resume_standby(struct avs_dev *adev)
 	return 0;
 }
 
-static int __maybe_unused avs_resume_common(struct avs_dev *adev, bool low_power, bool purge)
+static int avs_resume_common(struct avs_dev *adev, bool low_power, bool purge)
 {
 	struct hdac_bus *bus = &adev->base.core;
 	int ret;
@@ -696,41 +723,41 @@ static int __maybe_unused avs_resume_common(struct avs_dev *adev, bool low_power
 	return 0;
 }
 
-static int __maybe_unused avs_suspend(struct device *dev)
+static int avs_suspend(struct device *dev)
 {
 	return avs_suspend_common(to_avs_dev(dev), true);
 }
 
-static int __maybe_unused avs_resume(struct device *dev)
+static int avs_resume(struct device *dev)
 {
 	return avs_resume_common(to_avs_dev(dev), true, true);
 }
 
-static int __maybe_unused avs_runtime_suspend(struct device *dev)
+static int avs_runtime_suspend(struct device *dev)
 {
 	return avs_suspend_common(to_avs_dev(dev), true);
 }
 
-static int __maybe_unused avs_runtime_resume(struct device *dev)
+static int avs_runtime_resume(struct device *dev)
 {
 	return avs_resume_common(to_avs_dev(dev), true, false);
 }
 
-static int __maybe_unused avs_freeze(struct device *dev)
+static int avs_freeze(struct device *dev)
 {
 	return avs_suspend_common(to_avs_dev(dev), false);
 }
-static int __maybe_unused avs_thaw(struct device *dev)
+static int avs_thaw(struct device *dev)
 {
 	return avs_resume_common(to_avs_dev(dev), false, true);
 }
 
-static int __maybe_unused avs_poweroff(struct device *dev)
+static int avs_poweroff(struct device *dev)
 {
 	return avs_suspend_common(to_avs_dev(dev), false);
 }
 
-static int __maybe_unused avs_restore(struct device *dev)
+static int avs_restore(struct device *dev)
 {
 	return avs_resume_common(to_avs_dev(dev), false, true);
 }
@@ -742,19 +769,22 @@ static const struct dev_pm_ops avs_dev_pm = {
 	.thaw = avs_thaw,
 	.poweroff = avs_poweroff,
 	.restore = avs_restore,
-	SET_RUNTIME_PM_OPS(avs_runtime_suspend, avs_runtime_resume, NULL)
+	RUNTIME_PM_OPS(avs_runtime_suspend, avs_runtime_resume, NULL)
 };
 
 static const struct avs_sram_spec skl_sram_spec = {
 	.base_offset = SKL_ADSP_SRAM_BASE_OFFSET,
 	.window_size = SKL_ADSP_SRAM_WINDOW_SIZE,
-	.rom_status_offset = SKL_ADSP_SRAM_BASE_OFFSET,
 };
 
 static const struct avs_sram_spec apl_sram_spec = {
 	.base_offset = APL_ADSP_SRAM_BASE_OFFSET,
 	.window_size = APL_ADSP_SRAM_WINDOW_SIZE,
-	.rom_status_offset = APL_ADSP_SRAM_BASE_OFFSET,
+};
+
+static const struct avs_sram_spec mtl_sram_spec = {
+	.base_offset = MTL_ADSP_SRAM_BASE_OFFSET,
+	.window_size = MTL_ADSP_SRAM_WINDOW_SIZE,
 };
 
 static const struct avs_hipc_spec skl_hipc_spec = {
@@ -766,6 +796,19 @@ static const struct avs_hipc_spec skl_hipc_spec = {
 	.rsp_offset = SKL_ADSP_REG_HIPCT,
 	.rsp_busy_mask = SKL_ADSP_HIPCT_BUSY,
 	.ctl_offset = SKL_ADSP_REG_HIPCCTL,
+	.sts_offset = SKL_ADSP_SRAM_BASE_OFFSET,
+};
+
+static const struct avs_hipc_spec apl_hipc_spec = {
+	.req_offset = SKL_ADSP_REG_HIPCI,
+	.req_ext_offset = SKL_ADSP_REG_HIPCIE,
+	.req_busy_mask = SKL_ADSP_HIPCI_BUSY,
+	.ack_offset = SKL_ADSP_REG_HIPCIE,
+	.ack_done_mask = SKL_ADSP_HIPCIE_DONE,
+	.rsp_offset = SKL_ADSP_REG_HIPCT,
+	.rsp_busy_mask = SKL_ADSP_HIPCT_BUSY,
+	.ctl_offset = SKL_ADSP_REG_HIPCCTL,
+	.sts_offset = APL_ADSP_SRAM_BASE_OFFSET,
 };
 
 static const struct avs_hipc_spec cnl_hipc_spec = {
@@ -777,6 +820,19 @@ static const struct avs_hipc_spec cnl_hipc_spec = {
 	.rsp_offset = CNL_ADSP_REG_HIPCTDR,
 	.rsp_busy_mask = CNL_ADSP_HIPCTDR_BUSY,
 	.ctl_offset = CNL_ADSP_REG_HIPCCTL,
+	.sts_offset = APL_ADSP_SRAM_BASE_OFFSET,
+};
+
+static const struct avs_hipc_spec lnl_hipc_spec = {
+	.req_offset = MTL_REG_HfIPCxIDR,
+	.req_ext_offset = MTL_REG_HfIPCxIDD,
+	.req_busy_mask = MTL_HfIPCxIDR_BUSY,
+	.ack_offset = MTL_REG_HfIPCxIDA,
+	.ack_done_mask = MTL_HfIPCxIDA_DONE,
+	.rsp_offset = MTL_REG_HfIPCxTDR,
+	.rsp_busy_mask = MTL_HfIPCxTDR_BUSY,
+	.ctl_offset = MTL_REG_HfIPCxCTL,
+	.sts_offset = LNL_REG_HfDFR(0),
 };
 
 static const struct avs_spec skl_desc = {
@@ -796,7 +852,7 @@ static const struct avs_spec apl_desc = {
 	.core_init_mask = 3,
 	.attributes = AVS_PLATATTR_IMR,
 	.sram = &apl_sram_spec,
-	.hipc = &skl_hipc_spec,
+	.hipc = &apl_hipc_spec,
 };
 
 static const struct avs_spec cnl_desc = {
@@ -829,10 +885,10 @@ static const struct avs_spec jsl_desc = {
 	.hipc = &cnl_hipc_spec,
 };
 
-#define AVS_TGL_BASED_SPEC(sname)		\
+#define AVS_TGL_BASED_SPEC(sname, min)		\
 static const struct avs_spec sname##_desc = {	\
 	.name = #sname,				\
-	.min_fw_version = { 10,	29, 0, 5646 },	\
+	.min_fw_version = { 10,	min, 0, 5646 },	\
 	.dsp_ops = &avs_tgl_dsp_ops,		\
 	.core_init_mask = 1,			\
 	.attributes = AVS_PLATATTR_IMR,		\
@@ -840,11 +896,21 @@ static const struct avs_spec sname##_desc = {	\
 	.hipc = &cnl_hipc_spec,			\
 }
 
-AVS_TGL_BASED_SPEC(lkf);
-AVS_TGL_BASED_SPEC(tgl);
-AVS_TGL_BASED_SPEC(ehl);
-AVS_TGL_BASED_SPEC(adl);
-AVS_TGL_BASED_SPEC(adl_n);
+AVS_TGL_BASED_SPEC(lkf, 28);
+AVS_TGL_BASED_SPEC(tgl, 29);
+AVS_TGL_BASED_SPEC(ehl, 30);
+AVS_TGL_BASED_SPEC(adl, 35);
+AVS_TGL_BASED_SPEC(adl_n, 35);
+
+static const struct avs_spec fcl_desc = {
+	.name = "fcl",
+	.min_fw_version = { 0 },
+	.dsp_ops = &avs_ptl_dsp_ops,
+	.core_init_mask = 1,
+	.attributes = AVS_PLATATTR_IMR | AVS_PLATATTR_ACE | AVS_PLATATTR_ALTHDA,
+	.sram = &mtl_sram_spec,
+	.hipc = &lnl_hipc_spec,
+};
 
 static const struct pci_device_id avs_ids[] = {
 	{ PCI_DEVICE_DATA(INTEL, HDA_SKL_LP, &skl_desc) },
@@ -854,7 +920,7 @@ static const struct pci_device_id avs_ids[] = {
 	{ PCI_DEVICE_DATA(INTEL, HDA_KBL_H, &skl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_CML_S, &skl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_APL, &apl_desc) },
-	{ PCI_DEVICE_DATA(INTEL, HDA_GML, &apl_desc) },
+	{ PCI_DEVICE_DATA(INTEL, HDA_GLK, &apl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_CNL_LP,	&cnl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_CNL_H,	&cnl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_CML_LP,	&cnl_desc) },
@@ -881,6 +947,7 @@ static const struct pci_device_id avs_ids[] = {
 	{ PCI_DEVICE_DATA(INTEL, HDA_RPL_P_1,	&adl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_RPL_M,	&adl_desc) },
 	{ PCI_DEVICE_DATA(INTEL, HDA_RPL_PX,	&adl_desc) },
+	{ PCI_DEVICE_DATA(INTEL, HDA_FCL,	&fcl_desc) },
 	{ 0 }
 };
 MODULE_DEVICE_TABLE(pci, avs_ids);
@@ -893,7 +960,7 @@ static struct pci_driver avs_pci_driver = {
 	.shutdown = avs_pci_shutdown,
 	.dev_groups = avs_attr_groups,
 	.driver = {
-		.pm = &avs_dev_pm,
+		.pm = pm_ptr(&avs_dev_pm),
 	},
 };
 module_pci_driver(avs_pci_driver);
@@ -902,3 +969,14 @@ MODULE_AUTHOR("Cezary Rojewski <cezary.rojewski@intel.com>");
 MODULE_AUTHOR("Amadeusz Slawinski <amadeuszx.slawinski@linux.intel.com>");
 MODULE_DESCRIPTION("Intel cAVS sound driver");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE("intel/avs/skl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/apl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/cnl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/icl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/jsl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/lkf/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/tgl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/ehl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/adl/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/avs/adl_n/dsp_basefw.bin");
+MODULE_FIRMWARE("intel/fcl/dsp_basefw.bin");

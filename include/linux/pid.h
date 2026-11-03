@@ -2,10 +2,14 @@
 #ifndef _LINUX_PID_H
 #define _LINUX_PID_H
 
+#include <linux/array_size.h>
+#include <linux/build_bug.h>
+#include <linux/minmax.h>
 #include <linux/pid_types.h>
 #include <linux/rculist.h>
 #include <linux/rcupdate.h>
 #include <linux/refcount.h>
+#include <linux/rhashtable-types.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
 
@@ -47,18 +51,23 @@
 
 #define RESERVED_PIDS 300
 
+struct pidfs_attr;
+
 struct upid {
 	int nr;
 	struct pid_namespace *ns;
 };
 
-struct pid
-{
+struct pid {
 	refcount_t count;
 	unsigned int level;
 	spinlock_t lock;
-	struct dentry *stashed;
-	u64 ino;
+	struct {
+		u64 ino;
+		struct rhash_head pidfs_hash;
+		struct dentry *stashed;
+		struct pidfs_attr *attr;
+	};
 	/* lists of tasks that use this pid */
 	struct hlist_head tasks[PIDTYPE_MAX];
 	struct hlist_head inodes;
@@ -75,7 +84,7 @@ struct file;
 struct pid *pidfd_pid(const struct file *file);
 struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags);
 struct task_struct *pidfd_get_task(int pidfd, unsigned int *flags);
-int pidfd_prepare(struct pid *pid, unsigned int flags, struct file **ret);
+int pidfd_prepare(struct pid *pid, unsigned int flags, struct file **ret_file);
 void do_notify_pidfd(struct task_struct *task);
 
 static inline struct pid *get_pid(struct pid *pid)
@@ -86,6 +95,56 @@ static inline struct pid *get_pid(struct pid *pid)
 }
 
 extern void put_pid(struct pid *pid);
+
+/*
+ * Helpers for arrays of struct pid indexed by pid type declared with
+ * DECLARE_PIDS(). The array covers PIDTYPE_PID up to the pid type it
+ * was declared with and the helpers take that bound from the array.
+ */
+static inline void __get_pids(struct pid **dst, struct pid *const *src,
+			      enum pid_type last)
+{
+	for (enum pid_type type = PIDTYPE_PID; type <= last; type++)
+		dst[type] = get_pid(src[type]);
+}
+
+static inline void __put_pids(struct pid **pids, enum pid_type last)
+{
+	for (enum pid_type type = PIDTYPE_PID; type <= last; type++) {
+		put_pid(pids[type]);
+		pids[type] = NULL;
+	}
+}
+
+static inline void __swap_pids(struct pid **a, struct pid **b,
+			       enum pid_type last)
+{
+	for (enum pid_type type = PIDTYPE_PID; type <= last; type++)
+		swap(a[type], b[type]);
+}
+
+static inline bool __pids_equal(struct pid *const *a, struct pid *const *b,
+				enum pid_type last)
+{
+	for (enum pid_type type = PIDTYPE_PID; type <= last; type++)
+		if (a[type] != b[type])
+			return false;
+	return true;
+}
+
+/* The last pid type an array declared with DECLARE_PIDS() covers. */
+#define pids_last(pids)							\
+	((enum pid_type)(ARRAY_SIZE(pids) - 1 +				\
+			 BUILD_BUG_ON_ZERO(ARRAY_SIZE(pids) > PIDTYPE_MAX)))
+
+#define __pids_last2(a, b)						\
+	(pids_last(a) + BUILD_BUG_ON_ZERO(ARRAY_SIZE(a) != ARRAY_SIZE(b)))
+
+#define get_pids(dst, src)	__get_pids(dst, src, __pids_last2(dst, src))
+#define put_pids(pids)		__put_pids(pids, pids_last(pids))
+#define swap_pids(a, b)		__swap_pids(a, b, __pids_last2(a, b))
+#define pids_equal(a, b)	__pids_equal(a, b, __pids_last2(a, b))
+
 extern struct task_struct *pid_task(struct pid *pid, enum pid_type);
 static inline bool pid_has_task(struct pid *pid, enum pid_type type)
 {
@@ -99,15 +158,12 @@ extern struct pid *get_task_pid(struct task_struct *task, enum pid_type type);
  * these helpers must be called with the tasklist_lock write-held.
  */
 extern void attach_pid(struct task_struct *task, enum pid_type);
-extern void detach_pid(struct task_struct *task, enum pid_type);
-extern void change_pid(struct task_struct *task, enum pid_type,
-			struct pid *pid);
+void detach_pid(struct pid **pids, struct task_struct *task, enum pid_type);
+void change_pid(struct pid **pids, struct task_struct *task, enum pid_type,
+		struct pid *pid);
 extern void exchange_tids(struct task_struct *task, struct task_struct *old);
 extern void transfer_pid(struct task_struct *old, struct task_struct *new,
 			 enum pid_type);
-
-extern int pid_max;
-extern int pid_max_min, pid_max_max;
 
 /*
  * look up a PID in the hash table. Must be called with the tasklist_lock
@@ -130,6 +186,7 @@ extern struct pid *find_ge_pid(int nr, struct pid_namespace *);
 extern struct pid *alloc_pid(struct pid_namespace *ns, pid_t *set_tid,
 			     size_t set_tid_size);
 extern void free_pid(struct pid *pid);
+void free_pids(struct pid **pids);
 extern void disable_pid_allocation(struct pid_namespace *ns);
 
 /*
@@ -183,6 +240,15 @@ static inline pid_t pid_nr(struct pid *pid)
 pid_t pid_nr_ns(struct pid *pid, struct pid_namespace *ns);
 pid_t pid_vnr(struct pid *pid);
 
+/*
+ * Needs tasklist_lock if type > PIDTYPE_TGID. A lockless reader can:
+ *
+ * - race with a change_pid() that moves the task to another hlist,
+ *   and continue to scan the wrong list.
+ *
+ * - race with a copy_process() that adds a new task to the start of hlist,
+ *   and miss the new child.
+ */
 #define do_each_pid_task(pid, type, task)				\
 	do {								\
 		if ((pid) != NULL)					\
@@ -260,7 +326,7 @@ static inline pid_t task_tgid_nr(struct task_struct *tsk)
  */
 static inline int pid_alive(const struct task_struct *p)
 {
-	return p->thread_pid != NULL;
+	return READ_ONCE(p->thread_pid) != NULL;
 }
 
 static inline pid_t task_pgrp_nr_ns(struct task_struct *tsk, struct pid_namespace *ns)
@@ -304,6 +370,11 @@ static inline pid_t task_ppid_nr_ns(const struct task_struct *tsk, struct pid_na
 	rcu_read_unlock();
 
 	return pid;
+}
+
+static inline pid_t task_ppid_vnr(const struct task_struct *tsk)
+{
+	return task_ppid_nr_ns(tsk, NULL);
 }
 
 static inline pid_t task_ppid_nr(const struct task_struct *tsk)

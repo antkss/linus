@@ -13,7 +13,6 @@
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/spi/spi.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/lcm.h>
 #include <linux/property.h>
@@ -111,7 +110,7 @@
 
 #define ADIS16480_REG_SERIAL_NUM		ADIS16480_REG(0x04, 0x20)
 
-/* Each filter coefficent bank spans two pages */
+/* Each filter coefficient bank spans two pages */
 #define ADIS16480_FIR_COEF(page) (x < 60 ? ADIS16480_REG(page, (x) + 8) : \
 		ADIS16480_REG((page) + 1, (x) - 60 + 8))
 #define ADIS16480_FIR_COEF_A(x)			ADIS16480_FIR_COEF(0x05, (x))
@@ -310,9 +309,9 @@ static void adis16480_debugfs_init(struct iio_dev *indio_dev)
 	if (!IS_ENABLED(CONFIG_DEBUG_FS))
 		return;
 
-	debugfs_create_file_unsafe("firmware_revision", 0400,
+	debugfs_create_file("firmware_revision", 0400,
 		d, adis16480, &adis16480_firmware_revision_fops);
-	debugfs_create_file_unsafe("firmware_date", 0400,
+	debugfs_create_file("firmware_date", 0400,
 		d, adis16480, &adis16480_firmware_date_fops);
 	debugfs_create_file_unsafe("serial_number", 0400,
 		d, adis16480, &adis16480_serial_number_fops);
@@ -878,11 +877,32 @@ static const struct iio_chan_spec adis16545_channels[] = {
 	IIO_CHAN_SOFT_TIMESTAMP(17),
 };
 
+static const struct iio_chan_spec adis16489_channels[] = {
+	ADIS16480_GYRO_CHANNEL(X),
+	ADIS16480_GYRO_CHANNEL(Y),
+	ADIS16480_GYRO_CHANNEL(Z),
+	ADIS16480_ACCEL_CHANNEL(X),
+	ADIS16480_ACCEL_CHANNEL(Y),
+	ADIS16480_ACCEL_CHANNEL(Z),
+	ADIS16480_PRESSURE_CHANNEL(),
+	ADIS16480_TEMP_CHANNEL(),
+	IIO_CHAN_SOFT_TIMESTAMP(8),
+	ADIS16480_DELTANG_CHANNEL_NO_SCAN(X),
+	ADIS16480_DELTANG_CHANNEL_NO_SCAN(Y),
+	ADIS16480_DELTANG_CHANNEL_NO_SCAN(Z),
+	ADIS16480_DELTVEL_CHANNEL_NO_SCAN(X),
+	ADIS16480_DELTVEL_CHANNEL_NO_SCAN(Y),
+	ADIS16480_DELTVEL_CHANNEL_NO_SCAN(Z),
+};
+
 enum adis16480_variant {
 	ADIS16375,
 	ADIS16480,
 	ADIS16485,
+	ADIS16486,
+	ADIS16487,
 	ADIS16488,
+	ADIS16489,
 	ADIS16490,
 	ADIS16495_1,
 	ADIS16495_2,
@@ -1038,6 +1058,38 @@ static const struct adis16480_chip_info adis16480_chip_info[] = {
 		.filter_freqs = adis16480_def_filter_freqs,
 		.adis_data = ADIS16480_DATA(16485, &adis16485_timeouts, 0, 0),
 	},
+	[ADIS16486] = {
+		.channels = adis16485_channels,
+		.num_channels = ARRAY_SIZE(adis16485_channels),
+		.gyro_max_val = 22500 << 16,
+		.gyro_max_scale = IIO_DEGREE_TO_RAD(450),
+		.accel_max_val = IIO_M_S_2_TO_G(20000 << 16),
+		.accel_max_scale = 18,
+		.temp_scale = 5650, /* 5.65 milli degree Celsius */
+		.deltang_max_val = IIO_DEGREE_TO_RAD(720),
+		.deltvel_max_val = 200,
+		.int_clk = 2460000,
+		.max_dec_rate = 2048,
+		.has_sleep_cnt = true,
+		.filter_freqs = adis16480_def_filter_freqs,
+		.adis_data = ADIS16480_DATA(16486, &adis16480_timeouts, 0, 0),
+	},
+	[ADIS16487] = {
+		.channels = adis16485_channels,
+		.num_channels = ARRAY_SIZE(adis16485_channels),
+		.gyro_max_val = 22500 << 16,
+		.gyro_max_scale = IIO_DEGREE_TO_RAD(450),
+		.accel_max_val = IIO_M_S_2_TO_G(20000 << 16),
+		.accel_max_scale = 5,
+		.temp_scale = 5650, /* 5.65 milli degree Celsius */
+		.deltang_max_val = IIO_DEGREE_TO_RAD(720),
+		.deltvel_max_val = 50,
+		.int_clk = 2460000,
+		.max_dec_rate = 2048,
+		.has_sleep_cnt = true,
+		.filter_freqs = adis16480_def_filter_freqs,
+		.adis_data = ADIS16480_DATA(16487, &adis16485_timeouts, 0, 0),
+	},
 	[ADIS16488] = {
 		.channels = adis16480_channels,
 		.num_channels = ARRAY_SIZE(adis16480_channels),
@@ -1053,6 +1105,22 @@ static const struct adis16480_chip_info adis16480_chip_info[] = {
 		.has_sleep_cnt = true,
 		.filter_freqs = adis16480_def_filter_freqs,
 		.adis_data = ADIS16480_DATA(16488, &adis16485_timeouts, 0, 0),
+	},
+	[ADIS16489] = {
+		.channels = adis16489_channels,
+		.num_channels = ARRAY_SIZE(adis16489_channels),
+		.gyro_max_val = 22500 << 16,
+		.gyro_max_scale = IIO_DEGREE_TO_RAD(450),
+		.accel_max_val = IIO_M_S_2_TO_G(20000 << 16),
+		.accel_max_scale = 18,
+		.temp_scale = 5650, /* 5.65 milli degree Celsius */
+		.deltang_max_val = IIO_DEGREE_TO_RAD(720),
+		.deltvel_max_val = 200,
+		.int_clk = 2460000,
+		.max_dec_rate = 2048,
+		.has_sleep_cnt = true,
+		.filter_freqs = adis16480_def_filter_freqs,
+		.adis_data = ADIS16480_DATA(16489, &adis16480_timeouts, 0, 0),
 	},
 	[ADIS16490] = {
 		.channels = adis16485_channels,
@@ -1399,7 +1467,7 @@ static irqreturn_t adis16480_trigger_handler(int irq, void *p)
 			 * We need to perform the padding to have the buffer
 			 * elements naturally aligned in case there are any
 			 * 32-bit storage size channels enabled which are added
-			 * in the buffer after the temprature data. In case
+			 * in the buffer after the temperature data. In case
 			 * there is no data being added after the temperature
 			 * data, the padding is harmless.
 			 */
@@ -1738,23 +1806,26 @@ static int adis16480_probe(struct spi_device *spi)
 }
 
 static const struct spi_device_id adis16480_ids[] = {
-	{ "adis16375", ADIS16375 },
-	{ "adis16480", ADIS16480 },
-	{ "adis16485", ADIS16485 },
-	{ "adis16488", ADIS16488 },
-	{ "adis16490", ADIS16490 },
-	{ "adis16495-1", ADIS16495_1 },
-	{ "adis16495-2", ADIS16495_2 },
-	{ "adis16495-3", ADIS16495_3 },
-	{ "adis16497-1", ADIS16497_1 },
-	{ "adis16497-2", ADIS16497_2 },
-	{ "adis16497-3", ADIS16497_3 },
-	{ "adis16545-1", ADIS16545_1 },
-	{ "adis16545-2", ADIS16545_2 },
-	{ "adis16545-3", ADIS16545_3 },
-	{ "adis16547-1", ADIS16547_1 },
-	{ "adis16547-2", ADIS16547_2 },
-	{ "adis16547-3", ADIS16547_3 },
+	{ .name = "adis16375", .driver_data = ADIS16375 },
+	{ .name = "adis16480", .driver_data = ADIS16480 },
+	{ .name = "adis16485", .driver_data = ADIS16485 },
+	{ .name = "adis16486", .driver_data = ADIS16486 },
+	{ .name = "adis16487", .driver_data = ADIS16487 },
+	{ .name = "adis16488", .driver_data = ADIS16488 },
+	{ .name = "adis16489", .driver_data = ADIS16489 },
+	{ .name = "adis16490", .driver_data = ADIS16490 },
+	{ .name = "adis16495-1", .driver_data = ADIS16495_1 },
+	{ .name = "adis16495-2", .driver_data = ADIS16495_2 },
+	{ .name = "adis16495-3", .driver_data = ADIS16495_3 },
+	{ .name = "adis16497-1", .driver_data = ADIS16497_1 },
+	{ .name = "adis16497-2", .driver_data = ADIS16497_2 },
+	{ .name = "adis16497-3", .driver_data = ADIS16497_3 },
+	{ .name = "adis16545-1", .driver_data = ADIS16545_1 },
+	{ .name = "adis16545-2", .driver_data = ADIS16545_2 },
+	{ .name = "adis16545-3", .driver_data = ADIS16545_3 },
+	{ .name = "adis16547-1", .driver_data = ADIS16547_1 },
+	{ .name = "adis16547-2", .driver_data = ADIS16547_2 },
+	{ .name = "adis16547-3", .driver_data = ADIS16547_3 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, adis16480_ids);
@@ -1763,7 +1834,10 @@ static const struct of_device_id adis16480_of_match[] = {
 	{ .compatible = "adi,adis16375" },
 	{ .compatible = "adi,adis16480" },
 	{ .compatible = "adi,adis16485" },
+	{ .compatible = "adi,adis16486" },
+	{ .compatible = "adi,adis16487" },
 	{ .compatible = "adi,adis16488" },
+	{ .compatible = "adi,adis16489" },
 	{ .compatible = "adi,adis16490" },
 	{ .compatible = "adi,adis16495-1" },
 	{ .compatible = "adi,adis16495-2" },
@@ -1777,7 +1851,7 @@ static const struct of_device_id adis16480_of_match[] = {
 	{ .compatible = "adi,adis16547-1" },
 	{ .compatible = "adi,adis16547-2" },
 	{ .compatible = "adi,adis16547-3" },
-	{ },
+	{ }
 };
 MODULE_DEVICE_TABLE(of, adis16480_of_match);
 

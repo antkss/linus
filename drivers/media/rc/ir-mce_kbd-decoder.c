@@ -109,7 +109,8 @@ static unsigned char kbd_keycodes[256] = {
 
 static void mce_kbd_rx_timeout(struct timer_list *t)
 {
-	struct ir_raw_event_ctrl *raw = from_timer(raw, t, mce_kbd.rx_timeout);
+	struct ir_raw_event_ctrl *raw = timer_container_of(raw, t,
+							   mce_kbd.rx_timeout);
 	unsigned char maskcode;
 	unsigned long flags;
 	int i;
@@ -218,6 +219,7 @@ static int ir_mce_kbd_decode(struct rc_dev *dev, struct ir_raw_event ev)
 	struct mce_kbd_dec *data = &dev->raw->mce_kbd;
 	u32 scancode;
 	unsigned long delay;
+	unsigned long flags;
 	struct lirc_scancode lsc = {};
 
 	if (!is_timing_event(ev)) {
@@ -318,17 +320,17 @@ again:
 			scancode = data->body & 0xffffff;
 			dev_dbg(&dev->dev, "keyboard data 0x%08x\n",
 				data->body);
-			spin_lock(&data->keylock);
+			spin_lock_irqsave(&data->keylock, flags);
 			if (scancode) {
 				delay = usecs_to_jiffies(dev->timeout) +
 					msecs_to_jiffies(100);
 				mod_timer(&data->rx_timeout, jiffies + delay);
 			} else {
-				del_timer(&data->rx_timeout);
+				timer_delete(&data->rx_timeout);
 			}
 			/* Pass data to keyboard buffer parser */
 			ir_mce_kbd_process_keyboard_data(dev, scancode);
-			spin_unlock(&data->keylock);
+			spin_unlock_irqrestore(&data->keylock, flags);
 			lsc.rc_proto = RC_PROTO_MCIR2_KBD;
 			break;
 		case MCIR2_MOUSE_NBITS:
@@ -372,7 +374,7 @@ static int ir_mce_kbd_unregister(struct rc_dev *dev)
 {
 	struct mce_kbd_dec *mce_kbd = &dev->raw->mce_kbd;
 
-	del_timer_sync(&mce_kbd->rx_timeout);
+	timer_delete_sync(&mce_kbd->rx_timeout);
 
 	return 0;
 }

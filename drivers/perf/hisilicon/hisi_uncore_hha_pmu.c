@@ -47,9 +47,9 @@
 #define HHA_SRCID_CMD		GENMASK(16, 6)
 #define HHA_SRCID_MSK		GENMASK(30, 20)
 #define HHA_DATSRC_SKT_EN	BIT(23)
-#define HHA_EVTYPE_NONE		0xff
+#define HHA_EVTYPE_MASK		GENMASK(7, 0)
 #define HHA_V1_NR_EVENT		0x65
-#define HHA_V2_NR_EVENT		0xCE
+#define HHA_V2_NR_EVENT		0xFF
 
 HISI_PMU_EVENT_ATTR_EXTRACTOR(srcid_cmd, config1, 10, 0);
 HISI_PMU_EVENT_ATTR_EXTRACTOR(srcid_msk, config1, 21, 11);
@@ -197,7 +197,7 @@ static void hisi_hha_pmu_write_evtype(struct hisi_pmu *hha_pmu, int idx,
 
 	/* Write event code to HHA_EVENT_TYPEx register */
 	val = readl(hha_pmu->base + reg);
-	val &= ~(HHA_EVTYPE_NONE << shift);
+	val &= ~(HHA_EVTYPE_MASK << shift);
 	val |= (type << shift);
 	writel(val, hha_pmu->base + reg);
 }
@@ -295,12 +295,13 @@ static int hisi_hha_pmu_init_data(struct platform_device *pdev,
 	unsigned long long id;
 	acpi_status status;
 
+	hisi_uncore_pmu_init_topology(hha_pmu, &pdev->dev);
+
 	/*
 	 * Use SCCL_ID and UID to identify the HHA PMU, while
 	 * SCCL_ID is in MPIDR[aff2].
 	 */
-	if (device_property_read_u32(&pdev->dev, "hisilicon,scl-id",
-				     &hha_pmu->sccl_id)) {
+	if (hha_pmu->topo.sccl_id < 0) {
 		dev_err(&pdev->dev, "Can not read hha sccl-id!\n");
 		return -EINVAL;
 	}
@@ -309,8 +310,7 @@ static int hisi_hha_pmu_init_data(struct platform_device *pdev,
 	 * Early versions of BIOS support _UID by mistake, so we support
 	 * both "hisilicon, idx-id" as preference, if available.
 	 */
-	if (device_property_read_u32(&pdev->dev, "hisilicon,idx-id",
-				     &hha_pmu->index_id)) {
+	if (hha_pmu->topo.index_id < 0) {
 		status = acpi_evaluate_integer(ACPI_HANDLE(&pdev->dev),
 					       "_UID", NULL, &id);
 		if (ACPI_FAILURE(status)) {
@@ -318,10 +318,8 @@ static int hisi_hha_pmu_init_data(struct platform_device *pdev,
 			return -EINVAL;
 		}
 
-		hha_pmu->index_id = id;
+		hha_pmu->topo.index_id = id;
 	}
-	/* HHA PMUs only share the same SCCL */
-	hha_pmu->ccl_id = -1;
 
 	hha_pmu->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(hha_pmu->base)) {
@@ -407,42 +405,19 @@ static const struct attribute_group hisi_hha_pmu_v2_events_group = {
 	.attrs = hisi_hha_pmu_v2_events_attr,
 };
 
-static DEVICE_ATTR(cpumask, 0444, hisi_cpumask_sysfs_show, NULL);
-
-static struct attribute *hisi_hha_pmu_cpumask_attrs[] = {
-	&dev_attr_cpumask.attr,
-	NULL,
-};
-
-static const struct attribute_group hisi_hha_pmu_cpumask_attr_group = {
-	.attrs = hisi_hha_pmu_cpumask_attrs,
-};
-
-static struct device_attribute hisi_hha_pmu_identifier_attr =
-	__ATTR(identifier, 0444, hisi_uncore_pmu_identifier_attr_show, NULL);
-
-static struct attribute *hisi_hha_pmu_identifier_attrs[] = {
-	&hisi_hha_pmu_identifier_attr.attr,
-	NULL
-};
-
-static const struct attribute_group hisi_hha_pmu_identifier_group = {
-	.attrs = hisi_hha_pmu_identifier_attrs,
-};
-
 static const struct attribute_group *hisi_hha_pmu_v1_attr_groups[] = {
 	&hisi_hha_pmu_v1_format_group,
 	&hisi_hha_pmu_v1_events_group,
-	&hisi_hha_pmu_cpumask_attr_group,
-	&hisi_hha_pmu_identifier_group,
+	&hisi_pmu_cpumask_attr_group,
+	&hisi_pmu_identifier_group,
 	NULL,
 };
 
 static const struct attribute_group *hisi_hha_pmu_v2_attr_groups[] = {
 	&hisi_hha_pmu_v2_format_group,
 	&hisi_hha_pmu_v2_events_group,
-	&hisi_hha_pmu_cpumask_attr_group,
-	&hisi_hha_pmu_identifier_group,
+	&hisi_pmu_cpumask_attr_group,
+	&hisi_pmu_identifier_group,
 	NULL
 };
 
@@ -510,12 +485,12 @@ static int hisi_hha_pmu_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "hisi_sccl%u_hha%u",
-			      hha_pmu->sccl_id, hha_pmu->index_id);
+	name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "hisi_sccl%d_hha%d",
+			      hha_pmu->topo.sccl_id, hha_pmu->topo.index_id);
 	if (!name)
 		return -ENOMEM;
 
-	ret = cpuhp_state_add_instance(CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE,
+	ret = cpuhp_state_add_instance(hisi_uncore_pmu_cpuhp_state,
 				       &hha_pmu->node);
 	if (ret) {
 		dev_err(&pdev->dev, "Error %d registering hotplug\n", ret);
@@ -528,7 +503,7 @@ static int hisi_hha_pmu_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(hha_pmu->dev, "HHA PMU register failed!\n");
 		cpuhp_state_remove_instance_nocalls(
-			CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE, &hha_pmu->node);
+			hisi_uncore_pmu_cpuhp_state, &hha_pmu->node);
 	}
 
 	return ret;
@@ -539,7 +514,7 @@ static void hisi_hha_pmu_remove(struct platform_device *pdev)
 	struct hisi_pmu *hha_pmu = platform_get_drvdata(pdev);
 
 	perf_pmu_unregister(&hha_pmu->pmu);
-	cpuhp_state_remove_instance_nocalls(CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE,
+	cpuhp_state_remove_instance_nocalls(hisi_uncore_pmu_cpuhp_state,
 					    &hha_pmu->node);
 }
 
@@ -553,34 +528,9 @@ static struct platform_driver hisi_hha_pmu_driver = {
 	.remove = hisi_hha_pmu_remove,
 };
 
-static int __init hisi_hha_pmu_module_init(void)
-{
-	int ret;
+module_platform_driver(hisi_hha_pmu_driver);
 
-	ret = cpuhp_setup_state_multi(CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE,
-				      "AP_PERF_ARM_HISI_HHA_ONLINE",
-				      hisi_uncore_pmu_online_cpu,
-				      hisi_uncore_pmu_offline_cpu);
-	if (ret) {
-		pr_err("HHA PMU: Error setup hotplug, ret = %d;\n", ret);
-		return ret;
-	}
-
-	ret = platform_driver_register(&hisi_hha_pmu_driver);
-	if (ret)
-		cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE);
-
-	return ret;
-}
-module_init(hisi_hha_pmu_module_init);
-
-static void __exit hisi_hha_pmu_module_exit(void)
-{
-	platform_driver_unregister(&hisi_hha_pmu_driver);
-	cpuhp_remove_multi_state(CPUHP_AP_PERF_ARM_HISI_HHA_ONLINE);
-}
-module_exit(hisi_hha_pmu_module_exit);
-
+MODULE_IMPORT_NS("HISI_PMU");
 MODULE_DESCRIPTION("HiSilicon SoC HHA uncore PMU driver");
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Shaokun Zhang <zhangshaokun@hisilicon.com>");

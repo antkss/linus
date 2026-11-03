@@ -12,6 +12,7 @@
 #include <linux/bits.h>
 #include <linux/circ_buf.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
 #include <linux/io.h>
@@ -78,6 +79,12 @@
 #define UART_TX_BYTE_FIFO			0x00
 #define UART_FIFO_CTL				0x02
 
+#define UART_MODEM_CTL_REG			0x04
+#define UART_MODEM_CTL_RTS_SET			BIT(1)
+
+#define UART_LINE_STAT_REG			0x05
+#define UART_LINE_XMIT_CHECK_MASK		GENMASK(6, 5)
+
 #define UART_ACTV_REG				0x11
 #define UART_BLOCK_SET_ACTIVE			BIT(0)
 
@@ -94,6 +101,7 @@
 #define UART_BIT_SAMPLE_CNT_16			16
 #define BAUD_CLOCK_DIV_INT_MSK			GENMASK(31, 8)
 #define ADCL_CFG_RTS_DELAY_MASK			GENMASK(11, 8)
+#define FRAC_DIV_TX_END_POINT_MASK		GENMASK(23, 20)
 
 #define UART_WAKE_REG				0x8C
 #define UART_WAKE_MASK_REG			0x90
@@ -108,6 +116,7 @@
 
 #define UART_RESET_REG				0x94
 #define UART_RESET_D3_RESET_DISABLE		BIT(16)
+#define UART_RESET_HOT_RESET_DISABLE		BIT(17)
 
 #define UART_BURST_STATUS_REG			0x9C
 #define UART_TX_BURST_FIFO			0xA0
@@ -134,12 +143,17 @@
 #define UART_BST_STAT_LSR_FRAME_ERR		0x8000000
 #define UART_BST_STAT_LSR_THRE			0x20000000
 
+#define GET_MODEM_CTL_RTS_STATUS(reg)		((reg) & UART_MODEM_CTL_RTS_SET)
+#define GET_RTS_PIN_STATUS(val)			(((val) & TIOCM_RTS) >> 1)
+#define RTS_TOGGLE_STATUS_MASK(val, reg)	(GET_MODEM_CTL_RTS_STATUS(reg) \
+						 != GET_RTS_PIN_STATUS(val))
+
 struct pci1xxxx_8250 {
 	unsigned int nr;
 	u8 dev_rev;
 	u8 pad[3];
 	void __iomem *membase;
-	int line[] __counted_by(nr);
+	struct uart_8250_port *uport[] __counted_by(nr);
 };
 
 static const struct serial_rs485 pci1xxxx_rs485_supported = {
@@ -252,6 +266,47 @@ static void pci1xxxx_set_divisor(struct uart_port *port, unsigned int baud,
 
 	writel(FIELD_PREP(BAUD_CLOCK_DIV_INT_MSK, quot) | frac,
 	       port->membase + UART_BAUD_CLK_DIVISOR_REG);
+}
+
+static void pci1xxxx_set_mctrl(struct uart_port *port, unsigned int mctrl)
+{
+	u32 fract_div_cfg_reg;
+	u32 line_stat_reg;
+	u32 modem_ctl_reg;
+	u32 adcl_cfg_reg;
+
+	adcl_cfg_reg = readl(port->membase + ADCL_CFG_REG);
+
+	/* HW is responsible in ADCL_EN case */
+	if ((adcl_cfg_reg & (ADCL_CFG_EN | ADCL_CFG_PIN_SEL)))
+		return;
+
+	modem_ctl_reg = readl(port->membase + UART_MODEM_CTL_REG);
+
+	serial8250_do_set_mctrl(port, mctrl);
+
+	if (RTS_TOGGLE_STATUS_MASK(mctrl, modem_ctl_reg)) {
+		line_stat_reg = readl(port->membase + UART_LINE_STAT_REG);
+		if (line_stat_reg & UART_LINE_XMIT_CHECK_MASK) {
+			fract_div_cfg_reg = readl(port->membase +
+						  FRAC_DIV_CFG_REG);
+
+			writel((fract_div_cfg_reg &
+			       ~(FRAC_DIV_TX_END_POINT_MASK)),
+			       port->membase + FRAC_DIV_CFG_REG);
+
+			/* Enable ADC and set the nRTS pin */
+			writel((adcl_cfg_reg | (ADCL_CFG_EN |
+			       ADCL_CFG_PIN_SEL)),
+			       port->membase + ADCL_CFG_REG);
+
+			/* Revert to the original settings */
+			writel(adcl_cfg_reg, port->membase + ADCL_CFG_REG);
+
+			writel(fract_div_cfg_reg, port->membase +
+			       FRAC_DIV_CFG_REG);
+		}
+	}
 }
 
 static int pci1xxxx_rs485_config(struct uart_port *port,
@@ -497,9 +552,8 @@ static int pci1xxxx_handle_irq(struct uart_port *port)
 	return 1;
 }
 
-static bool pci1xxxx_port_suspend(int line)
+static bool pci1xxxx_port_suspend(struct uart_8250_port *up)
 {
-	struct uart_8250_port *up = serial8250_get_port(line);
 	struct uart_port *port = &up->port;
 	struct tty_port *tport = &port->state->port;
 	unsigned long flags;
@@ -524,9 +578,8 @@ static bool pci1xxxx_port_suspend(int line)
 	return ret;
 }
 
-static void pci1xxxx_port_resume(int line)
+static void pci1xxxx_port_resume(struct uart_8250_port *up)
 {
-	struct uart_8250_port *up = serial8250_get_port(line);
 	struct uart_port *port = &up->port;
 	struct tty_port *tport = &port->state->port;
 	unsigned long flags;
@@ -554,9 +607,9 @@ static int pci1xxxx_suspend(struct device *dev)
 	int i;
 
 	for (i = 0; i < priv->nr; i++) {
-		if (priv->line[i] >= 0) {
-			serial8250_suspend_port(priv->line[i]);
-			wakeup |= pci1xxxx_port_suspend(priv->line[i]);
+		if (priv->uport[i]) {
+			serial8250_suspend_port(priv->uport[i]);
+			wakeup |= pci1xxxx_port_suspend(priv->uport[i]);
 		}
 	}
 
@@ -567,6 +620,10 @@ static int pci1xxxx_suspend(struct device *dev)
 	}
 
 	data = readl(p + UART_RESET_REG);
+
+	if (priv->dev_rev >= 0xC0)
+		data |= UART_RESET_HOT_RESET_DISABLE;
+
 	writel(data | UART_RESET_D3_RESET_DISABLE, p + UART_RESET_REG);
 
 	if (wakeup)
@@ -594,13 +651,18 @@ static int pci1xxxx_resume(struct device *dev)
 	}
 
 	data = readl(p + UART_RESET_REG);
+
+	if (priv->dev_rev >= 0xC0)
+		data &= ~UART_RESET_HOT_RESET_DISABLE;
+
 	writel(data & ~UART_RESET_D3_RESET_DISABLE, p + UART_RESET_REG);
+
 	iounmap(p);
 
 	for (i = 0; i < priv->nr; i++) {
-		if (priv->line[i] >= 0) {
-			pci1xxxx_port_resume(priv->line[i]);
-			serial8250_resume_port(priv->line[i]);
+		if (priv->uport[i]) {
+			pci1xxxx_port_resume(priv->uport[i]);
+			serial8250_resume_port(priv->uport[i]);
 		}
 	}
 
@@ -608,7 +670,7 @@ static int pci1xxxx_resume(struct device *dev)
 }
 
 static int pci1xxxx_setup(struct pci_dev *pdev,
-			  struct uart_8250_port *port, int port_idx, int rev)
+			  struct uart_8250_port *port, int port_idx, struct pci1xxxx_8250 *priv)
 {
 	int ret;
 
@@ -631,11 +693,16 @@ static int pci1xxxx_setup(struct pci_dev *pdev,
 	port->port.rs485_config = pci1xxxx_rs485_config;
 	port->port.rs485_supported = pci1xxxx_rs485_supported;
 
-	/* From C0 rev Burst operation is supported */
-	if (rev >= 0xC0)
+	/*
+	 * C0 and later revisions support Burst operation.
+	 * RTS workaround in mctrl is applicable only to B0.
+	 */
+	if (priv->dev_rev >= 0xC0)
 		port->port.handle_irq = pci1xxxx_handle_irq;
+	else if (priv->dev_rev == 0xB0)
+		port->port.set_mctrl = pci1xxxx_set_mctrl;
 
-	ret = serial8250_pci_setup_port(pdev, port, 0, PORT_OFFSET * port_idx, 0);
+	ret = serial8250_pci_setup_port(pdev, port, 0, PORT_OFFSET * port_idx, 0, priv->membase);
 	if (ret < 0)
 		return ret;
 
@@ -711,7 +778,7 @@ static int pci1xxxx_serial_probe(struct pci_dev *pdev,
 
 	nr_ports = pci1xxxx_get_num_ports(pdev);
 
-	priv = devm_kzalloc(dev, struct_size(priv, line, nr_ports), GFP_KERNEL);
+	priv = devm_kzalloc(dev, struct_size(priv, uport, nr_ports), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
@@ -744,8 +811,6 @@ static int pci1xxxx_serial_probe(struct pci_dev *pdev,
 		writeb(UART_PCI_CTRL_SET_MULTIPLE_MSI, priv->membase + UART_PCI_CTRL_REG);
 
 	for (i = 0; i < nr_ports; i++) {
-		priv->line[i] = -ENODEV;
-
 		port_idx = pci1xxxx_logical_to_physical_port_translate(subsys_dev, i);
 
 		if (num_vectors == max_vec_reqd)
@@ -753,19 +818,21 @@ static int pci1xxxx_serial_probe(struct pci_dev *pdev,
 		else
 			uart.port.irq = pci_irq_vector(pdev, 0);
 
-		rc = pci1xxxx_setup(pdev, &uart, port_idx, priv->dev_rev);
+		rc = pci1xxxx_setup(pdev, &uart, port_idx, priv);
 		if (rc) {
 			dev_warn(dev, "Failed to setup port %u\n", i);
 			continue;
 		}
 
-		priv->line[i] = serial8250_register_8250_port(&uart);
-		if (priv->line[i] < 0) {
+		struct uart_8250_port *uport = serial8250_register_8250_port(&uart);
+		if (IS_ERR(uport)) {
 			dev_warn(dev,
-				"Couldn't register serial port %lx, irq %d, type %d, error %d\n",
-				uart.port.iobase, uart.port.irq, uart.port.iotype,
-				priv->line[i]);
+				"Couldn't register serial port %lx, irq %d, type %d, error %pe\n",
+				uart.port.iobase, uart.port.irq, uart.port.iotype, uport);
+			continue;
 		}
+
+		priv->uport[i] = uport;
 	}
 
 	pci_set_drvdata(pdev, priv);
@@ -779,8 +846,8 @@ static void pci1xxxx_serial_remove(struct pci_dev *dev)
 	unsigned int i;
 
 	for (i = 0; i < priv->nr; i++) {
-		if (priv->line[i] >= 0)
-			serial8250_unregister_port(priv->line[i]);
+		if (priv->uport[i])
+			serial8250_unregister_port(priv->uport[i]);
 	}
 
 	pci_free_irq_vectors(dev);

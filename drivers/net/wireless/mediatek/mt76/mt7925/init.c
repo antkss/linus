@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: ISC
+// SPDX-License-Identifier: BSD-3-Clause-Clear
 /* Copyright (C) 2023 MediaTek Inc. */
 
 #include <linux/etherdevice.h>
@@ -7,6 +7,7 @@
 #include <linux/thermal.h>
 #include <linux/firmware.h>
 #include "mt7925.h"
+#include "regd.h"
 #include "mac.h"
 #include "mcu.h"
 
@@ -52,38 +53,12 @@ static int mt7925_thermal_init(struct mt792x_phy *phy)
 
 	name = devm_kasprintf(&wiphy->dev, GFP_KERNEL, "mt7925_%s",
 			      wiphy_name(wiphy));
+	if (!name)
+		return -ENOMEM;
 
 	hwmon = devm_hwmon_device_register_with_groups(&wiphy->dev, name, phy,
 						       mt7925_hwmon_groups);
 	return PTR_ERR_OR_ZERO(hwmon);
-}
-static void
-mt7925_regd_notifier(struct wiphy *wiphy,
-		     struct regulatory_request *req)
-{
-	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
-	struct mt792x_dev *dev = mt792x_hw_dev(hw);
-	struct mt76_dev *mdev = &dev->mt76;
-
-	/* allow world regdom at the first boot only */
-	if (!memcmp(req->alpha2, "00", 2) &&
-	    mdev->alpha2[0] && mdev->alpha2[1])
-		return;
-
-	/* do not need to update the same country twice */
-	if (!memcmp(req->alpha2, mdev->alpha2, 2) &&
-	    dev->country_ie_env == req->country_ie_env)
-		return;
-
-	memcpy(mdev->alpha2, req->alpha2, 2);
-	mdev->region = req->dfs_region;
-	dev->country_ie_env = req->country_ie_env;
-
-	mt792x_mutex_acquire(dev);
-	mt7925_mcu_set_clc(dev, req->alpha2, req->country_ie_env);
-	mt7925_mcu_set_channel_domain(hw->priv);
-	mt7925_set_tx_sar_pwr(hw, NULL);
-	mt792x_mutex_release(dev);
 }
 
 static void mt7925_mac_init_basic_rates(struct mt792x_dev *dev)
@@ -130,7 +105,9 @@ static int __mt7925_init_hardware(struct mt792x_dev *dev)
 	if (ret)
 		goto out;
 
-	mt76_eeprom_override(&dev->mphy);
+	ret = mt76_eeprom_override(&dev->mphy);
+	if (ret)
+		goto out;
 
 	ret = mt7925_mcu_set_eeprom(dev);
 	if (ret)
@@ -139,6 +116,15 @@ static int __mt7925_init_hardware(struct mt792x_dev *dev)
 	ret = mt7925_mac_init(dev);
 	if (ret)
 		goto out;
+
+	if (is_mt7927(&dev->mt76)) {
+		ret = mt7925_mcu_set_dbdc(&dev->mphy, true);
+		if (ret) {
+			dev_warn(dev->mt76.dev,
+				 "MT7927 DBDC enable failed: %d\n", ret);
+			ret = 0;
+		}
+	}
 
 out:
 	return ret;
@@ -151,8 +137,16 @@ static int mt7925_init_hardware(struct mt792x_dev *dev)
 	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
 
 	for (i = 0; i < MT792x_MCU_INIT_RETRY_COUNT; i++) {
+		if (atomic_read(&dev->mt76.bus_hung)) {
+			ret = -EIO;
+			break;
+		}
+
 		ret = __mt7925_init_hardware(dev);
 		if (!ret)
+			break;
+
+		if (atomic_read(&dev->mt76.bus_hung))
 			break;
 
 		mt792x_init_reset(dev);
@@ -162,6 +156,33 @@ static int mt7925_init_hardware(struct mt792x_dev *dev)
 		dev_err(dev->mt76.dev, "hardware init failed\n");
 		return ret;
 	}
+
+	return 0;
+}
+
+static int mt7925_init_nan_cap(struct mt76_dev *mdev)
+{
+	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
+	const struct ieee80211_sta_he_cap *he_cap;
+	struct ieee80211_supported_band *sband;
+	struct wiphy *wiphy = mdev->hw->wiphy;
+
+	if (!(dev->fw_features & MT792x_FW_CAP_NAN))
+		return 0;
+
+	sband = wiphy->bands[NL80211_BAND_2GHZ];
+	if (sband)
+		wiphy->nan_capa.phy.ht = sband->ht_cap;
+
+	sband = wiphy->bands[NL80211_BAND_5GHZ];
+	if (sband)
+		wiphy->nan_capa.phy.vht = sband->vht_cap;
+
+	sband = wiphy->bands[NL80211_BAND_2GHZ];
+	he_cap = sband ? ieee80211_get_he_iftype_cap(sband, NL80211_IFTYPE_NAN)
+		       : NULL;
+	if (he_cap)
+		wiphy->nan_capa.phy.he = *he_cap;
 
 	return 0;
 }
@@ -178,12 +199,15 @@ static void mt7925_init_work(struct work_struct *work)
 
 	mt76_set_stream_caps(&dev->mphy, true);
 	mt7925_set_stream_he_eht_caps(&dev->phy);
+	mt792x_config_mac_addr_list(dev);
 
 	ret = mt7925_init_mlo_caps(&dev->phy);
 	if (ret) {
 		dev_err(dev->mt76.dev, "MLO init failed\n");
 		return;
 	}
+
+	dev->mt76.init_wiphy = mt7925_init_nan_cap;
 
 	ret = mt76_register_device(&dev->mt76, true, mt76_rates,
 				   ARRAY_SIZE(mt76_rates));
@@ -204,6 +228,12 @@ static void mt7925_init_work(struct work_struct *work)
 		return;
 	}
 
+	ret = mt7925_mcu_set_thermal_protect(dev);
+	if (ret) {
+		dev_err(dev->mt76.dev, "thermal protection enable failed\n");
+		return;
+	}
+
 	/* we support chip reset now */
 	dev->hw_init_done = true;
 
@@ -221,10 +251,12 @@ int mt7925_register_device(struct mt792x_dev *dev)
 	dev->mt76.tx_worker.fn = mt792x_tx_worker;
 
 	INIT_DELAYED_WORK(&dev->pm.ps_work, mt792x_pm_power_save_work);
+	INIT_DELAYED_WORK(&dev->mlo_pm_work, mt7925_mlo_pm_work);
 	INIT_WORK(&dev->pm.wake_work, mt792x_pm_wake_work);
 	spin_lock_init(&dev->pm.wake.lock);
 	mutex_init(&dev->pm.mutex);
 	init_waitqueue_head(&dev->pm.wait);
+	init_waitqueue_head(&dev->wait);
 	spin_lock_init(&dev->pm.txq_lock);
 	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt792x_mac_work);
 	INIT_DELAYED_WORK(&dev->phy.scan_work, mt7925_scan_work);
@@ -238,6 +270,8 @@ int mt7925_register_device(struct mt792x_dev *dev)
 
 	INIT_WORK(&dev->reset_work, mt7925_mac_reset_work);
 	INIT_WORK(&dev->init_work, mt7925_init_work);
+	INIT_WORK(&dev->nan_deferred_work, mt7925_nan_deferred_work);
+	spin_lock_init(&dev->nan_deferred_lock);
 
 	INIT_WORK(&dev->phy.roc_work, mt7925_roc_work);
 	timer_setup(&dev->phy.roc_timer, mt792x_roc_timer, 0);
@@ -246,7 +280,8 @@ int mt7925_register_device(struct mt792x_dev *dev)
 	dev->pm.idle_timeout = MT792x_PM_TIMEOUT;
 	dev->pm.stats.last_wake_event = jiffies;
 	dev->pm.stats.last_doze_event = jiffies;
-	if (!mt76_is_usb(&dev->mt76)) {
+	/* MT7927: runtime PM crashes BT firmware on the shared CONNINFRA domain */
+	if (!mt76_is_usb(&dev->mt76) && !is_mt7927(&dev->mt76)) {
 		dev->pm.enable_user = true;
 		dev->pm.enable = true;
 		dev->pm.ds_enable_user = true;
@@ -290,7 +325,7 @@ int mt7925_register_device(struct mt792x_dev *dev)
 	dev->mphy.hw->wiphy->available_antennas_rx = dev->mphy.chainmask;
 	dev->mphy.hw->wiphy->available_antennas_tx = dev->mphy.chainmask;
 
-	queue_work(system_wq, &dev->init_work);
+	queue_work(system_percpu_wq, &dev->init_work);
 
 	return 0;
 }

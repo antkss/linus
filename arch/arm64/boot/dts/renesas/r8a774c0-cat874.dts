@@ -322,7 +322,7 @@
 		power-source = <3300>;
 	};
 
-	sdhi0_pins_uhs: sd0_uhs {
+	sdhi0_pins_uhs: sd0-uhs {
 		groups = "sdhi0_data4", "sdhi0_ctrl";
 		function = "sdhi0";
 		power-source = <1800>;
@@ -334,7 +334,7 @@
 		power-source = <1800>;
 	};
 
-	sound_clk_pins: sound_clk {
+	sound_clk_pins: sound-clk {
 		groups = "audio_clkout1_a";
 		function = "audio_clk";
 	};
@@ -378,6 +378,7 @@
 &scif2 {
 	pinctrl-0 = <&scif2_pins>;
 	pinctrl-names = "default";
+	bootph-all;
 
 	status = "okay";
 };

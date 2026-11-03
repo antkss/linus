@@ -371,8 +371,8 @@
 		.ops		= &axp20x_ops,					\
 	}
 
-#define AXP_DESC_DELAY(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		 _vmask, _ereg, _emask, _ramp_delay) 				\
+#define AXP_DESC(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
+		 _vmask, _ereg, _emask)						\
 	[_family##_##_id] = {							\
 		.name		= (_match),					\
 		.supply_name	= (_supply),					\
@@ -388,14 +388,8 @@
 		.vsel_mask	= (_vmask),					\
 		.enable_reg	= (_ereg),					\
 		.enable_mask	= (_emask),					\
-		.ramp_delay = (_ramp_delay),					\
 		.ops		= &axp20x_ops,					\
 	}
-
-#define AXP_DESC(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		 _vmask, _ereg, _emask) 					\
-	AXP_DESC_DELAY(_family, _id, _match, _supply, _min, _max, _step, _vreg,	\
-		 _vmask, _ereg, _emask, 0)
 
 #define AXP_DESC_SW(_family, _id, _match, _supply, _ereg, _emask)		\
 	[_family##_##_id] = {							\
@@ -805,9 +799,9 @@ static const struct regulator_desc axp717_regulators[] = {
 			axp717_dcdc3_ranges, AXP717_DCDC3_NUM_VOLTAGES,
 			AXP717_DCDC3_CONTROL, AXP717_DCDC_V_OUT_MASK,
 			AXP717_DCDC_OUTPUT_CONTROL, BIT(2), 640),
-	AXP_DESC_DELAY(AXP717, DCDC4, "dcdc4", "vin4", 1000, 3700, 100,
+	AXP_DESC(AXP717, DCDC4, "dcdc4", "vin4", 1000, 3700, 100,
 		 AXP717_DCDC4_CONTROL, AXP717_DCDC_V_OUT_MASK,
-		 AXP717_DCDC_OUTPUT_CONTROL, BIT(3), 6400),
+		 AXP717_DCDC_OUTPUT_CONTROL, BIT(3)),
 	AXP_DESC(AXP717, ALDO1, "aldo1", "aldoin", 500, 3500, 100,
 		 AXP717_ALDO1_CONTROL, AXP717_LDO_V_OUT_MASK,
 		 AXP717_LDO0_OUTPUT_CONTROL, BIT(0)),
@@ -1658,7 +1652,7 @@ static int axp20x_regulator_probe(struct platform_device *pdev)
 		    (regulators == axp803_regulators && i == AXP803_DC1SW) ||
 		    (regulators == axp809_regulators && i == AXP809_DC1SW) ||
 		    (regulators == axp15060_regulators && i == AXP15060_SW)) {
-			new_desc = devm_kzalloc(&pdev->dev, sizeof(*desc),
+			new_desc = devm_kzalloc(&pdev->dev, sizeof(*new_desc),
 						GFP_KERNEL);
 			if (!new_desc)
 				return -ENOMEM;
@@ -1671,7 +1665,7 @@ static int axp20x_regulator_probe(struct platform_device *pdev)
 		if ((regulators == axp22x_regulators && i == AXP22X_DC5LDO) ||
 		    (regulators == axp809_regulators && i == AXP809_DC5LDO) ||
 		    (regulators == axp15060_regulators && i == AXP15060_CPUSLDO)) {
-			new_desc = devm_kzalloc(&pdev->dev, sizeof(*desc),
+			new_desc = devm_kzalloc(&pdev->dev, sizeof(*new_desc),
 						GFP_KERNEL);
 			if (!new_desc)
 				return -ENOMEM;
@@ -1683,7 +1677,7 @@ static int axp20x_regulator_probe(struct platform_device *pdev)
 
 
 		if (regulators == axp15060_regulators && i == AXP15060_RTC_LDO) {
-			new_desc = devm_kzalloc(&pdev->dev, sizeof(*desc),
+			new_desc = devm_kzalloc(&pdev->dev, sizeof(*new_desc),
 						GFP_KERNEL);
 			if (!new_desc)
 				return -ENOMEM;

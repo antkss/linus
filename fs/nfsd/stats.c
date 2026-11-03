@@ -26,6 +26,8 @@
 #include <net/net_namespace.h>
 
 #include "nfsd.h"
+#include "netns.h"
+#include "stats.h"
 
 static int nfsd_show(struct seq_file *seq, void *v)
 {
@@ -63,7 +65,7 @@ static int nfsd_show(struct seq_file *seq, void *v)
 			   percpu_counter_sum_positive(&nn->counter[NFSD_STATS_NFS4_OP(i)]));
 	}
 	seq_printf(seq, "\nwdeleg_getattr %lld",
-		percpu_counter_sum_positive(&nn->counter[NFSD_STATS_WDELEG_GETATTR]));
+		percpu_counter_sum_positive(&nn->cb_counter[OP_CB_GETATTR]));
 
 	seq_putc(seq, '\n');
 #endif
@@ -73,11 +75,11 @@ static int nfsd_show(struct seq_file *seq, void *v)
 
 DEFINE_PROC_SHOW_ATTRIBUTE(nfsd);
 
-void nfsd_proc_stat_init(struct net *net)
+struct proc_dir_entry *nfsd_proc_stat_init(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
-	svc_proc_register(net, &nn->nfsd_svcstats, &nfsd_proc_ops);
+	return svc_proc_register(net, &nn->nfsd_svcstats, &nfsd_proc_ops);
 }
 
 void nfsd_proc_stat_shutdown(struct net *net)

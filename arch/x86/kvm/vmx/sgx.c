@@ -2,10 +2,12 @@
 /*  Copyright(c) 2021 Intel Corporation. */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <asm/cpuid/api.h>
+#include <asm/msr.h>
 #include <asm/sgx.h>
 
 #include "x86.h"
-#include "kvm_cache_regs.h"
+#include "regs.h"
 #include "nested.h"
 #include "sgx.h"
 #include "vmx.h"
@@ -122,7 +124,7 @@ static int sgx_inject_fault(struct kvm_vcpu *vcpu, gva_t gva, int trapnr)
 	 * likely than a bad userspace address.
 	 */
 	if ((trapnr == PF_VECTOR || !boot_cpu_has(X86_FEATURE_SGX2)) &&
-	    guest_cpuid_has(vcpu, X86_FEATURE_SGX2)) {
+	    guest_cpu_cap_has(vcpu, X86_FEATURE_SGX2)) {
 		memset(&ex, 0, sizeof(ex));
 		ex.vector = PF_VECTOR;
 		ex.error_code = PFERR_PRESENT_MASK | PFERR_WRITE_MASK |
@@ -351,7 +353,7 @@ static int handle_encls_einit(struct kvm_vcpu *vcpu)
 		rflags &= ~X86_EFLAGS_ZF;
 	vmx_set_rflags(vcpu, rflags);
 
-	kvm_rax_write(vcpu, ret);
+	kvm_eax_write(vcpu, ret);
 	return kvm_skip_emulated_instruction(vcpu);
 }
 
@@ -365,7 +367,7 @@ static inline bool encls_leaf_enabled_in_guest(struct kvm_vcpu *vcpu, u32 leaf)
 		return true;
 
 	if (leaf >= EAUG && leaf <= EMODT)
-		return guest_cpuid_has(vcpu, X86_FEATURE_SGX2);
+		return guest_cpu_cap_has(vcpu, X86_FEATURE_SGX2);
 
 	return false;
 }
@@ -379,10 +381,10 @@ static inline bool sgx_enabled_in_guest_bios(struct kvm_vcpu *vcpu)
 
 int handle_encls(struct kvm_vcpu *vcpu)
 {
-	u32 leaf = (u32)kvm_rax_read(vcpu);
+	u32 leaf = kvm_eax_read(vcpu);
 
-	if (!enable_sgx || !guest_cpuid_has(vcpu, X86_FEATURE_SGX) ||
-	    !guest_cpuid_has(vcpu, X86_FEATURE_SGX1)) {
+	if (!enable_sgx || !guest_cpu_cap_has(vcpu, X86_FEATURE_SGX) ||
+	    !guest_cpu_cap_has(vcpu, X86_FEATURE_SGX1)) {
 		kvm_queue_exception(vcpu, UD_VECTOR);
 	} else if (!encls_leaf_enabled_in_guest(vcpu, leaf) ||
 		   !sgx_enabled_in_guest_bios(vcpu) || !is_paging(vcpu)) {
@@ -411,16 +413,16 @@ void setup_default_sgx_lepubkeyhash(void)
 	 * MSRs exist but are read-only (locked and not writable).
 	 */
 	if (!enable_sgx || boot_cpu_has(X86_FEATURE_SGX_LC) ||
-	    rdmsrl_safe(MSR_IA32_SGXLEPUBKEYHASH0, &sgx_pubkey_hash[0])) {
+	    rdmsrq_safe(MSR_IA32_SGXLEPUBKEYHASH0, &sgx_pubkey_hash[0])) {
 		sgx_pubkey_hash[0] = 0xa6053e051270b7acULL;
 		sgx_pubkey_hash[1] = 0x6cfbe8ba8b3b413dULL;
 		sgx_pubkey_hash[2] = 0xc4916d99f2b3735dULL;
 		sgx_pubkey_hash[3] = 0xd4f8c05909f9bb3bULL;
 	} else {
 		/* MSR_IA32_SGXLEPUBKEYHASH0 is read above */
-		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH1, sgx_pubkey_hash[1]);
-		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH2, sgx_pubkey_hash[2]);
-		rdmsrl(MSR_IA32_SGXLEPUBKEYHASH3, sgx_pubkey_hash[3]);
+		rdmsrq(MSR_IA32_SGXLEPUBKEYHASH1, sgx_pubkey_hash[1]);
+		rdmsrq(MSR_IA32_SGXLEPUBKEYHASH2, sgx_pubkey_hash[2]);
+		rdmsrq(MSR_IA32_SGXLEPUBKEYHASH3, sgx_pubkey_hash[3]);
 	}
 }
 
@@ -479,15 +481,15 @@ void vmx_write_encls_bitmap(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
 	if (!cpu_has_vmx_encls_vmexit())
 		return;
 
-	if (guest_cpuid_has(vcpu, X86_FEATURE_SGX) &&
+	if (guest_cpu_cap_has(vcpu, X86_FEATURE_SGX) &&
 	    sgx_enabled_in_guest_bios(vcpu)) {
-		if (guest_cpuid_has(vcpu, X86_FEATURE_SGX1)) {
+		if (guest_cpu_cap_has(vcpu, X86_FEATURE_SGX1)) {
 			bitmap &= ~GENMASK_ULL(ETRACK, ECREATE);
 			if (sgx_intercept_encls_ecreate(vcpu))
 				bitmap |= (1 << ECREATE);
 		}
 
-		if (guest_cpuid_has(vcpu, X86_FEATURE_SGX2))
+		if (guest_cpu_cap_has(vcpu, X86_FEATURE_SGX2))
 			bitmap &= ~GENMASK_ULL(EMODT, EAUG);
 
 		/*

@@ -99,10 +99,12 @@ buf_write(struct buffer *buf, const char *s, int len);
  * struct module_alias - auto-generated MODULE_ALIAS()
  *
  * @node: linked to module::aliases
+ * @modname: name of the builtin module (only for vmlinux)
  * @str: a string for MODULE_ALIAS()
  */
 struct module_alias {
 	struct list_head node;
+	char *builtin_modname;
 	char str[];
 };
 
@@ -111,6 +113,8 @@ struct module_alias {
  *
  * @dump_file: path to the .symvers file if loaded from a file
  * @aliases: list head for module_aliases
+ * @no_trim_symbol: .no_trim_symbol section data
+ * @no_trim_symbol_len: length of the .no_trim_symbol section
  */
 struct module {
 	struct list_head list;
@@ -128,6 +132,8 @@ struct module {
 	// Actual imported namespaces
 	struct list_head imported_namespaces;
 	struct list_head aliases;
+	char *no_trim_symbol;
+	unsigned int no_trim_symbol_len;
 	char name[];
 };
 
@@ -141,6 +147,8 @@ struct elf_info {
 	char         *strtab;
 	char	     *modinfo;
 	unsigned int modinfo_len;
+	char         *no_trim_symbol;
+	unsigned int no_trim_symbol_len;
 
 	/* support for 32bit section numbers */
 
@@ -190,7 +198,7 @@ static inline bool is_valid_name(struct elf_info *elf, Elf_Sym *sym)
 
 	if (!name || !strlen(name))
 		return false;
-	return !is_mapping_symbol(name);
+	return !is_ignored_kernel_symbol(name);
 }
 
 /* symsearch.c */
@@ -210,12 +218,13 @@ void get_src_version(const char *modname, char sum[], unsigned sumlen);
 /* from modpost.c */
 extern bool target_is_big_endian;
 extern bool host_is_big_endian;
+const char *get_basename(const char *path);
 char *read_text_file(const char *filename);
 char *get_line(char **stringp);
 void *sym_get_data(const struct elf_info *info, const Elf_Sym *sym);
 
-void __attribute__((format(printf, 2, 3)))
-modpost_log(bool is_error, const char *fmt, ...);
+void __attribute__((format(printf, 3, 4)))
+modpost_log(bool is_error, struct module *mod, const char *fmt, ...);
 
 /*
  * warn - show the given message, then let modpost continue running, still
@@ -230,6 +239,6 @@ modpost_log(bool is_error, const char *fmt, ...);
  * fatal - show the given message, and bail out immediately. This should be
  *         used when there is no point to continue running modpost.
  */
-#define warn(fmt, args...)	modpost_log(false, fmt, ##args)
-#define error(fmt, args...)	modpost_log(true, fmt, ##args)
+#define warn(fmt, args...)	modpost_log(false, NULL, fmt, ##args)
+#define error(fmt, args...)	modpost_log(true, NULL, fmt, ##args)
 #define fatal(fmt, args...)	do { error(fmt, ##args); exit(1); } while (1)

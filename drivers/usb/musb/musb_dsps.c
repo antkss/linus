@@ -24,6 +24,7 @@
 #include <linux/usb/usb_phy_generic.h>
 #include <linux/platform_data/usb-omap.h>
 #include <linux/sizes.h>
+#include <linux/string_choices.h>
 
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -200,7 +201,7 @@ static void dsps_musb_disable(struct musb *musb)
 	musb_writel(reg_base, wrp->coreintr_clear, wrp->usb_bitmap);
 	musb_writel(reg_base, wrp->epintr_clear,
 			 wrp->txep_bitmap | wrp->rxep_bitmap);
-	del_timer_sync(&musb->dev_timer);
+	timer_delete_sync(&musb->dev_timer);
 }
 
 /* Caller must take musb->lock */
@@ -214,7 +215,7 @@ static int dsps_check_status(struct musb *musb, void *unused)
 	int skip_session = 0;
 
 	if (glue->vbus_irq)
-		del_timer(&musb->dev_timer);
+		timer_delete(&musb->dev_timer);
 
 	/*
 	 * We poll because DSPS IP's won't expose several OTG-critical
@@ -277,7 +278,7 @@ static int dsps_check_status(struct musb *musb, void *unused)
 
 static void otg_timer(struct timer_list *t)
 {
-	struct musb *musb = from_timer(musb, t, dev_timer);
+	struct musb *musb = timer_container_of(musb, t, dev_timer);
 	struct device *dev = musb->controller;
 	unsigned long flags;
 	int err;
@@ -295,7 +296,6 @@ static void otg_timer(struct timer_list *t)
 	if (err < 0)
 		dev_err(dev, "%s resume work: %i\n", __func__, err);
 	spin_unlock_irqrestore(&musb->lock, flags);
-	pm_runtime_mark_last_busy(dev);
 	pm_runtime_put_autosuspend(dev);
 }
 
@@ -378,7 +378,7 @@ static irqreturn_t dsps_interrupt(int irq, void *hci)
 
 		/* NOTE: this must complete power-on within 100 ms. */
 		dev_dbg(musb->controller, "VBUS %s (%s)%s, devctl %02x\n",
-				drvvbus ? "on" : "off",
+				str_on_off(drvvbus),
 				usb_otg_state_string(musb->xceiv->otg->state),
 				err ? " ERROR" : "",
 				devctl);
@@ -498,7 +498,7 @@ static int dsps_musb_exit(struct musb *musb)
 	struct device *dev = musb->controller;
 	struct dsps_glue *glue = dev_get_drvdata(dev->parent);
 
-	del_timer_sync(&musb->dev_timer);
+	timer_delete_sync(&musb->dev_timer);
 	phy_power_off(musb->phy);
 	phy_exit(musb->phy);
 	debugfs_remove_recursive(glue->dbgfs_root);
@@ -618,6 +618,29 @@ static int dsps_musb_recover(struct musb *musb)
 	return session_restart ? 0 : -EPIPE;
 }
 
+static int dsps_musb_vbus_status(struct musb *musb)
+{
+	u8 devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
+
+	return (devctl & MUSB_DEVCTL_VBUS) == MUSB_DEVCTL_VBUS;
+}
+
+static void dsps_musb_set_vbus(struct musb *musb, int is_on)
+{
+	u8 devctl;
+
+	devctl = musb_readb(musb->mregs, MUSB_DEVCTL);
+
+	if (is_on) {
+		devctl |= MUSB_DEVCTL_SESSION;
+	} else {
+		musb_root_disconnect(musb);
+		devctl &= ~MUSB_DEVCTL_SESSION;
+	}
+
+	musb_writeb(musb->mregs, MUSB_DEVCTL, devctl);
+}
+
 /* Similar to am35x, dm81xx support only 32-bit read operation */
 static void dsps_read_fifo32(struct musb_hw_ep *hw_ep, u16 len, u8 *dst)
 {
@@ -702,6 +725,8 @@ static struct musb_platform_ops dsps_ops = {
 
 	.set_mode	= dsps_musb_set_mode,
 	.recover	= dsps_musb_recover,
+	.vbus_status	= dsps_musb_vbus_status,
+	.set_vbus	= dsps_musb_set_vbus,
 	.clear_ep_rxintr = dsps_musb_clear_ep_rxintr,
 };
 
@@ -838,7 +863,7 @@ static int dsps_setup_optional_vbus_irq(struct platform_device *pdev,
 {
 	int error;
 
-	glue->vbus_irq = platform_get_irq_byname(pdev, "vbus");
+	glue->vbus_irq = platform_get_irq_byname_optional(pdev, "vbus");
 	if (glue->vbus_irq == -EPROBE_DEFER)
 		return -EPROBE_DEFER;
 
@@ -982,7 +1007,7 @@ static int dsps_suspend(struct device *dev)
 		return ret;
 	}
 
-	del_timer_sync(&musb->dev_timer);
+	timer_delete_sync(&musb->dev_timer);
 
 	mbase = musb->ctrl_base;
 	glue->context.control = musb_readl(mbase, wrp->control);

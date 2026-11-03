@@ -3,7 +3,7 @@
 //! A wrapper for data protected by a lock that does not wrap it.
 
 use super::{lock::Backend, lock::Lock};
-use crate::build_assert;
+use crate::build_assert::build_assert;
 use core::{cell::UnsafeCell, mem::size_of, ptr};
 
 /// Allows access to some data to be serialised by a lock that does not wrap it.
@@ -55,7 +55,7 @@ use core::{cell::UnsafeCell, mem::size_of, ptr};
 /// fn print_bytes_used(dir: &Directory, file: &File) {
 ///     let guard = dir.inner.lock();
 ///     let inner_file = file.inner.access(&guard);
-///     pr_info!("{} {}", guard.bytes_used, inner_file.bytes_used);
+///     pr_info!("{} {}\n", guard.bytes_used, inner_file.bytes_used);
 /// }
 ///
 /// /// Increments `bytes_used` for both the directory and file.

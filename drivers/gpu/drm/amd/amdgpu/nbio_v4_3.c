@@ -21,7 +21,6 @@
  *
  */
 #include "amdgpu.h"
-#include "amdgpu_atombios.h"
 #include "nbio_v4_3.h"
 
 #include "nbio/nbio_4_3_0_offset.h"
@@ -200,7 +199,7 @@ static void nbio_v4_3_ih_doorbell_range(struct amdgpu_device *adev,
 		ih_doorbell_range = REG_SET_FIELD(ih_doorbell_range,
 						  S2A_DOORBELL_ENTRY_1_CTRL,
 						  S2A_DOORBELL_PORT1_RANGE_SIZE,
-						  2);
+						  8);
 		ih_doorbell_range = REG_SET_FIELD(ih_doorbell_range,
 						  S2A_DOORBELL_ENTRY_1_CTRL,
 						  S2A_DOORBELL_PORT1_AWADDR_31_28_VALUE,

@@ -29,15 +29,23 @@ static const struct nla_policy hsr_policy[IFLA_HSR_MAX + 1] = {
 /* Here, it seems a netdevice has already been allocated for us, and the
  * hsr_dev_setup routine has been executed. Nice!
  */
-static int hsr_newlink(struct net *src_net, struct net_device *dev,
-		       struct nlattr *tb[], struct nlattr *data[],
+static int hsr_newlink(struct net_device *dev,
+		       struct rtnl_newlink_params *params,
 		       struct netlink_ext_ack *extack)
 {
+	struct net *link_net = rtnl_newlink_link_net(params);
+	struct net_device *link[2], *interlink = NULL;
+	struct nlattr **data = params->data;
 	enum hsr_version proto_version;
 	unsigned char multicast_spec;
 	u8 proto = HSR_PROTOCOL_HSR;
 
-	struct net_device *link[2], *interlink = NULL;
+	if (!net_eq(link_net, dev_net(dev))) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "HSR slaves/interlink must be on the same net namespace than HSR link");
+		return -EINVAL;
+	}
+
 	if (!data) {
 		NL_SET_ERR_MSG_MOD(extack, "No slave devices specified");
 		return -EINVAL;
@@ -46,7 +54,7 @@ static int hsr_newlink(struct net *src_net, struct net_device *dev,
 		NL_SET_ERR_MSG_MOD(extack, "Slave1 device not specified");
 		return -EINVAL;
 	}
-	link[0] = __dev_get_by_index(src_net,
+	link[0] = __dev_get_by_index(link_net,
 				     nla_get_u32(data[IFLA_HSR_SLAVE1]));
 	if (!link[0]) {
 		NL_SET_ERR_MSG_MOD(extack, "Slave1 does not exist");
@@ -56,7 +64,7 @@ static int hsr_newlink(struct net *src_net, struct net_device *dev,
 		NL_SET_ERR_MSG_MOD(extack, "Slave2 device not specified");
 		return -EINVAL;
 	}
-	link[1] = __dev_get_by_index(src_net,
+	link[1] = __dev_get_by_index(link_net,
 				     nla_get_u32(data[IFLA_HSR_SLAVE2]));
 	if (!link[1]) {
 		NL_SET_ERR_MSG_MOD(extack, "Slave2 does not exist");
@@ -68,9 +76,14 @@ static int hsr_newlink(struct net *src_net, struct net_device *dev,
 		return -EINVAL;
 	}
 
-	if (data[IFLA_HSR_INTERLINK])
-		interlink = __dev_get_by_index(src_net,
+	if (data[IFLA_HSR_INTERLINK]) {
+		interlink = __dev_get_by_index(link_net,
 					       nla_get_u32(data[IFLA_HSR_INTERLINK]));
+		if (!interlink) {
+			NL_SET_ERR_MSG_MOD(extack, "Interlink does not exist");
+			return -EINVAL;
+		}
+	}
 
 	if (interlink && interlink == link[0]) {
 		NL_SET_ERR_MSG_MOD(extack, "Interlink and Slave1 are the same");
@@ -108,14 +121,8 @@ static int hsr_newlink(struct net *src_net, struct net_device *dev,
 		}
 	}
 
-	if (proto == HSR_PROTOCOL_PRP) {
+	if (proto == HSR_PROTOCOL_PRP)
 		proto_version = PRP_V1;
-		if (interlink) {
-			NL_SET_ERR_MSG_MOD(extack,
-					   "Interlink only works with HSR");
-			return -EINVAL;
-		}
-	}
 
 	return hsr_dev_finalize(dev, link, interlink, multicast_spec,
 				proto_version, extack);
@@ -140,36 +147,61 @@ static void hsr_dellink(struct net_device *dev, struct list_head *head)
 	unregister_netdevice_queue(dev, head);
 }
 
-static int hsr_fill_info(struct sk_buff *skb, const struct net_device *dev)
+/* RCU variant of hsr_port_get_hsr() */
+static struct hsr_port *hsr_port_get_hsr_rcu(const struct hsr_priv *hsr,
+					     enum hsr_port_type pt)
 {
-	struct hsr_priv *hsr = netdev_priv(dev);
-	u8 proto = HSR_PROTOCOL_HSR;
 	struct hsr_port *port;
 
-	port = hsr_port_get_hsr(hsr, HSR_PT_SLAVE_A);
+	hsr_for_each_port(hsr, port)
+		if (port->type == pt)
+			return port;
+	return NULL;
+}
+
+static int hsr_fill_info(struct sk_buff *skb, const struct net_device *dev)
+{
+	const struct hsr_priv *hsr = netdev_priv(dev);
+	const struct hsr_port *port;
+	u8 proto = HSR_PROTOCOL_HSR;
+
+	rcu_read_lock();
+
+	port = hsr_port_get_hsr_rcu(hsr, HSR_PT_SLAVE_A);
 	if (port) {
 		if (nla_put_u32(skb, IFLA_HSR_SLAVE1, port->dev->ifindex))
 			goto nla_put_failure;
 	}
 
-	port = hsr_port_get_hsr(hsr, HSR_PT_SLAVE_B);
+	port = hsr_port_get_hsr_rcu(hsr, HSR_PT_SLAVE_B);
 	if (port) {
 		if (nla_put_u32(skb, IFLA_HSR_SLAVE2, port->dev->ifindex))
 			goto nla_put_failure;
 	}
 
+	port = hsr_port_get_hsr_rcu(hsr, HSR_PT_INTERLINK);
+	if (port) {
+		if (nla_put_u32(skb, IFLA_HSR_INTERLINK, port->dev->ifindex))
+			goto nla_put_failure;
+	}
+
+	rcu_read_unlock();
+
 	if (nla_put(skb, IFLA_HSR_SUPERVISION_ADDR, ETH_ALEN,
 		    hsr->sup_multicast_addr) ||
-	    nla_put_u16(skb, IFLA_HSR_SEQ_NR, hsr->sequence_nr))
-		goto nla_put_failure;
+	    nla_put_u16(skb, IFLA_HSR_SEQ_NR, READ_ONCE(hsr->sequence_nr)))
+		return -EMSGSIZE;
 	if (hsr->prot_version == PRP_V1)
 		proto = HSR_PROTOCOL_PRP;
+	else if (nla_put_u8(skb, IFLA_HSR_VERSION, hsr->prot_version))
+		return -EMSGSIZE;
 	if (nla_put_u8(skb, IFLA_HSR_PROTOCOL, proto))
-		goto nla_put_failure;
+		return -EMSGSIZE;
 
 	return 0;
 
 nla_put_failure:
+	rcu_read_unlock();
 	return -EMSGSIZE;
 }
 
@@ -231,7 +263,8 @@ void hsr_nl_ringerror(struct hsr_priv *hsr, unsigned char addr[ETH_ALEN],
 		goto nla_put_failure;
 
 	genlmsg_end(skb, msg_head);
-	genlmsg_multicast(&hsr_genl_family, skb, 0, 0, GFP_ATOMIC);
+	genlmsg_multicast_netns(&hsr_genl_family, dev_net(port->dev),
+				skb, 0, 0, GFP_ATOMIC);
 
 	return;
 
@@ -267,8 +300,12 @@ void hsr_nl_nodedown(struct hsr_priv *hsr, unsigned char addr[ETH_ALEN])
 	if (res < 0)
 		goto nla_put_failure;
 
+	rcu_read_lock();
+	master = hsr_port_get_hsr(hsr, HSR_PT_MASTER);
 	genlmsg_end(skb, msg_head);
-	genlmsg_multicast(&hsr_genl_family, skb, 0, 0, GFP_ATOMIC);
+	genlmsg_multicast_netns(&hsr_genl_family, dev_net(master->dev),
+				skb, 0, 0, GFP_ATOMIC);
+	rcu_read_unlock();
 
 	return;
 

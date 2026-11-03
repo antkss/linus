@@ -3,7 +3,7 @@
  * Copyright (C) 2020 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <darrick.wong@oracle.com>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -134,6 +134,7 @@ xfs_btree_stage_ifakeroot(
 	cur->bc_ino.ifake = ifake;
 	cur->bc_nlevels = ifake->if_levels;
 	cur->bc_ino.forksize = ifake->if_fork_size;
+	cur->bc_ino.whichfork = XFS_STAGING_FORK;
 	cur->bc_flags |= XFS_BTREE_STAGING;
 }
 
@@ -247,11 +248,10 @@ xfs_btree_bload_drop_buf(
 		return 0;
 
 	/*
-	 * Mark this buffer XBF_DONE (i.e. uptodate) so that a subsequent
-	 * xfs_buf_read will not pointlessly reread the contents from the disk.
+	 * Mark this buffer uptodate so that a subsequent xfs_buf_read will
+	 * not pointlessly reread the contents from the disk.
 	 */
-	bp->b_flags |= XBF_DONE;
-
+	xfs_buf_set_uptodate(bp);
 	xfs_buf_delwri_queue_here(bp, buffers_list);
 	xfs_buf_relse(bp);
 	*bpp = NULL;
@@ -308,7 +308,7 @@ xfs_btree_bload_prep_block(
 
 		/* Initialize it and send it out. */
 		xfs_btree_init_block(cur->bc_mp, ifp->if_broot, cur->bc_ops,
-				level, nr_this_block, cur->bc_ino.ip->i_ino);
+				level, nr_this_block, I_INO(cur->bc_ino.ip));
 
 		*bpp = NULL;
 		*blockp = ifp->if_broot;
@@ -336,8 +336,10 @@ xfs_btree_bload_prep_block(
 		xfs_btree_set_sibling(cur, *blockp, &new_ptr, XFS_BB_RIGHTSIB);
 
 	ret = xfs_btree_bload_drop_buf(bbl, buffers_list, bpp);
-	if (ret)
+	if (ret) {
+		xfs_buf_relse(new_bp);
 		return ret;
+	}
 
 	/* Initialize the new btree block. */
 	xfs_btree_init_block_cur(cur, new_bp, level, nr_this_block);
@@ -573,6 +575,7 @@ xfs_btree_bload_compute_geometry(
 	struct xfs_btree_bload	*bbl,
 	uint64_t		nr_records)
 {
+	const struct xfs_btree_ops *ops = cur->bc_ops;
 	uint64_t		nr_blocks = 0;
 	uint64_t		nr_this_level;
 
@@ -599,7 +602,7 @@ xfs_btree_bload_compute_geometry(
 		xfs_btree_bload_level_geometry(cur, bbl, level, nr_this_level,
 				&avg_per_block, &level_blocks, &dontcare64);
 
-		if (cur->bc_ops->type == XFS_BTREE_TYPE_INODE) {
+		if (ops->type == XFS_BTREE_TYPE_INODE) {
 			/*
 			 * If all the items we want to store at this level
 			 * would fit in the inode root block, then we have our
@@ -607,7 +610,9 @@ xfs_btree_bload_compute_geometry(
 			 *
 			 * Note that bmap btrees forbid records in the root.
 			 */
-			if (level != 0 && nr_this_level <= avg_per_block) {
+			if ((level != 0 ||
+			     (ops->geom_flags & XFS_BTGEO_IROOT_RECORDS)) &&
+			    nr_this_level <= avg_per_block) {
 				nr_blocks++;
 				break;
 			}
@@ -658,7 +663,7 @@ xfs_btree_bload_compute_geometry(
 		return -EOVERFLOW;
 
 	bbl->btree_height = cur->bc_nlevels;
-	if (cur->bc_ops->type == XFS_BTREE_TYPE_INODE)
+	if (ops->type == XFS_BTREE_TYPE_INODE)
 		bbl->nr_blocks = nr_blocks - 1;
 	else
 		bbl->nr_blocks = nr_blocks;

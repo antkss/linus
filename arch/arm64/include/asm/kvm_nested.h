@@ -23,6 +23,7 @@ static inline u64 tcr_el2_ps_to_tcr_el1_ips(u64 tcr_el2)
 static inline u64 translate_tcr_el2_to_tcr_el1(u64 tcr)
 {
 	return TCR_EPD1_MASK |				/* disable TTBR1_EL1 */
+	       ((tcr & TCR_EL2_DS) ? TCR_DS : 0) |
 	       ((tcr & TCR_EL2_TBI) ? TCR_TBI0 : 0) |
 	       tcr_el2_ps_to_tcr_el1_ips(tcr) |
 	       (tcr & TCR_EL2_TG0_MASK) |
@@ -33,14 +34,14 @@ static inline u64 translate_tcr_el2_to_tcr_el1(u64 tcr)
 
 static inline u64 translate_cptr_el2_to_cpacr_el1(u64 cptr_el2)
 {
-	u64 cpacr_el1 = CPACR_ELx_RES1;
+	u64 cpacr_el1 = CPACR_EL1_RES1;
 
 	if (cptr_el2 & CPTR_EL2_TTA)
-		cpacr_el1 |= CPACR_ELx_TTA;
+		cpacr_el1 |= CPACR_EL1_TTA;
 	if (!(cptr_el2 & CPTR_EL2_TFP))
-		cpacr_el1 |= CPACR_ELx_FPEN;
+		cpacr_el1 |= CPACR_EL1_FPEN;
 	if (!(cptr_el2 & CPTR_EL2_TZ))
-		cpacr_el1 |= CPACR_ELx_ZEN;
+		cpacr_el1 |= CPACR_EL1_ZEN;
 
 	cpacr_el1 |= cptr_el2 & (CPTR_EL2_TCPAC | CPTR_EL2_TAM);
 
@@ -64,7 +65,9 @@ static inline u64 translate_ttbr0_el2_to_ttbr0_el1(u64 ttbr0)
 }
 
 extern bool forward_smc_trap(struct kvm_vcpu *vcpu);
-extern void kvm_init_nested(struct kvm *kvm);
+extern bool forward_debug_exception(struct kvm_vcpu *vcpu);
+extern int kvm_init_nested(struct kvm *kvm);
+extern void kvm_destroy_nested(struct kvm *kvm);
 extern int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu);
 extern void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu);
 extern struct kvm_s2_mmu *lookup_s2_mmu(struct kvm_vcpu *vcpu);
@@ -75,10 +78,19 @@ extern void kvm_s2_mmu_iterate_by_vmid(struct kvm *kvm, u16 vmid,
 				       const union tlbi_info *info,
 				       void (*)(struct kvm_s2_mmu *,
 						const union tlbi_info *));
+extern void kvm_record_guest_s2_mapping(struct kvm_s2_mmu *mmu, gpa_t canonical_ipa,
+					gpa_t nested_ipa, size_t map_size,
+					struct kvm_guest_s2_mapping *mapping);
+extern void kvm_remove_guest_s2_mappings(struct kvm_s2_mmu *mmu,
+					 gpa_t nipa, size_t size);
 extern void kvm_vcpu_load_hw_mmu(struct kvm_vcpu *vcpu);
 extern void kvm_vcpu_put_hw_mmu(struct kvm_vcpu *vcpu);
 
 extern void check_nested_vcpu_requests(struct kvm_vcpu *vcpu);
+extern void kvm_nested_flush_hwstate(struct kvm_vcpu *vcpu);
+extern void kvm_nested_sync_hwstate(struct kvm_vcpu *vcpu);
+
+extern void kvm_nested_setup_mdcr_el2(struct kvm_vcpu *vcpu);
 
 struct kvm_s2_trans {
 	phys_addr_t output;
@@ -115,9 +127,42 @@ static inline bool kvm_s2_trans_writable(struct kvm_s2_trans *trans)
 	return trans->writable;
 }
 
-static inline bool kvm_s2_trans_executable(struct kvm_s2_trans *trans)
+static inline bool kvm_has_xnx(struct kvm *kvm)
 {
-	return !(trans->desc & BIT(54));
+	return cpus_have_final_cap(ARM64_HAS_XNX) &&
+		kvm_has_feat(kvm, ID_AA64MMFR1_EL1, XNX, IMP);
+}
+
+static inline bool kvm_s2_trans_exec_el0(struct kvm *kvm, struct kvm_s2_trans *trans)
+{
+	u8 xn = FIELD_GET(KVM_PTE_LEAF_ATTR_HI_S2_XN, trans->desc);
+
+	if (!kvm_has_xnx(kvm))
+		xn &= 0b10;
+
+	switch (xn) {
+	case 0b00:
+	case 0b01:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline bool kvm_s2_trans_exec_el1(struct kvm *kvm, struct kvm_s2_trans *trans)
+{
+	u8 xn = FIELD_GET(KVM_PTE_LEAF_ATTR_HI_S2_XN, trans->desc);
+
+	if (!kvm_has_xnx(kvm))
+		xn &= 0b10;
+
+	switch (xn) {
+	case 0b00:
+	case 0b11:
+		return true;
+	default:
+		return false;
+	}
 }
 
 extern int kvm_walk_nested_s2(struct kvm_vcpu *vcpu, phys_addr_t gipa,
@@ -126,6 +171,8 @@ extern int kvm_s2_handle_perm_fault(struct kvm_vcpu *vcpu,
 				    struct kvm_s2_trans *trans);
 extern int kvm_inject_s2_fault(struct kvm_vcpu *vcpu, u64 esr_el2);
 extern void kvm_nested_s2_wp(struct kvm *kvm);
+extern void kvm_nested_unmap_cipa_range(struct kvm *kvm, gpa_t cipa,
+					size_t unmap_size, bool may_block);
 extern void kvm_nested_s2_unmap(struct kvm *kvm, bool may_block);
 extern void kvm_nested_s2_flush(struct kvm *kvm);
 
@@ -186,7 +233,8 @@ static inline bool kvm_supported_tlbi_s1e2_op(struct kvm_vcpu *vpcu, u32 instr)
 	return true;
 }
 
-int kvm_init_nv_sysregs(struct kvm *kvm);
+int kvm_init_nv_sysregs(struct kvm_vcpu *vcpu);
+u64 limit_nv_id_reg(struct kvm *kvm, u32 reg, u64 val);
 
 #ifdef CONFIG_ARM64_PTR_AUTH
 bool kvm_auth_eretax(struct kvm_vcpu *vcpu, u64 *elr);
@@ -229,7 +277,52 @@ static inline u64 kvm_encode_nested_level(struct kvm_s2_trans *trans)
 		shift;							\
 	})
 
-static inline unsigned int ps_to_output_size(unsigned int ps)
+static inline u64 decode_range_tlbi(u64 val, u64 *range, u16 *asid)
+{
+	u64 base, tg, num, scale;
+	int shift;
+
+	tg	= FIELD_GET(GENMASK(47, 46), val);
+
+	switch(tg) {
+	case 1:
+		shift = 12;
+		break;
+	case 2:
+		shift = 14;
+		break;
+	case 3:
+	default:		/* IMPDEF: handle tg==0 as 64k */
+		shift = 16;
+		break;
+	}
+
+	base	= (val & GENMASK(36, 0)) << shift;
+
+	/*
+	 * We only deal with at most 48bit VA/IPA, so 48 is where we
+	 * sign-extend from. Should we support FEAT_L{VP}A* at some point,
+	 * this will need to be revisited.
+	 */
+	base	= (u64)sign_extend64(base, 48);
+
+	if (asid)
+		*asid = FIELD_GET(TLBIR_ASID_MASK, val);
+
+	scale	= FIELD_GET(GENMASK(45, 44), val);
+	num	= FIELD_GET(GENMASK(43, 39), val);
+	*range	= __TLBI_RANGE_PAGES(num, scale) << shift;
+
+	/* Cap the range to the correct half of the address space */
+	if (!(base & BIT(48)))
+		*range = min(*range, (BIT(48) - base));
+	else
+		*range = min(*range, ~base + 1);
+
+	return base;
+}
+
+static inline unsigned int ps_to_output_size(unsigned int ps, bool pa52bit)
 {
 	switch (ps) {
 	case 0: return 32;
@@ -237,10 +330,119 @@ static inline unsigned int ps_to_output_size(unsigned int ps)
 	case 2: return 40;
 	case 3: return 42;
 	case 4: return 44;
-	case 5:
+	case 5: return 48;
+	case 6: if (pa52bit)
+			return 52;
+		fallthrough;
 	default:
 		return 48;
 	}
 }
+
+enum trans_regime {
+	TR_EL10,
+	TR_EL20,
+	TR_EL2,
+};
+
+struct s1_walk_info;
+
+struct s1_walk_context {
+	struct s1_walk_info	*wi;
+	u64			table_ipa;
+	int			level;
+};
+
+struct s1_walk_filter {
+	int	(*fn)(struct s1_walk_context *, void *);
+	void	*priv;
+};
+
+struct s1_walk_info {
+	struct s1_walk_filter	*filter;
+	u64	     		baddr;
+	enum trans_regime	regime;
+	unsigned int		max_oa_bits;
+	unsigned int		pgshift;
+	unsigned int		txsz;
+	int 	     		sl;
+	u8			sh;
+	bool			as_el0;
+	bool	     		hpd;
+	bool			e0poe;
+	bool			poe;
+	bool			pan;
+	bool	     		be;
+	bool	     		s2;
+	bool			pa52bit;
+	bool			ha;
+};
+
+struct s1_walk_result {
+	union {
+		struct {
+			u64	desc;
+			u64	pa;
+			s8	level;
+			u8	APTable;
+			bool	nG;
+			u16	asid;
+			bool	UXNTable;
+			bool	PXNTable;
+			bool	uwxn;
+			bool	uov;
+			bool	ur;
+			bool	uw;
+			bool	ux;
+			bool	pwxn;
+			bool	pov;
+			bool	pr;
+			bool	pw;
+			bool	px;
+		};
+		struct {
+			u8	fst;
+			bool	ptw;
+			bool	s2;
+		};
+	};
+	bool	failed;
+};
+
+#define S1_MMU_DISABLED		(-127)
+
+static inline void fail_s1_walk(struct s1_walk_result *wr, u8 fst, bool s1ptw)
+{
+	wr->fst		= fst;
+	wr->ptw		= s1ptw;
+	wr->s2		= s1ptw;
+	wr->failed	= true;
+}
+
+static inline bool s1_walk_translated(struct s1_walk_result *wr)
+{
+	return wr->level != S1_MMU_DISABLED;
+}
+
+int __kvm_translate_va(struct kvm_vcpu *vcpu, struct s1_walk_info *wi,
+		       struct s1_walk_result *wr, u64 va);
+int __kvm_find_s1_desc_level(struct kvm_vcpu *vcpu, u64 va, u64 ipa,
+			     int *level);
+
+/* VNCR management */
+int kvm_vcpu_allocate_vncr_tlb(struct kvm_vcpu *vcpu);
+int kvm_handle_vncr_abort(struct kvm_vcpu *vcpu);
+void kvm_handle_s1e2_tlbi(struct kvm_vcpu *vcpu, u32 inst, u64 val);
+
+u16 get_asid_by_regime(struct kvm_vcpu *vcpu, enum trans_regime regime);
+
+#define vncr_fixmap(c)						\
+	({							\
+		u32 __c = (c);					\
+		BUG_ON(__c >= NR_CPUS);				\
+		(FIX_VNCR - __c);				\
+	})
+
+int __kvm_at_swap_desc(struct kvm *kvm, gpa_t ipa, u64 old, u64 new);
 
 #endif /* __ARM64_KVM_NESTED_H */

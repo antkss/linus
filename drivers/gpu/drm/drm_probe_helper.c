@@ -119,6 +119,7 @@ drm_mode_validate_pipeline(struct drm_display_mode *mode,
 		*status = drm_bridge_chain_mode_valid(bridge,
 						      &connector->display_info,
 						      mode);
+		drm_bridge_put(bridge);
 		if (*status != MODE_OK) {
 			/* There is also no point in continuing for crtc check
 			 * here. */
@@ -202,7 +203,7 @@ enum drm_mode_status drm_encoder_mode_valid(struct drm_encoder *encoder,
 
 int
 drm_connector_mode_valid(struct drm_connector *connector,
-			 struct drm_display_mode *mode,
+			 const struct drm_display_mode *mode,
 			 struct drm_modeset_acquire_ctx *ctx,
 			 enum drm_mode_status *status)
 {
@@ -338,10 +339,23 @@ void drm_kms_helper_poll_reschedule(struct drm_device *dev)
 }
 EXPORT_SYMBOL(drm_kms_helper_poll_reschedule);
 
+static int detect_connector_status(struct drm_connector *connector,
+				   struct drm_modeset_acquire_ctx *ctx,
+				   bool force)
+{
+	const struct drm_connector_helper_funcs *funcs = connector->helper_private;
+
+	if (funcs->detect_ctx)
+		return funcs->detect_ctx(connector, ctx, force);
+	else if (connector->funcs->detect)
+		return connector->funcs->detect(connector, force);
+
+	return connector_status_connected;
+}
+
 static enum drm_connector_status
 drm_helper_probe_detect_ctx(struct drm_connector *connector, bool force)
 {
-	const struct drm_connector_helper_funcs *funcs = connector->helper_private;
 	struct drm_modeset_acquire_ctx ctx;
 	int ret;
 
@@ -349,14 +363,8 @@ drm_helper_probe_detect_ctx(struct drm_connector *connector, bool force)
 
 retry:
 	ret = drm_modeset_lock(&connector->dev->mode_config.connection_mutex, &ctx);
-	if (!ret) {
-		if (funcs->detect_ctx)
-			ret = funcs->detect_ctx(connector, &ctx, force);
-		else if (connector->funcs->detect)
-			ret = connector->funcs->detect(connector, force);
-		else
-			ret = connector_status_connected;
-	}
+	if (!ret)
+		ret = detect_connector_status(connector, &ctx, force);
 
 	if (ret == -EDEADLK) {
 		drm_modeset_backoff(&ctx);
@@ -390,7 +398,6 @@ drm_helper_probe_detect(struct drm_connector *connector,
 			struct drm_modeset_acquire_ctx *ctx,
 			bool force)
 {
-	const struct drm_connector_helper_funcs *funcs = connector->helper_private;
 	struct drm_device *dev = connector->dev;
 	int ret;
 
@@ -401,12 +408,7 @@ drm_helper_probe_detect(struct drm_connector *connector,
 	if (ret)
 		return ret;
 
-	if (funcs->detect_ctx)
-		ret = funcs->detect_ctx(connector, ctx, force);
-	else if (connector->funcs->detect)
-		ret = connector->funcs->detect(connector, force);
-	else
-		ret = connector_status_connected;
+	ret = detect_connector_status(connector, ctx, force);
 
 	if (ret != connector->status)
 		connector->epoch_counter += 1;
@@ -557,6 +559,7 @@ static int __drm_helper_update_and_validate(struct drm_connector *connector,
 int drm_helper_probe_single_connector_modes(struct drm_connector *connector,
 					    uint32_t maxX, uint32_t maxY)
 {
+	const struct drm_connector_helper_funcs *funcs = connector->helper_private;
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
 	int count = 0, ret;
@@ -590,8 +593,20 @@ retry:
 			connector->status = connector_status_connected;
 		else
 			connector->status = connector_status_disconnected;
-		if (connector->funcs->force)
+
+		if (funcs && funcs->force_ctx) {
+			ret = funcs->force_ctx(connector, &ctx);
+			if (ret == -EDEADLK) {
+				connector->status = old_status;
+				drm_modeset_backoff(&ctx);
+				goto retry;
+			} else if (ret < 0) {
+				drm_dbg_kms(dev, "[CONNECTOR:%d:%s] force_ctx failed: %d\n",
+					    connector->base.id, connector->name, ret);
+			}
+		} else if (connector->funcs->force) {
 			connector->funcs->force(connector);
+		}
 	} else {
 		ret = drm_helper_probe_detect(connector, &ctx, true);
 
@@ -624,7 +639,7 @@ retry:
 		 */
 		dev->mode_config.delayed_event = true;
 		if (dev->mode_config.poll_enabled)
-			mod_delayed_work(system_wq,
+			mod_delayed_work(system_percpu_wq,
 					 &dev->mode_config.output_poll_work,
 					 0);
 	}
@@ -758,27 +773,32 @@ static void output_poll_execute(struct work_struct *work)
 	struct drm_connector *connector;
 	struct drm_connector_list_iter conn_iter;
 	enum drm_connector_status old_status;
-	bool repoll = false, changed;
+	bool repoll = false, changed = false;
 	u64 old_epoch_counter;
 
 	if (!dev->mode_config.poll_enabled)
 		return;
-
-	/* Pick up any changes detected by the probe functions. */
-	changed = dev->mode_config.delayed_event;
-	dev->mode_config.delayed_event = false;
 
 	if (!drm_kms_helper_poll) {
 		if (dev->mode_config.poll_running) {
 			drm_kms_helper_disable_hpd(dev);
 			dev->mode_config.poll_running = false;
 		}
-		goto out;
+
+		scoped_guard(mutex, &dev->mode_config.mutex) {
+			changed = dev->mode_config.delayed_event;
+			dev->mode_config.delayed_event = false;
+		}
+
+		if (changed)
+			drm_kms_helper_hotplug_event(dev);
+
+		return;
 	}
 
 	if (!mutex_trylock(&dev->mode_config.mutex)) {
-		repoll = true;
-		goto out;
+		schedule_delayed_work(delayed_work, DRM_OUTPUT_POLL_PERIOD);
+		return;
 	}
 
 	drm_connector_list_iter_begin(dev, &conn_iter);
@@ -834,16 +854,23 @@ static void output_poll_execute(struct work_struct *work)
 				    connector->base.id, connector->name,
 				    old_epoch_counter, connector->epoch_counter);
 
+			drm_sysfs_connector_hotplug_event(connector);
 			changed = true;
 		}
 	}
 	drm_connector_list_iter_end(&conn_iter);
 
+	/* Pick up any changes detected by the probe functions. */
+	if (dev->mode_config.delayed_event) {
+		dev->mode_config.delayed_event = false;
+		changed = true;
+		drm_sysfs_hotplug_event(dev);
+	}
+
 	mutex_unlock(&dev->mode_config.mutex);
 
-out:
 	if (changed)
-		drm_kms_helper_hotplug_event(dev);
+		drm_client_dev_hotplug(dev);
 
 	if (repoll)
 		schedule_delayed_work(delayed_work, DRM_OUTPUT_POLL_PERIOD);
@@ -957,15 +984,16 @@ static void drm_kms_helper_poll_init_release(struct drm_device *dev, void *res)
  * cleaned up when the DRM device goes away.
  *
  * See drm_kms_helper_poll_init() for more information.
- *
- * Returns:
- * 0 on success, or a negative errno code otherwise.
  */
-int drmm_kms_helper_poll_init(struct drm_device *dev)
+void drmm_kms_helper_poll_init(struct drm_device *dev)
 {
+	int ret;
+
 	drm_kms_helper_poll_init(dev);
 
-	return drmm_add_action_or_reset(dev, drm_kms_helper_poll_init_release, dev);
+	ret = drmm_add_action_or_reset(dev, drm_kms_helper_poll_init_release, dev);
+	if (ret)
+		drm_warn(dev, "Connector status will not be updated, error %d\n", ret);
 }
 EXPORT_SYMBOL(drmm_kms_helper_poll_init);
 
@@ -1078,9 +1106,9 @@ EXPORT_SYMBOL(drm_connector_helper_hpd_irq_event);
  */
 bool drm_helper_hpd_irq_event(struct drm_device *dev)
 {
-	struct drm_connector *connector, *first_changed_connector = NULL;
 	struct drm_connector_list_iter conn_iter;
-	int changed = 0;
+	struct drm_connector *connector;
+	bool changed = false;
 
 	if (!dev->mode_config.poll_enabled)
 		return false;
@@ -1093,24 +1121,15 @@ bool drm_helper_hpd_irq_event(struct drm_device *dev)
 			continue;
 
 		if (check_connector_changed(connector)) {
-			if (!first_changed_connector) {
-				drm_connector_get(connector);
-				first_changed_connector = connector;
-			}
-
-			changed++;
+			changed = true;
+			drm_sysfs_connector_hotplug_event(connector);
 		}
 	}
 	drm_connector_list_iter_end(&conn_iter);
 	mutex_unlock(&dev->mode_config.mutex);
 
-	if (changed == 1)
-		drm_kms_helper_connector_hotplug_event(first_changed_connector);
-	else if (changed > 0)
-		drm_kms_helper_hotplug_event(dev);
-
-	if (first_changed_connector)
-		drm_connector_put(first_changed_connector);
+	if (changed)
+		drm_client_dev_hotplug(dev);
 
 	return changed;
 }

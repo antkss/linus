@@ -184,8 +184,8 @@ def bpftool_prog_list(expected=None, ns="", exclude_orphaned=True):
         progs = [ p for p in progs if not p['orphaned'] ]
     if expected is not None:
         if len(progs) != expected:
-            fail(True, "%d BPF programs loaded, expected %d" %
-                 (len(progs), expected))
+            fail(True, "%d BPF programs loaded, expected %d\nLoaded Progs:\n%s" %
+                 (len(progs), expected, pp.pformat(progs)))
     return progs
 
 def bpftool_map_list(expected=None, ns=""):
@@ -207,20 +207,24 @@ def bpftool_prog_list_wait(expected=0, n_retry=20):
     raise Exception("Time out waiting for program counts to stabilize want %d, have %d" % (expected, nprogs))
 
 def bpftool_map_list_wait(expected=0, n_retry=20, ns=""):
+    nmaps = None
     for i in range(n_retry):
         maps = bpftool_map_list(ns=ns)
-        if len(maps) == expected:
+        nmaps = len(maps)
+        if nmaps == expected:
             return maps
         time.sleep(0.05)
     raise Exception("Time out waiting for map counts to stabilize want %d, have %d" % (expected, nmaps))
 
 def bpftool_prog_load(sample, file_name, maps=[], prog_type="xdp", dev=None,
-                      fail=True, include_stderr=False):
+                      fail=True, include_stderr=False, dev_bind=None):
     args = "prog load %s %s" % (os.path.join(bpf_test_dir, sample), file_name)
     if prog_type is not None:
         args += " type " + prog_type
     if dev is not None:
         args += " dev " + dev
+    elif dev_bind is not None:
+        args += " xdpmeta_dev " + dev_bind
     if len(maps):
         args += " map " + " map ".join(maps)
 
@@ -448,6 +452,38 @@ class BpfNetdevSim(NetdevSim):
         self.tc_add_ingress()
         self.wait_for_flush(bound=bound, total=total)
 
+    def tc_add_block(self, block, fail=True, include_stderr=False):
+        return tc("qdisc add dev %s ingress_block %d clsact" %
+                  (self['ifname'], block), fail=fail,
+                  include_stderr=include_stderr)
+
+    def tc_del_block(self, block):
+        tc("qdisc del dev %s clsact" % (self['ifname']), fail=False)
+
+    def tc_add_block_filter(self, block, bpf, op="add", prio=None, handle=None,
+                            da=False, verbose=False, skip_sw=False,
+                            skip_hw=False, fail=True, include_stderr=False):
+        spec = ""
+        if prio is not None:
+            spec += " prio %d" % (prio)
+        if handle:
+            spec += " handle %s" % (handle)
+
+        params = ""
+        if da:
+            params += " da"
+        if verbose:
+            params += " verbose"
+        if skip_sw:
+            params += " skip_sw"
+        if skip_hw:
+            params += " skip_hw"
+
+        return tc("filter {op} block {block} {spec} bpf {bpf} {params}"
+                  .format(op=op, block=block, spec=spec, bpf=bpf,
+                          params=params),
+                  fail=fail, include_stderr=include_stderr)
+
     def tc_show_ingress(self, expected=None):
         # No JSON support, oh well...
         flags = ["skip_sw", "skip_hw", "in_hw"]
@@ -625,6 +661,111 @@ def test_spurios_extack(sim, obj, skip_hw, needle):
                             include_stderr=True)
     check_no_extack(res, needle)
 
+def test_tc_shared_block():
+    """
+    Device-bound cls_bpf program attached through a shared block.
+    """
+    # A shared block has no qdisc, so the target device is derived from the
+    # block's bound netdevs and the program must match every member, since
+    # the offload path broadcasts it to every callback on the block.  A
+    # netdev joining a populated block later is replayed the stored filter
+    # before it is inserted into block->ports, so the driver callback must
+    # enforce the device match as well.
+    simdev = BpfNetdevSimDev()
+    sim, = simdev.nsims
+    sim.set_ethtool_tc_offloads(True)
+
+    start_test("Test TC shared-block load dev-bound program...")
+    bpftool_prog_load("sample_ret0.bpf.o", "/sys/fs/bpf/tc_shared",
+                      prog_type="classifier", dev=sim['ifname'])
+
+    start_test("Test TC shared-block dev-bound attach...")
+    # The pinned program is dev-bound to this device; attaching it through
+    # a shared block must succeed even though block->q is NULL.
+    sim.tc_add_block(22)
+    # err is kept (include_stderr) for post-mortem value on a failure.
+    ret, _, err = sim.tc_add_block_filter(22, bpf_pinned("/sys/fs/bpf/tc_shared"),
+                                          da=True, skip_sw=True,
+                                          fail=False, include_stderr=True)
+    fail(ret != 0, "dev-bound program rejected on a matching shared block")
+    fail(sim.dfs_read("bpf_offloaded_id") == "0",
+         "dev-bound program not offloaded on a matching shared block")
+    sim.tc_del_block(22)
+
+    start_test("Test TC shared-block broadcast to a foreign member...")
+    # Add an independently backed device to the SAME block before the
+    # attach.  The program is bound to sim's device only, and the offload
+    # path fans it out to every member, so the attach must be rejected.
+    simdev2 = BpfNetdevSimDev()
+    sim2, = simdev2.nsims
+    sim2.set_ethtool_tc_offloads(True)
+    sim.tc_add_block(40)
+    sim2.tc_add_block(40)
+    ret, _, err = sim.tc_add_block_filter(40, bpf_pinned("/sys/fs/bpf/tc_shared"),
+                                          da=True, skip_sw=True,
+                                          fail=False, include_stderr=True)
+    fail(ret == 0, "dev-bound program broadcast to a foreign shared-block member")
+    check_extack(err, "Program is not bound to every device in the block.", args)
+    sim2.tc_del_block(40)
+    sim.tc_del_block(40)
+    simdev2.remove()
+
+    start_test("Test TC shared-block late join replay...")
+    # Build a block owned by sim's device with the matching program
+    # installed, then let an independently backed device join it.  The
+    # join replays the stored filter to the joining device's callback
+    # before the device is recorded in block->ports; the driver must
+    # reject the replay so the foreign device is never loaded.
+    # sim2 is created here (not inherited) so the TC-offload state it
+    # depends on is explicit.
+    simdev2 = BpfNetdevSimDev()
+    sim2, = simdev2.nsims
+    sim2.set_ethtool_tc_offloads(True)
+    sim.tc_add_block(30)
+    ret, _, err = sim.tc_add_block_filter(30, bpf_pinned("/sys/fs/bpf/tc_shared"),
+                                          da=True, skip_sw=True,
+                                          fail=False, include_stderr=True)
+    fail(ret != 0, "dev-bound program rejected on a matching shared block")
+    ret, _, err = sim2.tc_add_block(30, fail=False, include_stderr=True)
+    fail(ret == 0, "foreign device joined a populated dev-bound shared block")
+    check_extack_nsim(err, "program bound to a different device.", args)
+    fail(sim2.dfs_read("bpf_offloaded_id") != "0",
+         "replayed program loaded onto a foreign device")
+    # The add above was expected to fail, so the qdisc may not exist; the
+    # delete is harmless and only cleans up when it does.
+    sim2.tc_del_block(30)
+    sim.tc_del_block(30)
+    simdev2.remove()
+
+    start_test("Test TC shared-block same-offload-device member...")
+    # A second port of the same netdevsim device shares the offload device,
+    # so a program bound to one port may legitimately be offloaded to both.
+    simdev3 = BpfNetdevSimDev(2)
+    sim3, sim3b = simdev3.nsims
+    sim3.set_ethtool_tc_offloads(True)
+    sim3b.set_ethtool_tc_offloads(True)
+    bpftool_prog_load("sample_ret0.bpf.o", "/sys/fs/bpf/tc_shared_multi",
+                      prog_type="classifier", dev=sim3['ifname'])
+    sim3.tc_add_block(50)
+    sim3b.tc_add_block(50)
+    # err kept for post-mortem value on a failure.
+    ret, _, err = sim3.tc_add_block_filter(50, bpf_pinned("/sys/fs/bpf/tc_shared_multi"),
+                                           da=True, skip_sw=True,
+                                           fail=False, include_stderr=True)
+    fail(ret != 0, "same-offload-device member rejected on a shared block")
+    fail(sim3.dfs_read("bpf_offloaded_id") == "0",
+         "program not offloaded to the bound port")
+    fail(sim3b.dfs_read("bpf_offloaded_id") == "0",
+         "program not offloaded to the same-offload-device port")
+    sim3b.tc_del_block(50)
+    sim3.tc_del_block(50)
+
+    simdev3.remove()
+    simdev.remove()
+    rm("/sys/fs/bpf/tc_shared_multi")
+    rm("/sys/fs/bpf/tc_shared")
+    bpftool_prog_list_wait(expected=0)
+
 def test_multi_prog(simdev, sim, obj, modename, modeid):
     start_test("Test multi-attachment XDP - %s + offload..." %
                (modename or "default", ))
@@ -708,6 +849,7 @@ _, base_maps = bpftool("map")
 base_map_names = [
     'pid_iter.rodata', # created on each bpftool invocation
     'libbpf_det_bind', # created on each bpftool invocation
+    'libbpf_global',
 ]
 
 # Check netdevsim
@@ -978,6 +1120,16 @@ try:
     fail(ret == 0, "attached offloaded XDP program to drv")
     check_extack(err, "Using offloaded program without HW_MODE flag is not supported.", args)
     rm("/sys/fs/bpf/offload")
+    sim.wait_for_flush()
+
+    bpftool_prog_load("sample_ret0.bpf.o", "/sys/fs/bpf/devbound",
+                      dev_bind=sim['ifname'])
+    devbound = bpf_pinned("/sys/fs/bpf/devbound")
+    start_test("Test dev-bound program in generic mode...")
+    ret, _, err = sim.set_xdp(devbound, "generic", fail=False, include_stderr=True)
+    fail(ret == 0, "devbound program in generic mode allowed")
+    check_extack(err, "Can't attach device-bound programs in generic mode.", args)
+    rm("/sys/fs/bpf/devbound")
     sim.wait_for_flush()
 
     start_test("Test XDP load failure...")
@@ -1333,6 +1485,8 @@ try:
     start_test("Test multi-dev ASIC cross-dev destruction - orphaned...")
     ret, out = bpftool("prog show %s" % (progB), fail=False)
     fail(ret != 0, "couldn't get information about orphaned program")
+
+    test_tc_shared_block()
 
     print("%s: OK" % (os.path.basename(__file__)))
 

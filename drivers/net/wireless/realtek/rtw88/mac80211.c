@@ -71,7 +71,7 @@ static void rtw_ops_stop(struct ieee80211_hw *hw, bool suspend)
 	mutex_unlock(&rtwdev->mutex);
 }
 
-static int rtw_ops_config(struct ieee80211_hw *hw, u32 changed)
+static int rtw_ops_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
 {
 	struct rtw_dev *rtwdev = hw->priv;
 	int ret = 0;
@@ -281,12 +281,18 @@ static void rtw_ops_configure_filter(struct ieee80211_hw *hw,
 	struct rtw_dev *rtwdev = hw->priv;
 
 	*new_flags &= FIF_ALLMULTI | FIF_OTHER_BSS | FIF_FCSFAIL |
-		      FIF_BCN_PRBRESP_PROMISC;
+		      FIF_BCN_PRBRESP_PROMISC | FIF_CONTROL;
 
 	mutex_lock(&rtwdev->mutex);
 
 	rtw_leave_lps_deep(rtwdev);
 
+	if (changed_flags & FIF_CONTROL) {
+		if (*new_flags & FIF_CONTROL)
+			rtw_write16(rtwdev, REG_RXFLTMAP1, 0xffff);
+		else
+			rtw_write16(rtwdev, REG_RXFLTMAP1, rtwdev->hal.rxfltmap1);
+	}
 	if (changed_flags & FIF_ALLMULTI) {
 		if (*new_flags & FIF_ALLMULTI)
 			rtwdev->hal.rcr |= BIT_AM;
@@ -396,6 +402,8 @@ static void rtw_ops_bss_info_changed(struct ieee80211_hw *hw,
 			if (rtw_bf_support)
 				rtw_bf_assoc(rtwdev, vif, conf);
 
+			rtw_set_ampdu_factor(rtwdev, vif, conf);
+
 			rtw_fw_beacon_filter_config(rtwdev, true, vif);
 		} else {
 			rtw_leave_lps(rtwdev);
@@ -466,6 +474,7 @@ static int rtw_ops_start_ap(struct ieee80211_hw *hw,
 
 	mutex_lock(&rtwdev->mutex);
 	rtw_write32_set(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
+	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_AP);
 	rtwdev->ap_active = true;
 	rtw_store_op_chan(rtwdev, true);
 	chip->ops->phy_calibration(rtwdev);
@@ -482,6 +491,7 @@ static void rtw_ops_stop_ap(struct ieee80211_hw *hw,
 
 	mutex_lock(&rtwdev->mutex);
 	rtw_write32_clr(rtwdev, REG_TCR, BIT_TCR_UPDATE_HGQMD);
+	rtw_write16(rtwdev, REG_ATIMWND, ATIMWND_DEFAULT);
 	rtwdev->ap_active = false;
 	if (!rtw_core_check_sta_active(rtwdev))
 		rtw_clear_op_chan(rtwdev);
@@ -595,7 +605,7 @@ static int rtw_ops_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		hw_key_idx = key->keyidx;
 	}
 
-	if (hw_key_idx > sec->total_cam_num) {
+	if (hw_key_idx >= sec->total_cam_num) {
 		ret = -ENOSPC;
 		goto out;
 	}
@@ -706,7 +716,8 @@ static void rtw_ops_mgd_prepare_tx(struct ieee80211_hw *hw,
 	mutex_unlock(&rtwdev->mutex);
 }
 
-static int rtw_ops_set_rts_threshold(struct ieee80211_hw *hw, u32 value)
+static int rtw_ops_set_rts_threshold(struct ieee80211_hw *hw, int radio_idx,
+				     u32 value)
 {
 	struct rtw_dev *rtwdev = hw->priv;
 
@@ -795,6 +806,7 @@ static int rtw_ops_set_bitrate_mask(struct ieee80211_hw *hw,
 }
 
 static int rtw_ops_set_antenna(struct ieee80211_hw *hw,
+			       int radio_idx,
 			       u32 tx_antenna,
 			       u32 rx_antenna)
 {
@@ -806,13 +818,14 @@ static int rtw_ops_set_antenna(struct ieee80211_hw *hw,
 		return -EOPNOTSUPP;
 
 	mutex_lock(&rtwdev->mutex);
-	ret = chip->ops->set_antenna(rtwdev, tx_antenna, rx_antenna);
+	ret = chip->ops->set_antenna(rtwdev, -1, tx_antenna, rx_antenna);
 	mutex_unlock(&rtwdev->mutex);
 
 	return ret;
 }
 
 static int rtw_ops_get_antenna(struct ieee80211_hw *hw,
+			       int radio_idx,
 			       u32 *tx_antenna,
 			       u32 *rx_antenna)
 {

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 /* Copyright (C) 2023 MediaTek Inc. */
 
 #ifndef __MT7925_H
@@ -6,6 +6,11 @@
 
 #include "../mt792x.h"
 #include "regs.h"
+
+#define MT7925_FILTER_FCSFAIL		BIT(2)
+#define MT7925_FILTER_CONTROL		BIT(5)
+#define MT7925_FILTER_OTHER_BSS	BIT(6)
+#define MT7925_FILTER_ENABLE		BIT(31)
 
 #define MT7925_BEACON_RATES_TBL		25
 
@@ -15,6 +20,7 @@
 
 #define MT7925_RX_RING_SIZE		1536
 #define MT7925_RX_MCU_RING_SIZE		512
+#define MT7928_RX_MCU_WA_RING_SIZE	512
 
 #define MT7925_EEPROM_SIZE		3584
 #define MT7925_TOKEN_SIZE		8192
@@ -26,6 +32,26 @@
 #define MT7925_SKU_TABLE_SIZE		(MT7925_SKU_RATE_NUM + 1)
 
 #define MCU_UNI_EVENT_ROC  0x27
+
+#define HIF_TRAFFIC_IDLE 0x2
+
+enum {
+	UNI_EVENT_HIF_CTRL_BASIC = 0,
+	UNI_EVENT_HIF_CTRL_TAG_NUM
+};
+
+struct mt7925_mcu_hif_ctrl_basic_tlv {
+	__le16 tag;
+	__le16 len;
+	u8 cid;
+	u8 pad[3];
+	u32 status;
+	u8 hif_type;
+	u8 hif_tx_traffic_status;
+	u8 hif_rx_traffic_status;
+	u8 hifsuspend;
+	u8 rsv[4];
+} __packed;
 
 enum {
 	UNI_ROC_ACQUIRE,
@@ -83,6 +109,12 @@ struct mt7925_uni_beacon_loss_event {
 	struct mt7925_beacon_loss_tlv beacon_loss;
 } __packed;
 
+struct mt7925_uni_rssi_monitor_event {
+		__le16 tag;
+		__le16 len;
+		__le32 rssi;
+} __packed;
+
 #define to_rssi(field, rxv)		((FIELD_GET(field, rxv) - 220) / 2)
 #define to_rcpi(rssi)			(2 * (rssi) + 220)
 
@@ -98,6 +130,26 @@ enum mt7925_rxq_id {
 	MT7925_RXQ_BAND1,
 	MT7925_RXQ_MCU_WM = 0,
 	MT7925_RXQ_MCU_WM2, /* for tx done */
+};
+
+enum mt7927_txq_id {
+	MT7927_TXQ_BAND0 = MT7925_TXQ_BAND0,
+	MT7927_TXQ_BAND1 = MT7925_TXQ_BAND1,
+	MT7927_TXQ_MCU_WM = MT7925_TXQ_MCU_WM,
+	MT7927_TXQ_FWDL = MT7925_TXQ_FWDL,
+};
+
+enum mt7927_rxq_id {
+	MT7927_RXQ_BAND0 = 4,
+	MT7927_RXQ_MCU_WM = 6,
+	MT7927_RXQ_DATA2 = 7,
+};
+
+enum mt7928_rxq_id {
+	MT7928_RXQ_BAND0,
+	MT7928_RXQ_BAND1 = 2,
+	MT7928_RXQ_MCU_WM = 3,
+	MT7928_RXQ_MCU_WM2 = 1, /* for tx done */
 };
 
 enum {
@@ -117,11 +169,18 @@ enum {
 	MT7925_CLC_MAX_NUM,
 };
 
+struct mt7925_clc_rule_v2 {
+	u32 flag;
+	u8 alpha2[2];
+	u8 rsv[10];
+} __packed;
+
 struct mt7925_clc_rule {
 	u8 alpha2[2];
 	u8 type[2];
 	u8 seg_idx;
-	u8 rsv[3];
+	u8 flag; /* UNII4~8 ctrl flag */
+	u8 rsv[2];
 } __packed;
 
 struct mt7925_clc_segment {
@@ -132,14 +191,26 @@ struct mt7925_clc_segment {
 	u8 rsv2[4];
 } __packed;
 
-struct mt7925_clc {
-	__le32 len;
-	u8 idx;
-	u8 ver;
+struct mt7925_clc_type0 {
 	u8 nr_country;
 	u8 type;
 	u8 nr_seg;
 	u8 rsv[7];
+} __packed;
+
+struct mt7925_clc_type2 {
+	u8 type;
+	u8 rsv[9];
+} __packed;
+
+struct mt7925_clc {
+	__le32 len;
+	u8 idx;
+	u8 ver;
+	union {
+		struct mt7925_clc_type0 t0;
+		struct mt7925_clc_type2 t2;
+	};
 	u8 data[];
 } __packed;
 
@@ -147,8 +218,11 @@ enum mt7925_eeprom_field {
 	MT_EE_CHIP_ID =		0x000,
 	MT_EE_VERSION =		0x002,
 	MT_EE_MAC_ADDR =	0x004,
+	MT_EE_HW_TYPE =		0xa71,
 	__MT_EE_MAX =		0x9ff
 };
+
+#define MT_EE_HW_TYPE_ENCAP     GENMASK(1, 0)
 
 enum {
 	TXPWR_USER,
@@ -191,6 +265,18 @@ struct mt7925_txpwr {
 	s8 eht996x3_484[16][2];
 };
 
+static inline u8 mt7927_band_idx(enum nl80211_band band)
+{
+	switch (band) {
+	case NL80211_BAND_2GHZ:
+		return 0;
+	case NL80211_BAND_5GHZ:
+	case NL80211_BAND_6GHZ:
+	default:
+		return 1;
+	}
+}
+
 extern const struct ieee80211_ops mt7925_ops;
 
 int __mt7925_start(struct mt792x_phy *phy);
@@ -202,8 +288,11 @@ int mt7925_mcu_set_bss_pm(struct mt792x_dev *dev,
 			  bool enable);
 int mt7925_mcu_sta_update(struct mt792x_dev *dev,
 			  struct ieee80211_link_sta *link_sta,
-			  struct ieee80211_vif *vif, bool enable,
-			  enum mt76_sta_info_state state);
+			  struct ieee80211_vif *vif,
+			  struct mt792x_link_sta *mlink,
+			  bool enable,
+			  enum mt76_sta_info_state state,
+			  struct mt792x_link_sta *pending);
 int mt7925_mcu_set_chan_info(struct mt792x_phy *phy, u16 tag);
 int mt7925_mcu_set_tx(struct mt792x_dev *dev, struct ieee80211_bss_conf *bss_conf);
 int mt7925_mcu_set_eeprom(struct mt792x_dev *dev);
@@ -243,12 +332,14 @@ int mt7925_mcu_set_beacon_filter(struct mt792x_dev *dev,
 				 bool enable);
 int mt7925_mcu_uni_tx_ba(struct mt792x_dev *dev,
 			 struct ieee80211_ampdu_params *params,
-			 bool enable);
+			 struct ieee80211_vif *vif, bool enable);
 int mt7925_mcu_uni_rx_ba(struct mt792x_dev *dev,
 			 struct ieee80211_ampdu_params *params,
-			 bool enable);
+			 struct ieee80211_vif *vif, bool enable);
+void mt7925_mlo_pm_work(struct work_struct *work);
 void mt7925_scan_work(struct work_struct *work);
 void mt7925_roc_work(struct work_struct *work);
+void mt7925_csa_work(struct work_struct *work);
 int mt7925_mcu_uni_bss_ps(struct mt792x_dev *dev,
 			  struct ieee80211_bss_conf *link_conf);
 void mt7925_coredump_work(struct work_struct *work);
@@ -268,13 +359,16 @@ int mt7925_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 
 int mt7925e_mac_reset(struct mt792x_dev *dev);
 int mt7925e_mcu_init(struct mt792x_dev *dev);
+void mt7925e_axidma_cal_cache_init(struct mt792x_dev *dev);
 void mt7925_mac_add_txs(struct mt792x_dev *dev, void *data);
+void mt7928_mac_add_txs_msg(struct mt792x_dev *dev, void *evt);
 void mt7925_set_runtime_pm(struct mt792x_dev *dev);
 void mt7925_mcu_set_suspend_iter(void *priv, u8 *mac,
 				 struct ieee80211_vif *vif);
 void mt7925_connac_mcu_set_suspend_iter(void *priv, u8 *mac,
 					struct ieee80211_vif *vif);
 void mt7925_set_ipv6_ns_work(struct work_struct *work);
+void mt7925_nan_deferred_work(struct work_struct *work);
 
 int mt7925_mcu_set_sniffer(struct mt792x_dev *dev, struct ieee80211_vif *vif,
 			   bool enable);
@@ -300,8 +394,8 @@ int mt7925_set_tx_sar_pwr(struct ieee80211_hw *hw,
 int mt7925_mcu_regval(struct mt792x_dev *dev, u32 regidx, u32 *val, bool set);
 int mt7925_mcu_set_clc(struct mt792x_dev *dev, u8 *alpha2,
 		       enum environment_cap env_cap);
-int mt7925_mcu_set_mlo_roc(struct mt792x_bss_conf *mconf, u16 sel_links,
-			   int duration, u8 token_id);
+int mt7925_mcu_set_mlo_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf,
+			   u16 sel_links, int duration, u8 token_id);
 int mt7925_mcu_set_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf,
 		       struct ieee80211_channel *chan, int duration,
 		       enum mt7925_roc_req type, u8 token_id);
@@ -318,7 +412,14 @@ int mt7925_mcu_add_key(struct mt76_dev *dev, struct ieee80211_vif *vif,
 int mt7925_mcu_set_rts_thresh(struct mt792x_phy *phy, u32 val);
 int mt7925_mcu_wtbl_update_hdr_trans(struct mt792x_dev *dev,
 				     struct ieee80211_vif *vif,
-				     struct ieee80211_sta *sta,
-				     int link_id);
+				     struct mt792x_bss_conf *mconf,
+				     struct mt792x_link_sta *mlink);
+int mt7925_mcu_wf_rf_pin_ctrl(struct mt792x_phy *phy);
 
+int mt7925_testmode_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+			void *data, int len);
+int mt7925_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *msg,
+			 struct netlink_callback *cb, void *data, int len);
+
+int mt7925_mcu_set_rssimonitor(struct mt792x_dev *dev, struct ieee80211_vif *vif);
 #endif

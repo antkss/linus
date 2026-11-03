@@ -1463,7 +1463,7 @@ static void rt5663_enable_push_button_irq(struct snd_soc_component *component,
 
 static int rt5663_v2_jack_detect(struct snd_soc_component *component, int jack_insert)
 {
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	struct rt5663_priv *rt5663 = snd_soc_component_get_drvdata(component);
 	int val, i = 0, sleep_time[5] = {300, 150, 100, 50, 30};
 
@@ -1859,7 +1859,7 @@ static irqreturn_t rt5663_irq(int irq, void *data)
 	dev_dbg(regmap_get_device(rt5663->regmap), "%s IRQ queue work\n",
 		__func__);
 
-	queue_delayed_work(system_wq, &rt5663->jack_detect_work,
+	queue_delayed_work(system_dfl_wq, &rt5663->jack_detect_work,
 		msecs_to_jiffies(250));
 
 	return IRQ_HANDLED;
@@ -1974,7 +1974,7 @@ static void rt5663_jack_detect_work(struct work_struct *work)
 				cancel_delayed_work_sync(
 					&rt5663->jd_unplug_work);
 			} else {
-				queue_delayed_work(system_wq,
+				queue_delayed_work(system_dfl_wq,
 					&rt5663->jd_unplug_work,
 					msecs_to_jiffies(500));
 			}
@@ -2024,7 +2024,7 @@ static void rt5663_jd_unplug_work(struct work_struct *work)
 				    SND_JACK_BTN_0 | SND_JACK_BTN_1 |
 				    SND_JACK_BTN_2 | SND_JACK_BTN_3);
 	} else {
-		queue_delayed_work(system_wq, &rt5663->jd_unplug_work,
+		queue_delayed_work(system_dfl_wq, &rt5663->jd_unplug_work,
 			msecs_to_jiffies(500));
 	}
 }
@@ -2814,9 +2814,9 @@ static int rt5663_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	unsigned int reg_val = 0;
 
 	switch (fmt & SND_SOC_DAIFMT_MASTER_MASK) {
-	case SND_SOC_DAIFMT_CBM_CFM:
+	case SND_SOC_DAIFMT_CBP_CFP:
 		break;
-	case SND_SOC_DAIFMT_CBS_CFS:
+	case SND_SOC_DAIFMT_CBC_CFC:
 		reg_val |= RT5663_I2S_MS_S;
 		break;
 	default:
@@ -3140,7 +3140,7 @@ static int rt5663_set_bias_level(struct snd_soc_component *component,
 
 static int rt5663_probe(struct snd_soc_component *component)
 {
-	struct snd_soc_dapm_context *dapm = snd_soc_component_get_dapm(component);
+	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
 	struct rt5663_priv *rt5663 = snd_soc_component_get_drvdata(component);
 
 	rt5663->component = component;
@@ -3222,6 +3222,14 @@ static int rt5663_resume(struct snd_soc_component *component)
 #define RT5663_FORMATS (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S20_3LE | \
 			SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S8)
 
+static const u64 rt5663_selectable_formats =
+	SND_SOC_POSSIBLE_DAIFMT_I2S	|
+	SND_SOC_POSSIBLE_DAIFMT_LEFT_J	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_A	|
+	SND_SOC_POSSIBLE_DAIFMT_DSP_B	|
+	SND_SOC_POSSIBLE_DAIFMT_NB_NF	|
+	SND_SOC_POSSIBLE_DAIFMT_IB_NF;
+
 static const struct snd_soc_dai_ops rt5663_aif_dai_ops = {
 	.hw_params = rt5663_hw_params,
 	.set_fmt = rt5663_set_dai_fmt,
@@ -3229,6 +3237,8 @@ static const struct snd_soc_dai_ops rt5663_aif_dai_ops = {
 	.set_pll = rt5663_set_dai_pll,
 	.set_tdm_slot = rt5663_set_tdm_slot,
 	.set_bclk_ratio = rt5663_set_bclk_ratio,
+	.auto_selectable_formats	= &rt5663_selectable_formats,
+	.num_auto_selectable_formats	= 1,
 };
 
 static struct snd_soc_dai_driver rt5663_dai[] = {
@@ -3307,23 +3317,23 @@ static const struct regmap_config temp_regmap = {
 };
 
 static const struct i2c_device_id rt5663_i2c_id[] = {
-	{ "rt5663" },
-	{}
+	{ .name = "rt5663" },
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, rt5663_i2c_id);
 
 #if defined(CONFIG_OF)
 static const struct of_device_id rt5663_of_match[] = {
 	{ .compatible = "realtek,rt5663", },
-	{},
+	{ }
 };
 MODULE_DEVICE_TABLE(of, rt5663_of_match);
 #endif
 
 #ifdef CONFIG_ACPI
 static const struct acpi_device_id rt5663_acpi_match[] = {
-	{ "10EC5663", 0},
-	{},
+	{ "10EC5663" },
+	{ }
 };
 MODULE_DEVICE_TABLE(acpi, rt5663_acpi_match);
 #endif
@@ -3689,8 +3699,8 @@ static int rt5663_i2c_probe(struct i2c_client *i2c)
 
 	if (i2c->irq) {
 		ret = request_irq(i2c->irq, rt5663_irq,
-			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING
-			| IRQF_ONESHOT, "rt5663", rt5663);
+			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+			"rt5663", rt5663);
 		if (ret) {
 			dev_err(&i2c->dev, "%s Failed to request IRQ: %d\n",
 				__func__, ret);

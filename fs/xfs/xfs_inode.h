@@ -30,7 +30,6 @@ typedef struct xfs_inode {
 	struct xfs_dquot	*i_pdquot;	/* project dquot */
 
 	/* Inode location stuff */
-	xfs_ino_t		i_ino;		/* inode number (agno/agino)*/
 	struct xfs_imap		i_imap;		/* location for xfs_imap() */
 
 	/* Extent information. */
@@ -59,8 +58,13 @@ typedef struct xfs_inode {
 	xfs_rfsblock_t		i_nblocks;	/* # of direct & btree blocks */
 	prid_t			i_projid;	/* owner's project id */
 	xfs_extlen_t		i_extsize;	/* basic/minimum extent size */
-	/* cowextsize is only used for v3 inodes, flushiter for v1/2 */
+	/*
+	 * i_used_blocks is used for zoned rtrmap inodes,
+	 * i_cowextsize is used for other v3 inodes,
+	 * i_flushiter for v1/2 inodes
+	 */
 	union {
+		uint32_t	i_used_blocks;	/* used blocks in RTG */
 		xfs_extlen_t	i_cowextsize;	/* basic cow extent size */
 		uint16_t	i_flushiter;	/* incremented on flush */
 	};
@@ -128,7 +132,7 @@ xfs_ifork_ptr(
 
 static inline unsigned int xfs_inode_fork_boff(struct xfs_inode *ip)
 {
-	return ip->i_forkoff << 3;
+	return XFS_FORKOFF_TO_B(ip->i_forkoff);
 }
 
 static inline unsigned int xfs_inode_data_fork_size(struct xfs_inode *ip)
@@ -177,6 +181,11 @@ static inline struct inode *VFS_I(struct xfs_inode *ip)
 static inline const struct inode *VFS_IC(const struct xfs_inode *ip)
 {
 	return &ip->i_vnode;
+}
+
+static inline xfs_ino_t I_INO(const struct xfs_inode *ip)
+{
+	return VFS_IC(ip)->i_ino;
 }
 
 /*
@@ -294,9 +303,14 @@ static inline bool xfs_is_internal_inode(const struct xfs_inode *ip)
 	 * Before metadata directories, the only metadata inodes were the
 	 * three quota files, the realtime bitmap, and the realtime summary.
 	 */
-	return ip->i_ino == mp->m_sb.sb_rbmino ||
-	       ip->i_ino == mp->m_sb.sb_rsumino ||
-	       xfs_is_quota_inode(&mp->m_sb, ip->i_ino);
+	return I_INO(ip) == mp->m_sb.sb_rbmino ||
+	       I_INO(ip) == mp->m_sb.sb_rsumino ||
+	       xfs_is_quota_inode(&mp->m_sb, I_INO(ip));
+}
+
+static inline bool xfs_is_zoned_inode(const struct xfs_inode *ip)
+{
+	return xfs_has_zoned(ip->i_mount) && XFS_IS_REALTIME_INODE(ip);
 }
 
 bool xfs_is_always_cow_inode(const struct xfs_inode *ip);
@@ -340,25 +354,35 @@ static inline bool xfs_inode_has_bigrtalloc(const struct xfs_inode *ip)
 }
 
 /*
+ * Return the type of the group that data for a given inode is allocated from.
+ */
+static inline enum xfs_group_type
+xfs_inode_group_type(const struct xfs_inode *ip)
+{
+	return XFS_IS_REALTIME_INODE(ip) ? XG_TYPE_RTG : XG_TYPE_AG;
+}
+
+/*
  * Return the buftarg used for data allocations on a given inode.
  */
 #define xfs_inode_buftarg(ip) \
 	(XFS_IS_REALTIME_INODE(ip) ? \
 		(ip)->i_mount->m_rtdev_targp : (ip)->i_mount->m_ddev_targp)
 
-static inline bool
-xfs_inode_can_atomicwrite(
-	struct xfs_inode	*ip)
+static inline bool xfs_inode_can_hw_atomic_write(const struct xfs_inode *ip)
 {
-	struct xfs_mount	*mp = ip->i_mount;
-	struct xfs_buftarg	*target = xfs_inode_buftarg(ip);
-
-	if (mp->m_sb.sb_blocksize < target->bt_bdev_awu_min)
-		return false;
-	if (mp->m_sb.sb_blocksize > target->bt_bdev_awu_max)
+	if (IS_DAX(VFS_IC(ip)))
 		return false;
 
-	return true;
+	return xfs_inode_buftarg(ip)->bt_awu_max > 0;
+}
+
+static inline bool xfs_inode_can_sw_atomic_write(const struct xfs_inode *ip)
+{
+	if (IS_DAX(VFS_IC(ip)))
+		return false;
+
+	return xfs_can_sw_atomic_write(ip->i_mount);
 }
 
 /*
@@ -553,7 +577,7 @@ int		xfs_remove(struct xfs_inode *dp, struct xfs_name *name,
 			   struct xfs_inode *ip);
 int		xfs_link(struct xfs_inode *tdp, struct xfs_inode *sip,
 			 struct xfs_name *target_name);
-int		xfs_rename(struct mnt_idmap *idmap,
+int		xfs_rename(const struct mnt_idmap *idmap,
 			   struct xfs_inode *src_dp, struct xfs_name *src_name,
 			   struct xfs_inode *src_ip, struct xfs_inode *target_dp,
 			   struct xfs_name *target_name,
@@ -570,7 +594,6 @@ uint		xfs_ilock_attr_map_shared(struct xfs_inode *);
 int		xfs_ifree(struct xfs_trans *, struct xfs_inode *);
 int		xfs_itruncate_extents_flags(struct xfs_trans **,
 				struct xfs_inode *, int, xfs_fsize_t, int);
-void		xfs_iext_realloc(xfs_inode_t *, int, int);
 
 int		xfs_log_force_inode(struct xfs_inode *ip);
 void		xfs_iunpin_wait(xfs_inode_t *);
@@ -593,7 +616,7 @@ xfs_itruncate_extents(
 	return xfs_itruncate_extents_flags(tpp, ip, whichfork, new_size, 0);
 }
 
-int	xfs_break_dax_layouts(struct inode *inode, bool *retry);
+int	xfs_break_dax_layouts(struct inode *inode);
 int	xfs_break_layouts(struct inode *inode, uint *iolock,
 		enum layout_break_reason reason);
 
@@ -617,13 +640,6 @@ static inline void xfs_finish_inode_setup(struct xfs_inode *ip)
 	xfs_iflags_clear(ip, XFS_INEW);
 	barrier();
 	unlock_new_inode(VFS_I(ip));
-}
-
-static inline void xfs_setup_existing_inode(struct xfs_inode *ip)
-{
-	xfs_setup_inode(ip);
-	xfs_setup_iops(ip);
-	xfs_finish_inode_setup(ip);
 }
 
 void xfs_irele(struct xfs_inode *ip);

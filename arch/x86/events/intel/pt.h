@@ -37,9 +37,6 @@ struct topa_entry {
 	u64	rsvd4	: 12;
 };
 
-/* TSC to Core Crystal Clock Ratio */
-#define CPUID_TSC_LEAF		0x15
-
 struct pt_pmu {
 	struct pmu		pmu;
 	u32			caps[PT_CPUID_REGS_NUM * PT_CPUID_LEAVES];
@@ -61,7 +58,6 @@ struct pt_pmu {
  * @cur_idx:	current output region's index within @cur table
  * @output_off:	offset within the current output region
  * @data_size:	running total of the amount of data in this buffer
- * @lost:	if data was lost/truncated
  * @head:	logical write offset inside the buffer
  * @snapshot:	if this is for a snapshot/overwrite counter
  * @single:	use Single Range Output instead of ToPA
@@ -71,7 +67,6 @@ struct pt_pmu {
  * @stop_te:	STOP topa entry pointer
  * @intr_te:	INT topa entry pointer
  * @data_pages:	array of pages from perf
- * @topa_index:	table of topa entries indexed by page offset
  */
 struct pt_buffer {
 	struct list_head	tables;

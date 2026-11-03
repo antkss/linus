@@ -45,7 +45,7 @@
  * here if set to avoid blocking other users of this pipe if splice is
  * being done on it.
  */
-static noinline void noinline pipe_clear_nowait(struct file *file)
+static noinline void pipe_clear_nowait(struct file *file)
 {
 	fmode_t fmode = READ_ONCE(file->f_mode);
 
@@ -177,9 +177,9 @@ static const struct pipe_buf_operations user_page_pipe_buf_ops = {
 
 static void wakeup_pipe_readers(struct pipe_inode_info *pipe)
 {
-	smp_mb();
-	if (waitqueue_active(&pipe->rd_wait))
-		wake_up_interruptible(&pipe->rd_wait);
+	if (wq_has_sleeper(&pipe->rd_wait))
+		wake_up_interruptible_poll(&pipe->rd_wait,
+					   EPOLLIN | EPOLLRDNORM);
 	kill_fasync(&pipe->fasync_readers, SIGIO, POLL_IN);
 }
 
@@ -200,7 +200,6 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 	unsigned int spd_pages = spd->nr_pages;
 	unsigned int tail = pipe->tail;
 	unsigned int head = pipe->head;
-	unsigned int mask = pipe->ring_size - 1;
 	ssize_t ret = 0;
 	int page_nr = 0;
 
@@ -214,7 +213,7 @@ ssize_t splice_to_pipe(struct pipe_inode_info *pipe,
 	}
 
 	while (!pipe_full(head, tail, pipe->max_usage)) {
-		struct pipe_buffer *buf = &pipe->bufs[head & mask];
+		struct pipe_buffer *buf = pipe_buf(pipe, head);
 
 		buf->page = spd->pages[page_nr];
 		buf->offset = spd->partial[page_nr].offset;
@@ -247,7 +246,6 @@ ssize_t add_to_pipe(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
 {
 	unsigned int head = pipe->head;
 	unsigned int tail = pipe->tail;
-	unsigned int mask = pipe->ring_size - 1;
 	int ret;
 
 	if (unlikely(!pipe->readers)) {
@@ -256,7 +254,7 @@ ssize_t add_to_pipe(struct pipe_inode_info *pipe, struct pipe_buffer *buf)
 	} else if (pipe_full(head, tail, pipe->max_usage)) {
 		ret = -EAGAIN;
 	} else {
-		pipe->bufs[head & mask] = *buf;
+		*pipe_buf(pipe, head) = *buf;
 		pipe->head = head + 1;
 		return buf->len;
 	}
@@ -277,9 +275,8 @@ int splice_grow_spd(const struct pipe_inode_info *pipe, struct splice_pipe_desc 
 	if (max_usage <= PIPE_DEF_BUFFERS)
 		return 0;
 
-	spd->pages = kmalloc_array(max_usage, sizeof(struct page *), GFP_KERNEL);
-	spd->partial = kmalloc_array(max_usage, sizeof(struct partial_page),
-				     GFP_KERNEL);
+	spd->pages = kmalloc_objs(struct page *, max_usage);
+	spd->partial = kmalloc_objs(struct partial_page, max_usage);
 
 	if (spd->pages && spd->partial)
 		return 0;
@@ -331,7 +328,7 @@ ssize_t copy_splice_read(struct file *in, loff_t *ppos,
 	int i;
 
 	/* Work out how much data we can actually add into the pipe */
-	used = pipe_occupancy(pipe->head, pipe->tail);
+	used = pipe_buf_usage(pipe);
 	npages = max_t(ssize_t, pipe->max_usage - used, 0);
 	len = min_t(size_t, len, npages * PAGE_SIZE);
 	npages = DIV_ROUND_UP(len, PAGE_SIZE);
@@ -342,7 +339,7 @@ ssize_t copy_splice_read(struct file *in, loff_t *ppos,
 		return -ENOMEM;
 
 	pages = (struct page **)(bv + npages);
-	npages = alloc_pages_bulk_array(GFP_USER, npages, pages);
+	npages = alloc_pages_bulk(GFP_USER, npages, pages);
 	if (!npages) {
 		kfree(bv);
 		return -ENOMEM;
@@ -416,9 +413,9 @@ EXPORT_SYMBOL(nosteal_pipe_buf_ops);
 
 static void wakeup_pipe_writers(struct pipe_inode_info *pipe)
 {
-	smp_mb();
-	if (waitqueue_active(&pipe->wr_wait))
-		wake_up_interruptible(&pipe->wr_wait);
+	if (wq_has_sleeper(&pipe->wr_wait))
+		wake_up_interruptible_poll(&pipe->wr_wait,
+					   EPOLLOUT | EPOLLWRNORM);
 	kill_fasync(&pipe->fasync_writers, SIGIO, POLL_OUT);
 }
 
@@ -447,11 +444,10 @@ static int splice_from_pipe_feed(struct pipe_inode_info *pipe, struct splice_des
 {
 	unsigned int head = pipe->head;
 	unsigned int tail = pipe->tail;
-	unsigned int mask = pipe->ring_size - 1;
 	int ret;
 
 	while (!pipe_empty(head, tail)) {
-		struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+		struct pipe_buffer *buf = pipe_buf(pipe, tail);
 
 		sd->len = buf->len;
 		if (sd->len > sd->total_len)
@@ -495,8 +491,7 @@ static int splice_from_pipe_feed(struct pipe_inode_info *pipe, struct splice_des
 static inline bool eat_empty_buffer(struct pipe_inode_info *pipe)
 {
 	unsigned int tail = pipe->tail;
-	unsigned int mask = pipe->ring_size - 1;
-	struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+	struct pipe_buffer *buf = pipe_buf(pipe, tail);
 
 	if (unlikely(!buf->len)) {
 		pipe_buf_release(pipe, buf);
@@ -527,7 +522,7 @@ static int splice_from_pipe_next(struct pipe_inode_info *pipe, struct splice_des
 		return -ERESTARTSYS;
 
 repeat:
-	while (pipe_empty(pipe->head, pipe->tail)) {
+	while (pipe_is_empty(pipe)) {
 		if (!pipe->writers)
 			return 0;
 
@@ -680,7 +675,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 	if (!out->f_op->write_iter)
 		return -EINVAL;
 
-	array = kcalloc(nbufs, sizeof(struct bio_vec), GFP_KERNEL);
+	array = kzalloc_objs(struct bio_vec, nbufs);
 	if (unlikely(!array))
 		return -ENOMEM;
 
@@ -690,7 +685,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 	while (sd.total_len) {
 		struct kiocb kiocb;
 		struct iov_iter from;
-		unsigned int head, tail, mask;
+		unsigned int head, tail;
 		size_t left;
 		int n;
 
@@ -701,8 +696,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		if (unlikely(nbufs < pipe->max_usage)) {
 			kfree(array);
 			nbufs = pipe->max_usage;
-			array = kcalloc(nbufs, sizeof(struct bio_vec),
-					GFP_KERNEL);
+			array = kzalloc_objs(struct bio_vec, nbufs);
 			if (!array) {
 				ret = -ENOMEM;
 				break;
@@ -711,12 +705,11 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 
 		head = pipe->head;
 		tail = pipe->tail;
-		mask = pipe->ring_size - 1;
 
 		/* build the vector */
 		left = sd.total_len;
 		for (n = 0; !pipe_empty(head, tail) && left && n < nbufs; tail++) {
-			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+			struct pipe_buffer *buf = pipe_buf(pipe, tail);
 			size_t this_len = buf->len;
 
 			/* zero-length bvecs are not supported, skip them */
@@ -744,6 +737,9 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		sd.pos = kiocb.ki_pos;
 		if (ret <= 0)
 			break;
+		WARN_ONCE(ret > sd.total_len - left,
+			  "Splice Exceeded! ret=%zd tot=%zu left=%zu\n",
+			  ret, sd.total_len, left);
 
 		sd.num_spliced += ret;
 		sd.total_len -= ret;
@@ -752,7 +748,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 		/* dismiss the fully eaten buffers, adjust the partial one */
 		tail = pipe->tail;
 		while (ret) {
-			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+			struct pipe_buffer *buf = pipe_buf(pipe, tail);
 			if (ret >= buf->len) {
 				ret -= buf->len;
 				buf->len = 0;
@@ -809,7 +805,7 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 	pipe_lock(pipe);
 
 	while (len > 0) {
-		unsigned int head, tail, mask, bc = 0;
+		unsigned int head, tail, bc = 0;
 		size_t remain = len;
 
 		/*
@@ -820,7 +816,7 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 		if (signal_pending(current))
 			break;
 
-		while (pipe_empty(pipe->head, pipe->tail)) {
+		while (pipe_is_empty(pipe)) {
 			ret = 0;
 			if (!pipe->writers)
 				goto out;
@@ -846,10 +842,9 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 
 		head = pipe->head;
 		tail = pipe->tail;
-		mask = pipe->ring_size - 1;
 
 		while (!pipe_empty(head, tail)) {
-			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+			struct pipe_buffer *buf = pipe_buf(pipe, tail);
 			size_t seg;
 
 			if (!buf->len) {
@@ -894,7 +889,7 @@ ssize_t splice_to_socket(struct pipe_inode_info *pipe, struct file *out,
 		len -= ret;
 		tail = pipe->tail;
 		while (ret > 0) {
-			struct pipe_buffer *buf = &pipe->bufs[tail & mask];
+			struct pipe_buffer *buf = pipe_buf(pipe, tail);
 			size_t seg = min_t(size_t, ret, buf->len);
 
 			buf->offset += seg;
@@ -968,7 +963,7 @@ static ssize_t do_splice_read(struct file *in, loff_t *ppos,
 		return 0;
 
 	/* Don't try to read more the pipe has space for. */
-	p_space = pipe->max_usage - pipe_occupancy(pipe->head, pipe->tail);
+	p_space = pipe->max_usage - pipe_buf_usage(pipe);
 	len = min_t(size_t, len, p_space << PAGE_SHIFT);
 
 	if (unlikely(len > MAX_RW_COUNT))
@@ -1014,21 +1009,14 @@ ssize_t vfs_splice_read(struct file *in, loff_t *ppos,
 }
 EXPORT_SYMBOL_GPL(vfs_splice_read);
 
-/**
- * splice_direct_to_actor - splices data directly between two non-pipes
- * @in:		file to splice from
- * @sd:		actor information on where to splice to
- * @actor:	handles the data splicing
- *
- * Description:
- *    This is a special case helper to splice directly between two
- *    points, without requiring an explicit pipe. Internally an allocated
- *    pipe is cached in the process, and reused during the lifetime of
- *    that process.
- *
+/*
+ * This is a special case helper to splice directly between two
+ * points, without requiring an explicit pipe. Internally an allocated
+ * pipe is cached in the process, and reused during the lifetime of
+ * that process.
  */
-ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
-			       splice_direct_actor *actor)
+static ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
+				      splice_direct_actor *actor)
 {
 	struct pipe_inode_info *pipe;
 	ssize_t ret, bytes;
@@ -1080,7 +1068,7 @@ ssize_t splice_direct_to_actor(struct file *in, struct splice_desc *sd,
 	more = sd->flags & SPLICE_F_MORE;
 	sd->flags |= SPLICE_F_MORE;
 
-	WARN_ON_ONCE(!pipe_empty(pipe->head, pipe->tail));
+	WARN_ON_ONCE(!pipe_is_empty(pipe));
 
 	while (len) {
 		size_t read_len;
@@ -1152,7 +1140,42 @@ out_release:
 
 	goto done;
 }
-EXPORT_SYMBOL(splice_direct_to_actor);
+
+/**
+ * vfs_splice_to_actor - call an actor on data read from a file
+ * @in:		file to read from
+ * @pos:	file offset
+ * @count:	maximum number of bytes to read
+ * @actor:	callback to process a pipe's worth of data
+ * @private:	private data passed to @actor
+ *
+ * Read up to @count worth of data from @in at @pos, and call @actor
+ * when the hidden pipe used to buffer the data is full. Ensures the
+ * read is allowed using rw_verify_area() and emits fsnotify access
+ * events. @in must be seekable (FMODE_LSEEK).
+ *
+ * Return: The number of bytes spliced, or a negative errno.
+ */
+ssize_t vfs_splice_to_actor(struct file *in, loff_t pos, size_t count,
+			    splice_direct_actor *actor, void *private)
+{
+	struct splice_desc sd = {
+		.total_len	= count,
+		.pos		= pos,
+		.u.data		= private,
+	};
+	ssize_t ret;
+
+	ret = rw_verify_area(READ, in, &sd.pos, sd.total_len);
+	if (ret < 0)
+		return ret;
+
+	ret = splice_direct_to_actor(in, &sd, actor);
+	if (ret >= 0)
+		fsnotify_access(in);
+	return ret;
+}
+EXPORT_SYMBOL(vfs_splice_to_actor);
 
 static int direct_splice_actor(struct pipe_inode_info *pipe,
 			       struct splice_desc *sd)
@@ -1268,7 +1291,7 @@ static int wait_for_space(struct pipe_inode_info *pipe, unsigned flags)
 			send_sig(SIGPIPE, current, 0);
 			return -EPIPE;
 		}
-		if (!pipe_full(pipe->head, pipe->tail, pipe->max_usage))
+		if (!pipe_is_full(pipe))
 			return 0;
 		if (flags & SPLICE_F_NONBLOCK)
 			return -EAGAIN;
@@ -1354,10 +1377,10 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 		ret = do_splice_from(ipipe, out, &offset, len, flags);
 		file_end_write(out);
 
-		if (!off_out)
-			out->f_pos = offset;
-		else
+		if (off_out)
 			*off_out = offset;
+		else if (ret >= 0)
+			out->f_pos = offset;
 	} else if (opipe) {
 		if (off_out)
 			return -ESPIPE;
@@ -1378,10 +1401,10 @@ ssize_t do_splice(struct file *in, loff_t *off_in, struct file *out,
 
 		ret = splice_file_to_pipe(in, opipe, &offset, len, flags);
 
-		if (!off_in)
-			in->f_pos = offset;
-		else
+		if (off_in)
 			*off_in = offset;
+		else if (ret >= 0)
+			in->f_pos = offset;
 	} else {
 		ret = -EINVAL;
 	}
@@ -1470,7 +1493,7 @@ static ssize_t iter_to_pipe(struct iov_iter *from,
 
 		n = DIV_ROUND_UP(left + start, PAGE_SIZE);
 		for (i = 0; i < n; i++) {
-			int size = min_t(int, left, PAGE_SIZE - start);
+			int size = umin(left, PAGE_SIZE - start);
 
 			buf.page = pages[i];
 			buf.offset = start;
@@ -1501,7 +1524,7 @@ static int pipe_to_user(struct pipe_inode_info *pipe, struct pipe_buffer *buf,
 
 /*
  * For lack of a better implementation, implement vmsplice() to userspace
- * as a simple copy of the pipes pages to the user iov.
+ * as a simple copy of the pipe's pages to the user iov.
  */
 static ssize_t vmsplice_to_user(struct file *file, struct iov_iter *iter,
 				unsigned int flags)
@@ -1652,13 +1675,13 @@ static int ipipe_prep(struct pipe_inode_info *pipe, unsigned int flags)
 	 * Check the pipe occupancy without the inode lock first. This function
 	 * is speculative anyways, so missing one is ok.
 	 */
-	if (!pipe_empty(pipe->head, pipe->tail))
+	if (!pipe_is_empty(pipe))
 		return 0;
 
 	ret = 0;
 	pipe_lock(pipe);
 
-	while (pipe_empty(pipe->head, pipe->tail)) {
+	while (pipe_is_empty(pipe)) {
 		if (signal_pending(current)) {
 			ret = -ERESTARTSYS;
 			break;
@@ -1688,13 +1711,13 @@ static int opipe_prep(struct pipe_inode_info *pipe, unsigned int flags)
 	 * Check pipe occupancy without the inode lock first. This function
 	 * is speculative anyways, so missing one is ok.
 	 */
-	if (!pipe_full(pipe->head, pipe->tail, pipe->max_usage))
+	if (!pipe_is_full(pipe))
 		return 0;
 
 	ret = 0;
 	pipe_lock(pipe);
 
-	while (pipe_full(pipe->head, pipe->tail, pipe->max_usage)) {
+	while (pipe_is_full(pipe)) {
 		if (!pipe->readers) {
 			send_sig(SIGPIPE, current, 0);
 			ret = -EPIPE;
@@ -1725,7 +1748,6 @@ static int splice_pipe_to_pipe(struct pipe_inode_info *ipipe,
 	struct pipe_buffer *ibuf, *obuf;
 	unsigned int i_head, o_head;
 	unsigned int i_tail, o_tail;
-	unsigned int i_mask, o_mask;
 	int ret = 0;
 	bool input_wakeup = false;
 
@@ -1747,9 +1769,7 @@ retry:
 	pipe_double_lock(ipipe, opipe);
 
 	i_tail = ipipe->tail;
-	i_mask = ipipe->ring_size - 1;
 	o_head = opipe->head;
-	o_mask = opipe->ring_size - 1;
 
 	do {
 		size_t o_len;
@@ -1792,8 +1812,8 @@ retry:
 			goto retry;
 		}
 
-		ibuf = &ipipe->bufs[i_tail & i_mask];
-		obuf = &opipe->bufs[o_head & o_mask];
+		ibuf = pipe_buf(ipipe, i_tail);
+		obuf = pipe_buf(opipe, o_head);
 
 		if (len >= ibuf->len) {
 			/*
@@ -1862,8 +1882,16 @@ static ssize_t link_pipe(struct pipe_inode_info *ipipe,
 	struct pipe_buffer *ibuf, *obuf;
 	unsigned int i_head, o_head;
 	unsigned int i_tail, o_tail;
-	unsigned int i_mask, o_mask;
 	ssize_t ret = 0;
+
+retry:
+	ret = ipipe_prep(ipipe, flags);
+	if (ret)
+		return ret;
+
+	ret = opipe_prep(opipe, flags);
+	if (ret)
+		return ret;
 
 	/*
 	 * Potential ABBA deadlock, work around it by ordering lock
@@ -1873,9 +1901,7 @@ static ssize_t link_pipe(struct pipe_inode_info *ipipe,
 	pipe_double_lock(ipipe, opipe);
 
 	i_tail = ipipe->tail;
-	i_mask = ipipe->ring_size - 1;
 	o_head = opipe->head;
-	o_mask = opipe->ring_size - 1;
 
 	do {
 		if (!opipe->readers) {
@@ -1888,16 +1914,35 @@ static ssize_t link_pipe(struct pipe_inode_info *ipipe,
 		i_head = ipipe->head;
 		o_tail = opipe->tail;
 
+		if (pipe_empty(i_head, i_tail) && !ipipe->writers)
+			break;
+
 		/*
 		 * If we have iterated all input buffers or run out of
 		 * output room, break.
 		 */
 		if (pipe_empty(i_head, i_tail) ||
-		    pipe_full(o_head, o_tail, opipe->max_usage))
-			break;
+		    pipe_full(o_head, o_tail, opipe->max_usage)) {
+			if (ret)
+				break;
 
-		ibuf = &ipipe->bufs[i_tail & i_mask];
-		obuf = &opipe->bufs[o_head & o_mask];
+			if (flags & SPLICE_F_NONBLOCK) {
+				ret = -EAGAIN;
+				break;
+			}
+
+			/*
+			 * We raced with another reader/writer and haven't
+			 * linked any buffers. A zero return value means EOF,
+			 * so retry instead.
+			 */
+			pipe_unlock(ipipe);
+			pipe_unlock(opipe);
+			goto retry;
+		}
+
+		ibuf = pipe_buf(ipipe, i_tail);
+		obuf = pipe_buf(opipe, o_head);
 
 		/*
 		 * Get a reference to this pipe buffer,
@@ -1965,16 +2010,7 @@ ssize_t do_tee(struct file *in, struct file *out, size_t len,
 		if ((in->f_flags | out->f_flags) & O_NONBLOCK)
 			flags |= SPLICE_F_NONBLOCK;
 
-		/*
-		 * Keep going, unless we encounter an error. The ipipe/opipe
-		 * ordering doesn't really matter.
-		 */
-		ret = ipipe_prep(ipipe, flags);
-		if (!ret) {
-			ret = opipe_prep(opipe, flags);
-			if (!ret)
-				ret = link_pipe(ipipe, opipe, len, flags);
-		}
+		ret = link_pipe(ipipe, opipe, len, flags);
 	}
 
 	if (ret > 0) {

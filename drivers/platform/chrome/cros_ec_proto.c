@@ -3,6 +3,7 @@
 //
 // Copyright (C) 2015 Google, Inc
 
+#include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/limits.h>
@@ -15,6 +16,8 @@
 #include "cros_ec_trace.h"
 
 #define EC_COMMAND_RETRIES	50
+#define RWSIG_CONTINUE_RETRIES	8
+#define RWSIG_CONTINUE_MAX_ERRORS_IN_ROW	3
 
 static const int cros_ec_error_map[] = {
 	[EC_RES_INVALID_COMMAND] = -EOPNOTSUPP,
@@ -135,14 +138,13 @@ static int cros_ec_xfer_command(struct cros_ec_device *ec_dev, struct cros_ec_co
 	return ret;
 }
 
-static int cros_ec_wait_until_complete(struct cros_ec_device *ec_dev, uint32_t *result)
+static int cros_ec_wait_until_complete(struct cros_ec_device *ec_dev,
+				       struct cros_ec_command *orig_msg)
 {
-	struct {
-		struct cros_ec_command msg;
-		struct ec_response_get_comms_status status;
-	} __packed buf;
-	struct cros_ec_command *msg = &buf.msg;
-	struct ec_response_get_comms_status *status = &buf.status;
+	DEFINE_RAW_FLEX(struct cros_ec_command, msg, data,
+			sizeof(struct ec_response_get_comms_status));
+	struct ec_response_get_comms_status *status =
+			(struct ec_response_get_comms_status *)msg->data;
 	int ret = 0, i;
 
 	msg->version = 0;
@@ -160,23 +162,41 @@ static int cros_ec_wait_until_complete(struct cros_ec_device *ec_dev, uint32_t *
 		if (ret < 0)
 			return ret;
 
-		*result = msg->result;
+		orig_msg->result = msg->result;
 		if (msg->result != EC_RES_SUCCESS)
 			return ret;
 
-		if (ret == 0) {
-			ret = -EPROTO;
-			break;
-		}
+		if (ret == 0)
+			return -EPROTO;
 
-		if (!(status->flags & EC_COMMS_STATUS_PROCESSING))
+		if (!(status->flags & EC_COMMS_STATUS_PROCESSING)) {
+			u32 orig_cmd, orig_outsize, orig_version;
+
+			/* If no response payload is expected, return 0. */
+			if (orig_msg->insize == 0)
+				return 0;
+
+			/*
+			 * Request the response using EC_CMD_RESEND_RESPONSE.
+			 * Restore the original message fields so it appears
+			 * to be a direct response to the original command.
+			 */
+			orig_cmd = orig_msg->command;
+			orig_outsize = orig_msg->outsize;
+			orig_version = orig_msg->version;
+
+			orig_msg->command = EC_CMD_RESEND_RESPONSE;
+			orig_msg->outsize = 0;
+			orig_msg->version = 0;
+			ret = cros_ec_xfer_command(ec_dev, orig_msg);
+			orig_msg->command = orig_cmd;
+			orig_msg->outsize = orig_outsize;
+			orig_msg->version = orig_version;
 			return ret;
+		}
 	}
 
-	if (i >= EC_COMMAND_RETRIES)
-		ret = -EAGAIN;
-
-	return ret;
+	return -EAGAIN;
 }
 
 static int cros_ec_send_command(struct cros_ec_device *ec_dev, struct cros_ec_command *msg)
@@ -184,7 +204,7 @@ static int cros_ec_send_command(struct cros_ec_device *ec_dev, struct cros_ec_co
 	int ret = cros_ec_xfer_command(ec_dev, msg);
 
 	if (msg->result == EC_RES_IN_PROGRESS)
-		ret = cros_ec_wait_until_complete(ec_dev, &msg->result);
+		ret = cros_ec_wait_until_complete(ec_dev, msg);
 
 	return ret;
 }
@@ -288,6 +308,64 @@ exit:
 	return ret;
 }
 
+int cros_ec_rwsig_continue(struct cros_ec_device *ec_dev)
+{
+	struct cros_ec_command *msg;
+	struct ec_params_rwsig_action *rwsig_action;
+	int ret = 0;
+	int error_count = 0;
+
+	ec_dev->proto_version = 3;
+
+	msg = kmalloc(sizeof(*msg) + sizeof(*rwsig_action), GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	msg->version = 0;
+	msg->command = EC_CMD_RWSIG_ACTION;
+	msg->insize = 0;
+	msg->outsize = sizeof(*rwsig_action);
+
+	rwsig_action = (struct ec_params_rwsig_action *)msg->data;
+	rwsig_action->action = RWSIG_ACTION_CONTINUE;
+
+	for (int i = 0; i < RWSIG_CONTINUE_RETRIES; i++) {
+		ret = cros_ec_send_command(ec_dev, msg);
+
+		if (ret < 0) {
+			if (++error_count >= RWSIG_CONTINUE_MAX_ERRORS_IN_ROW)
+				break;
+		} else if (msg->result == EC_RES_INVALID_COMMAND) {
+			/*
+			 * If EC_RES_INVALID_COMMAND is retured, it means RWSIG
+			 * is not supported or EC is already in RW, so there is
+			 * nothing left to do.
+			 */
+			break;
+		} else if (msg->result != EC_RES_SUCCESS) {
+			/* Unexpected command error. */
+			ret = cros_ec_map_error(msg->result);
+			break;
+		} else {
+			/*
+			 * The EC_CMD_RWSIG_ACTION succeed. Send the command
+			 * more times, to make sure EC is in RW. A following
+			 * command can timeout, because EC may need some time to
+			 * initialize after jump to RW.
+			 */
+			error_count = 0;
+		}
+
+		if (ret != -ETIMEDOUT)
+			usleep_range(90000, 100000);
+	}
+
+	kfree(msg);
+
+	return ret;
+}
+EXPORT_SYMBOL(cros_ec_rwsig_continue);
+
 static int cros_ec_get_proto_info(struct cros_ec_device *ec_dev, int devidx)
 {
 	struct cros_ec_command *msg;
@@ -306,15 +384,6 @@ static int cros_ec_get_proto_info(struct cros_ec_device *ec_dev, int devidx)
 	msg->insize = sizeof(*info);
 
 	ret = cros_ec_send_command(ec_dev, msg);
-	/*
-	 * Send command once again when timeout occurred.
-	 * Fingerprint MCU (FPMCU) is restarted during system boot which
-	 * introduces small window in which FPMCU won't respond for any
-	 * messages sent by kernel. There is no need to wait before next
-	 * attempt because we waited at least EC_MSG_DEADLINE_MS.
-	 */
-	if (ret == -ETIMEDOUT)
-		ret = cros_ec_send_command(ec_dev, msg);
 
 	if (ret < 0) {
 		dev_dbg(ec_dev->dev,
@@ -706,16 +775,13 @@ static int get_next_event_xfer(struct cros_ec_device *ec_dev,
 
 static int get_next_event(struct cros_ec_device *ec_dev)
 {
-	struct {
-		struct cros_ec_command msg;
-		struct ec_response_get_next_event_v3 event;
-	} __packed buf;
-	struct cros_ec_command *msg = &buf.msg;
-	struct ec_response_get_next_event_v3 *event = &buf.event;
+	DEFINE_RAW_FLEX(struct cros_ec_command, msg, data,
+			sizeof(struct ec_response_get_next_event_v3));
+	struct ec_response_get_next_event_v3 *event =
+			(struct ec_response_get_next_event_v3 *)msg->data;
 	int cmd_version = ec_dev->mkbp_event_supported - 1;
 	u32 size;
 
-	memset(msg, 0, sizeof(*msg));
 	if (ec_dev->suspended) {
 		dev_dbg(ec_dev->dev, "Device suspended.\n");
 		return -EHOSTDOWN;
@@ -900,6 +966,27 @@ u32 cros_ec_get_host_event(struct cros_ec_device *ec_dev)
 EXPORT_SYMBOL(cros_ec_get_host_event);
 
 /**
+ * cros_ec_read_features() - Read EC features
+ *
+ * @ec: EC device.
+ *
+ * Return: >= 0 on success, negative error number on failure.
+ */
+int cros_ec_read_features(struct cros_ec_dev *ec)
+{
+	int ret = cros_ec_cmd(ec->ec_dev, 0, EC_CMD_GET_FEATURES + ec->cmd_offset,
+			      NULL, 0, &ec->features, sizeof(ec->features));
+
+	if (ret < 0) {
+		dev_warn(ec->dev, "cannot get EC features: %d\n", ret);
+		memset(&ec->features, 0, sizeof(ec->features));
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cros_ec_read_features);
+
+/**
  * cros_ec_check_features() - Test for the presence of EC features
  *
  * @ec: EC device, does not have to be connected directly to the AP,
@@ -913,17 +1000,10 @@ EXPORT_SYMBOL(cros_ec_get_host_event);
 bool cros_ec_check_features(struct cros_ec_dev *ec, int feature)
 {
 	struct ec_response_get_features *features = &ec->features;
-	int ret;
 
 	if (features->flags[0] == -1U && features->flags[1] == -1U) {
 		/* features bitmap not read yet */
-		ret = cros_ec_cmd(ec->ec_dev, 0, EC_CMD_GET_FEATURES + ec->cmd_offset,
-				  NULL, 0, features, sizeof(*features));
-		if (ret < 0) {
-			dev_warn(ec->dev, "cannot get EC features: %d\n", ret);
-			memset(features, 0, sizeof(*features));
-		}
-
+		cros_ec_read_features(ec);
 		dev_dbg(ec->dev, "EC features %08x %08x\n",
 			features->flags[0], features->flags[1]);
 	}
@@ -1106,3 +1186,20 @@ int cros_ec_get_cmd_versions(struct cros_ec_device *ec_dev, u16 cmd)
 		return resp.version_mask;
 }
 EXPORT_SYMBOL_GPL(cros_ec_get_cmd_versions);
+
+/**
+ * cros_ec_device_registered - Return if the ec_dev is registered.
+ *
+ * @ec_dev: EC device
+ *
+ * Return: true if registered.  Otherwise, false.
+ */
+bool cros_ec_device_registered(struct cros_ec_device *ec_dev)
+{
+	guard(mutex)(&ec_dev->lock);
+	return ec_dev->registered;
+}
+EXPORT_SYMBOL_GPL(cros_ec_device_registered);
+
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("ChromeOS EC communication protocol helpers");

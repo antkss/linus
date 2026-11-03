@@ -195,11 +195,6 @@ void hns_rcb_ring_enable_hw(struct hnae_queue *q, u32 val)
 	dsaf_write_dev(q, RCB_RING_PREFETCH_EN_REG, !!val);
 }
 
-void hns_rcb_start(struct hnae_queue *q, u32 val)
-{
-	hns_rcb_ring_enable_hw(q, val);
-}
-
 /**
  *hns_rcb_common_init_commit_hw - make rcb common init completed
  *@rcb_common: rcb common device
@@ -568,7 +563,7 @@ u32 hns_rcb_get_rx_coalesced_frames(
 u32 hns_rcb_get_tx_coalesced_frames(
 	struct rcb_common_cb *rcb_common, u32 port_idx)
 {
-	u64 reg;
+	u32 reg;
 
 	reg = RCB_CFG_PKTLINE_REG + (port_idx + HNS_RCB_TX_PKTLINE_OFFSET) * 4;
 	return dsaf_read_dev(rcb_common, reg);
@@ -639,7 +634,7 @@ int hns_rcb_set_tx_coalesced_frames(
 {
 	u32 old_waterline =
 		hns_rcb_get_tx_coalesced_frames(rcb_common, port_idx);
-	u64 reg;
+	u32 reg;
 
 	if (coalesced_frames == old_waterline)
 		return 0;

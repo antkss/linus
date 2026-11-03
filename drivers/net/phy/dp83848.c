@@ -117,13 +117,16 @@ static int dp83848_config_init(struct phy_device *phydev)
 	 * we check initial value of BMCR Auto negotiation enable bit
 	 */
 	val = phy_read(phydev, MII_BMCR);
+	if (val < 0)
+		return val;
+
 	if (!(val & BMCR_ANENABLE))
 		phydev->autoneg = AUTONEG_DISABLE;
 
 	return 0;
 }
 
-static struct mdio_device_id __maybe_unused dp83848_tbl[] = {
+static const struct mdio_device_id __maybe_unused dp83848_tbl[] = {
 	{ TI_DP83848C_PHY_ID, 0xfffffff0 },
 	{ NS_DP83848C_PHY_ID, 0xfffffff0 },
 	{ TI_DP83620_PHY_ID, 0xfffffff0 },

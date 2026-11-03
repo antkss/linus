@@ -119,9 +119,8 @@ static inline u32 vdc_tx_dring_avail(struct vio_dring_state *dr)
 	return vio_dring_avail(dr, VDC_TX_RING_SIZE);
 }
 
-static int vdc_getgeo(struct block_device *bdev, struct hd_geometry *geo)
+static int vdc_getgeo(struct gendisk *disk, struct hd_geometry *geo)
 {
-	struct gendisk *disk = bdev->bd_disk;
 	sector_t nsect = get_capacity(disk);
 	sector_t cylinders = nsect;
 
@@ -485,7 +484,7 @@ static int __send_request(struct request *req)
 	}
 
 	sg_init_table(sg, port->ring_cookies);
-	nsg = blk_rq_map_sg(req->q, req, sg);
+	nsg = blk_rq_map_sg(req, sg);
 
 	len = 0;
 	for (i = 0; i < nsg; i++)
@@ -526,6 +525,23 @@ static int __send_request(struct request *req)
 	err = __vdc_tx_trigger(port);
 	if (err < 0) {
 		printk(KERN_ERR PFX "vdc_tx_trigger() failure, err=%d\n", err);
+		/*
+		 * If the port was reset (-ENOTCONN), the dring and the
+		 * LDC channel including all of its mappings are already
+		 * torn down and reallocated - there is nothing to undo
+		 * and @desc must not be touched.
+		 *
+		 * For any other failure the descriptor was never handed
+		 * to the peer: unmap the cookies and free the descriptor
+		 * again, so that a later retry of the request does not
+		 * leak LDC map table entries.
+		 */
+		if (err != -ENOTCONN) {
+			ldc_unmap(port->vio.lp, desc->cookies,
+				  desc->ncookies);
+			desc->hdr.state = VIO_DESC_FREE;
+			rqe->req = NULL;
+		}
 	} else {
 		port->req_id++;
 		dr->prod = vio_dring_next(dr, dr->prod);
@@ -540,6 +556,7 @@ static blk_status_t vdc_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct vdc_port *port = hctx->queue->queuedata;
 	struct vio_dring_state *dr;
 	unsigned long flags;
+	int ret;
 
 	dr = &port->vio.drings[VIO_DRIVER_TX_RING];
 
@@ -561,7 +578,13 @@ static blk_status_t vdc_queue_rq(struct blk_mq_hw_ctx *hctx,
 		return BLK_STS_DEV_RESOURCE;
 	}
 
-	if (__send_request(bd->rq) < 0) {
+	ret = __send_request(bd->rq);
+	if (ret == -EAGAIN) {
+		spin_unlock_irqrestore(&port->vio.lock, flags);
+		/* already spun for 10msec, defer 10msec and retry */
+		blk_mq_delay_kick_requeue_list(hctx->queue, 10);
+		return BLK_STS_DEV_RESOURCE;
+	} else if (ret < 0) {
 		spin_unlock_irqrestore(&port->vio.lock, flags);
 		return BLK_STS_IOERR;
 	}
@@ -829,7 +852,7 @@ static int probe_disk(struct vdc_port *port)
 	}
 
 	err = blk_mq_alloc_sq_tag_set(&port->tag_set, &vdc_mq_ops,
-			VDC_TX_RING_SIZE, BLK_MQ_F_SHOULD_MERGE);
+			VDC_TX_RING_SIZE, 0);
 	if (err)
 		return err;
 
@@ -918,12 +941,12 @@ struct vdc_check_port_data {
 	char	*type;
 };
 
-static int vdc_device_probed(struct device *dev, void *arg)
+static int vdc_device_probed(struct device *dev, const void *arg)
 {
 	struct vio_dev *vdev = to_vio_dev(dev);
-	struct vdc_check_port_data *port_data;
+	const struct vdc_check_port_data *port_data;
 
-	port_data = (struct vdc_check_port_data *)arg;
+	port_data = (const struct vdc_check_port_data *)arg;
 
 	if ((vdev->dev_no == port_data->dev_no) &&
 	    (!(strcmp((char *)&vdev->type, port_data->type))) &&
@@ -957,8 +980,10 @@ static bool vdc_port_mpgroup_check(struct vio_dev *vdev)
 	dev = device_find_child(vdev->dev.parent, &port_data,
 				vdc_device_probed);
 
-	if (dev)
+	if (dev) {
+		put_device(dev);
 		return true;
+	}
 
 	return false;
 }
@@ -991,7 +1016,7 @@ static int vdc_port_probe(struct vio_dev *vdev, const struct vio_device_id *id)
 		goto err_out_release_mdesc;
 	}
 
-	port = kzalloc(sizeof(*port), GFP_KERNEL);
+	port = kzalloc_obj(*port);
 	if (!port) {
 		err = -ENOMEM;
 		goto err_out_release_mdesc;
@@ -1070,7 +1095,7 @@ static void vdc_port_remove(struct vio_dev *vdev)
 
 		flush_work(&port->ldc_reset_work);
 		cancel_delayed_work_sync(&port->ldc_reset_timer_work);
-		del_timer_sync(&port->vio.timer);
+		timer_delete_sync(&port->vio.timer);
 
 		del_gendisk(port->disk);
 		put_disk(port->disk);
@@ -1113,6 +1138,7 @@ static void vdc_requeue_inflight(struct vdc_port *port)
 static void vdc_queue_drain(struct vdc_port *port)
 {
 	struct request_queue *q = port->disk->queue;
+	unsigned int memflags;
 
 	/*
 	 * Mark the queue as draining, then freeze/quiesce to ensure
@@ -1121,13 +1147,13 @@ static void vdc_queue_drain(struct vdc_port *port)
 	port->drain = 1;
 	spin_unlock_irq(&port->vio.lock);
 
-	blk_mq_freeze_queue(q);
+	memflags = blk_mq_freeze_queue(q);
 	blk_mq_quiesce_queue(q);
 
 	spin_lock_irq(&port->vio.lock);
 	port->drain = 0;
 	blk_mq_unquiesce_queue(q);
-	blk_mq_unfreeze_queue(q);
+	blk_mq_unfreeze_queue(q, memflags);
 }
 
 static void vdc_ldc_reset_timer_work(struct work_struct *work)
@@ -1186,7 +1212,7 @@ static void vdc_ldc_reset(struct vdc_port *port)
 	}
 
 	if (port->ldc_timeout)
-		mod_delayed_work(system_wq, &port->ldc_reset_timer_work,
+		mod_delayed_work(system_percpu_wq, &port->ldc_reset_timer_work,
 			  round_jiffies(jiffies + HZ * port->ldc_timeout));
 	mod_timer(&port->vio.timer, round_jiffies(jiffies + HZ));
 	return;
@@ -1214,7 +1240,7 @@ static int __init vdc_init(void)
 {
 	int err;
 
-	sunvdc_wq = alloc_workqueue("sunvdc", 0, 0);
+	sunvdc_wq = alloc_workqueue("sunvdc", WQ_PERCPU, 0);
 	if (!sunvdc_wq)
 		return -ENOMEM;
 

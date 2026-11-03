@@ -29,7 +29,7 @@ static LIST_HEAD(fscache_cookie_lru);
 static DEFINE_SPINLOCK(fscache_cookie_lru_lock);
 DEFINE_TIMER(fscache_cookie_lru_timer, fscache_cookie_lru_timed_out);
 static DECLARE_WORK(fscache_cookie_lru_work, fscache_cookie_lru_worker);
-static const char fscache_cookie_states[FSCACHE_COOKIE_STATE__NR] = "-LCAIFUWRD";
+static const char fscache_cookie_states[FSCACHE_COOKIE_STATE__NR] __nonstring = "-LCAIFUWRD";
 static unsigned int fscache_lru_cookie_timeout = 10 * HZ;
 
 void fscache_print_cookie(struct fscache_cookie *cookie, char prefix)
@@ -327,7 +327,7 @@ static struct fscache_cookie *fscache_alloc_cookie(
 	u8 advice,
 	const void *index_key, size_t index_key_len,
 	const void *aux_data, size_t aux_data_len,
-	loff_t object_size)
+	uoff_t object_size)
 {
 	struct fscache_cookie *cookie;
 
@@ -452,7 +452,7 @@ struct fscache_cookie *__fscache_acquire_cookie(
 	u8 advice,
 	const void *index_key, size_t index_key_len,
 	const void *aux_data, size_t aux_data_len,
-	loff_t object_size)
+	uoff_t object_size)
 {
 	struct fscache_cookie *cookie;
 
@@ -663,7 +663,7 @@ static void fscache_unuse_cookie_locked(struct fscache_cookie *cookie)
  * Stop using the cookie for I/O.
  */
 void __fscache_unuse_cookie(struct fscache_cookie *cookie,
-			    const void *aux_data, const loff_t *object_size)
+			    const void *aux_data, const uoff_t *object_size)
 {
 	unsigned int debug_id = cookie->debug_id;
 	unsigned int r = refcount_read(&cookie->ref);
@@ -1049,7 +1049,7 @@ static void fscache_perform_invalidation(struct fscache_cookie *cookie)
  * Invalidate an object.
  */
 void __fscache_invalidate(struct fscache_cookie *cookie,
-			  const void *aux_data, loff_t new_size,
+			  const void *aux_data, uoff_t new_size,
 			  unsigned int flags)
 {
 	bool is_caching;

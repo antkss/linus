@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdlib.h>
@@ -11,6 +12,8 @@
 #include "../util/sort.h"
 #include "../util/evsel.h"
 #include "../util/evlist.h"
+#include "../util/mem-events.h"
+#include "../util/string2.h"
 #include "../util/thread.h"
 #include "../util/util.h"
 
@@ -27,9 +30,10 @@ static int __hpp__fmt_print(struct perf_hpp *hpp, struct hists *hists, u64 val,
 			    int nr_samples, const char *fmt, int len,
 			    hpp_snprint_fn print_fn, enum perf_hpp_fmt_type fmtype)
 {
-	if (fmtype == PERF_HPP_FMT_TYPE__PERCENT) {
+	if (fmtype == PERF_HPP_FMT_TYPE__PERCENT || fmtype == PERF_HPP_FMT_TYPE__LATENCY) {
 		double percent = 0.0;
-		u64 total = hists__total_period(hists);
+		u64 total = fmtype == PERF_HPP_FMT_TYPE__PERCENT ? hists__total_period(hists) :
+			hists__total_latency(hists);
 
 		if (total)
 			percent = 100.0 * val / total;
@@ -53,8 +57,9 @@ struct hpp_fmt_value {
 };
 
 static int __hpp__fmt(struct perf_hpp *hpp, struct hist_entry *he,
-		      hpp_field_fn get_field, const char *fmt, int len,
-		      hpp_snprint_fn print_fn, enum perf_hpp_fmt_type fmtype)
+		      hpp_field_fn get_field, const char *fmtstr, int len,
+		      hpp_snprint_fn print_fn, enum perf_hpp_fmt_type fmtype,
+		      struct perf_hpp_fmt *fmt __maybe_unused)
 {
 	int ret = 0;
 	struct hists *hists = he->hists;
@@ -94,13 +99,50 @@ static int __hpp__fmt(struct perf_hpp *hpp, struct hist_entry *he,
 		}
 	}
 
+	/* Note, merge_entries implies !symbol_conf.report_hierarchy. */
+	if (he->hists->merge_entries) {
+		u64 total_val = 0;
+		u64 total_samples = 0;
+		u64 total_period = 0;
+
+		for (i = 0; i < nr_members; i++) {
+			struct evsel *member_evsel = hists_to_evsel(values[i].hists);
+
+			struct evsel *he_evsel = hists_to_evsel(he->hists);
+
+			if (member_evsel != he_evsel &&
+			    member_evsel->first_wildcard_match != he_evsel)
+				continue;
+
+			total_val += values[i].val;
+			total_samples += values[i].samples;
+			total_period += fmtype == PERF_HPP_FMT_TYPE__PERCENT ?
+					hists__total_period(values[i].hists) :
+					hists__total_latency(values[i].hists);
+		}
+
+		if (fmtype == PERF_HPP_FMT_TYPE__PERCENT || fmtype == PERF_HPP_FMT_TYPE__LATENCY) {
+			double percent = 0.0;
+
+			if (total_period)
+				percent = 100.0 * total_val / total_period;
+			ret += hpp__call_print_fn(hpp, print_fn, fmtstr, len, percent);
+		} else if (fmtype == PERF_HPP_FMT_TYPE__AVERAGE) {
+			double avg = total_samples ? (1.0 * total_val / total_samples) : 0;
+
+			ret += hpp__call_print_fn(hpp, print_fn, fmtstr, len, avg);
+		} else {
+			ret += hpp__call_print_fn(hpp, print_fn, fmtstr, len, total_val);
+		}
+	}
+
 	for (i = 0; i < nr_members; i++) {
 		if (symbol_conf.skip_empty &&
 		    values[i].hists->stats.nr_samples == 0)
 			continue;
 
 		ret += __hpp__fmt_print(hpp, values[i].hists, values[i].val,
-					values[i].samples, fmt, len,
+					values[i].samples, fmtstr, len,
 					print_fn, fmtype);
 	}
 
@@ -121,19 +163,19 @@ int hpp__fmt(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
 	     const char *fmtstr, hpp_snprint_fn print_fn,
 	     enum perf_hpp_fmt_type fmtype)
 {
-	int len = fmt->user_len ?: fmt->len;
+	int len = max(fmt->user_len ?: fmt->len, (int)strlen(fmt->name));
 
 	if (symbol_conf.field_sep) {
 		return __hpp__fmt(hpp, he, get_field, fmtstr, 1,
-				  print_fn, fmtype);
+				  print_fn, fmtype, fmt);
 	}
 
-	if (fmtype == PERF_HPP_FMT_TYPE__PERCENT)
+	if (fmtype == PERF_HPP_FMT_TYPE__PERCENT || fmtype == PERF_HPP_FMT_TYPE__LATENCY)
 		len -= 2; /* 2 for a space and a % sign */
 	else
 		len -= 1;
 
-	return  __hpp__fmt(hpp, he, get_field, fmtstr, len, print_fn, fmtype);
+	return  __hpp__fmt(hpp, he, get_field, fmtstr, len, print_fn, fmtype, fmt);
 }
 
 int hpp__fmt_acc(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
@@ -147,6 +189,48 @@ int hpp__fmt_acc(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
 	}
 
 	return hpp__fmt(fmt, hpp, he, get_field, fmtstr, print_fn, fmtype);
+}
+
+int hpp__fmt_mem_stat(struct perf_hpp_fmt *fmt __maybe_unused, struct perf_hpp *hpp,
+		      struct hist_entry *he, enum mem_stat_type mst,
+		      const char *fmtstr, hpp_snprint_fn print_fn)
+{
+	struct hists *hists = he->hists;
+	int mem_stat_idx = -1;
+	char *buf = hpp->buf;
+	size_t size = hpp->size;
+	u64 total = 0;
+	int ret = 0;
+
+	for (int i = 0; i < hists->nr_mem_stats; i++) {
+		if (hists->mem_stat_types[i] == mst) {
+			mem_stat_idx = i;
+			break;
+		}
+	}
+	assert(mem_stat_idx != -1);
+
+	for (int i = 0; i < MEM_STAT_LEN; i++)
+		total += hists->mem_stat_total[mem_stat_idx].entries[i];
+	assert(total != 0);
+
+	for (int i = 0; i < MEM_STAT_LEN; i++) {
+		u64 val = he->mem_stat[mem_stat_idx].entries[i];
+
+		if (hists->mem_stat_total[mem_stat_idx].entries[i] == 0)
+			continue;
+
+		ret += hpp__call_print_fn(hpp, print_fn, fmtstr, 100.0 * val / total);
+	}
+
+	/*
+	 * Restore original buf and size as it's where caller expects
+	 * the result will be saved.
+	 */
+	hpp->buf = buf;
+	hpp->size = size;
+
+	return ret;
 }
 
 static int field_cmp(u64 field_a, u64 field_b)
@@ -241,6 +325,35 @@ static int __hpp__sort(struct hist_entry *a, struct hist_entry *b,
 		return __hpp__group_sort_idx(a, b, get_field,
 					     symbol_conf.group_sort_idx);
 	}
+	/*
+	 * Relies on merge_entries being only enabled if there are
+	 * only matching events. If that is ever relaxed will need
+	 * more logic here. merge_entries also implies that
+	 * symbol_conf.report_hierarchy is false.
+	 */
+	if (a->hists->merge_entries && b->hists->merge_entries) {
+		u64 val_a = get_field(a), val_b = get_field(b);
+		struct hist_entry *pair;
+		struct evsel *evsel_a = hists_to_evsel(a->hists);
+		struct evsel *evsel_b = hists_to_evsel(b->hists);
+
+		list_for_each_entry(pair, &a->pairs.head, pairs.node) {
+			struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+			if (pair_evsel->first_wildcard_match == evsel_a)
+				val_a += get_field(pair);
+		}
+		list_for_each_entry(pair, &b->pairs.head, pairs.node) {
+			struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+			if (pair_evsel->first_wildcard_match == evsel_b)
+				val_b += get_field(pair);
+		}
+
+		ret = field_cmp(val_a, val_b);
+		if (ret)
+			return ret;
+	}
 
 	ret = field_cmp(get_field(a), get_field(b));
 	if (ret || !symbol_conf.event_group)
@@ -277,7 +390,29 @@ static int __hpp__sort_acc(struct hist_entry *a, struct hist_entry *b,
 		/*
 		 * Put caller above callee when they have equal period.
 		 */
-		ret = field_cmp(get_field(a), get_field(b));
+		if (a->hists->merge_entries && b->hists->merge_entries) {
+			u64 val_a = get_field(a), val_b = get_field(b);
+			struct hist_entry *pair;
+			struct evsel *evsel_a = hists_to_evsel(a->hists);
+			struct evsel *evsel_b = hists_to_evsel(b->hists);
+
+			list_for_each_entry(pair, &a->pairs.head, pairs.node) {
+				struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+				if (pair_evsel->first_wildcard_match == evsel_a)
+					val_a += get_field(pair);
+			}
+			list_for_each_entry(pair, &b->pairs.head, pairs.node) {
+				struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+				if (pair_evsel->first_wildcard_match == evsel_b)
+					val_b += get_field(pair);
+			}
+
+			ret = field_cmp(val_a, val_b);
+		} else {
+			ret = field_cmp(get_field(a), get_field(b));
+		}
 		if (ret)
 			return ret;
 
@@ -291,6 +426,37 @@ static int __hpp__sort_acc(struct hist_entry *a, struct hist_entry *b,
 			ret = -ret;
 	}
 	return ret;
+}
+
+static bool perf_hpp__is_mem_stat_entry(struct perf_hpp_fmt *fmt);
+
+static enum mem_stat_type hpp__mem_stat_type(struct perf_hpp_fmt *fmt)
+{
+	if (!perf_hpp__is_mem_stat_entry(fmt))
+		return -1;
+
+	switch (fmt->idx) {
+	case PERF_HPP__MEM_STAT_OP:
+		return PERF_MEM_STAT_OP;
+	case PERF_HPP__MEM_STAT_CACHE:
+		return PERF_MEM_STAT_CACHE;
+	case PERF_HPP__MEM_STAT_MEMORY:
+		return PERF_MEM_STAT_MEMORY;
+	case PERF_HPP__MEM_STAT_SNOOP:
+		return PERF_MEM_STAT_SNOOP;
+	case PERF_HPP__MEM_STAT_DTLB:
+		return PERF_MEM_STAT_DTLB;
+	default:
+		break;
+	}
+	pr_debug("Should not reach here\n");
+	return -1;
+}
+
+static int64_t hpp__sort_mem_stat(struct perf_hpp_fmt *fmt __maybe_unused,
+				  struct hist_entry *a, struct hist_entry *b)
+{
+	return a->stat.period - b->stat.period;
 }
 
 static int hpp__width_fn(struct perf_hpp_fmt *fmt,
@@ -309,6 +475,8 @@ static int hpp__width_fn(struct perf_hpp_fmt *fmt,
 			    evsel__hists(pos)->stats.nr_samples)
 				nr++;
 		}
+		if (hists->merge_entries)
+			nr++; /* Add 1 extra unit of width generically for the 'Total' */
 
 		len = max(len, nr * fmt->len);
 	}
@@ -320,11 +488,108 @@ static int hpp__width_fn(struct perf_hpp_fmt *fmt,
 }
 
 static int hpp__header_fn(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
-			  struct hists *hists, int line __maybe_unused,
+			  struct hists *hists, int line,
 			  int *span __maybe_unused)
 {
 	int len = hpp__width_fn(fmt, hpp, hists);
-	return scnprintf(hpp->buf, hpp->size, "%*s", len, fmt->name);
+	const char *hdr = "";
+
+	if (line == hists->hpp_list->nr_header_lines - 1) {
+		hdr = fmt->name;
+		if (hists->merge_entries) {
+			int w = 0;
+			int f_len = fmt->user_len ?: fmt->len;
+			struct evsel *pos, *evsel = hists_to_evsel(hists);
+			int string_len = f_len;
+
+			for_each_group_evsel(pos, evsel) {
+				if (symbol_conf.skip_empty &&
+				    evsel__hists(pos)->stats.nr_samples == 0)
+					continue;
+				string_len += f_len;
+			}
+
+			if (len > string_len) {
+				w += scnprintf(hpp->buf + w, hpp->size - w, "%*s",
+					       len - string_len, "");
+			}
+
+			w += scnprintf(hpp->buf + w, hpp->size - w, "%*.*s",
+				       f_len, f_len, fmt->name);
+			for_each_group_evsel(pos, evsel) {
+				if (symbol_conf.skip_empty &&
+				    evsel__hists(pos)->stats.nr_samples == 0)
+					continue;
+				w += scnprintf(hpp->buf + w, hpp->size - w, " %*.*s",
+					       f_len - 1, f_len - 1, evsel__name(pos));
+			}
+			return w;
+		}
+	}
+
+	return scnprintf(hpp->buf, hpp->size, "%*s", len, hdr);
+}
+
+static int hpp__header_mem_stat_fn(struct perf_hpp_fmt *fmt, struct perf_hpp *hpp,
+				   struct hists *hists, int line,
+				   int *span __maybe_unused)
+{
+	char *buf = hpp->buf;
+	int ret = 0;
+	int len;
+	enum mem_stat_type mst = hpp__mem_stat_type(fmt);
+	int mem_stat_idx = -1;
+
+	for (int i = 0; i < hists->nr_mem_stats; i++) {
+		if (hists->mem_stat_types[i] == mst) {
+			mem_stat_idx = i;
+			break;
+		}
+	}
+	assert(mem_stat_idx != -1);
+
+	if (line == 0) {
+		int left, right;
+
+		len = 0;
+		/* update fmt->len for actually used columns only */
+		for (int i = 0; i < MEM_STAT_LEN; i++) {
+			if (hists->mem_stat_total[mem_stat_idx].entries[i])
+				len += MEM_STAT_PRINT_LEN;
+		}
+		fmt->len = len;
+
+		/* print header directly if single column only */
+		if (len == MEM_STAT_PRINT_LEN)
+			return scnprintf(hpp->buf, hpp->size, "%*s", len, fmt->name);
+
+		left = (len - strlen(fmt->name)) / 2 - 1;
+		right = len - left - strlen(fmt->name) - 2;
+
+		if (left < 0)
+			left = 0;
+		if (right < 0)
+			right = 0;
+
+		return scnprintf(hpp->buf, hpp->size, "%.*s %s %.*s",
+				 left, graph_dotted_line, fmt->name, right, graph_dotted_line);
+	}
+
+
+	len = hpp->size;
+	for (int i = 0; i < MEM_STAT_LEN; i++) {
+		int printed;
+
+		if (hists->mem_stat_total[mem_stat_idx].entries[i] == 0)
+			continue;
+
+		printed = scnprintf(buf, len, "%*s", MEM_STAT_PRINT_LEN,
+				    mem_stat_name(mst, i));
+		ret += printed;
+		buf += printed;
+		len -= printed;
+	}
+	return ret;
 }
 
 int hpp_color_scnprintf(struct perf_hpp *hpp, const char *fmt, ...)
@@ -356,7 +621,7 @@ static int hpp_entry_scnprintf(struct perf_hpp *hpp, const char *fmt, ...)
 	return (ret >= ssize) ? (ssize - 1) : ret;
 }
 
-#define __HPP_COLOR_PERCENT_FN(_type, _field)					\
+#define __HPP_COLOR_PERCENT_FN(_type, _field, _fmttype)				\
 static u64 he_get_##_field(struct hist_entry *he)				\
 {										\
 	return he->stat._field;							\
@@ -366,15 +631,15 @@ static int hpp__color_##_type(struct perf_hpp_fmt *fmt,				\
 			      struct perf_hpp *hpp, struct hist_entry *he) 	\
 {										\
 	return hpp__fmt(fmt, hpp, he, he_get_##_field, " %*.2f%%",		\
-			hpp_color_scnprintf, PERF_HPP_FMT_TYPE__PERCENT);	\
+			hpp_color_scnprintf, _fmttype);				\
 }
 
-#define __HPP_ENTRY_PERCENT_FN(_type, _field)					\
+#define __HPP_ENTRY_PERCENT_FN(_type, _field, _fmttype)				\
 static int hpp__entry_##_type(struct perf_hpp_fmt *fmt,				\
 			      struct perf_hpp *hpp, struct hist_entry *he) 	\
 {										\
 	return hpp__fmt(fmt, hpp, he, he_get_##_field, " %*.2f%%",		\
-			hpp_entry_scnprintf, PERF_HPP_FMT_TYPE__PERCENT);	\
+			hpp_entry_scnprintf, _fmttype);	\
 }
 
 #define __HPP_SORT_FN(_type, _field)						\
@@ -384,7 +649,7 @@ static int64_t hpp__sort_##_type(struct perf_hpp_fmt *fmt __maybe_unused, 	\
 	return __hpp__sort(a, b, he_get_##_field);				\
 }
 
-#define __HPP_COLOR_ACC_PERCENT_FN(_type, _field)				\
+#define __HPP_COLOR_ACC_PERCENT_FN(_type, _field, _fmttype)			\
 static u64 he_get_acc_##_field(struct hist_entry *he)				\
 {										\
 	return he->stat_acc->_field;						\
@@ -394,15 +659,15 @@ static int hpp__color_##_type(struct perf_hpp_fmt *fmt,				\
 			      struct perf_hpp *hpp, struct hist_entry *he) 	\
 {										\
 	return hpp__fmt_acc(fmt, hpp, he, he_get_acc_##_field, " %*.2f%%", 	\
-			    hpp_color_scnprintf, PERF_HPP_FMT_TYPE__PERCENT);	\
+			    hpp_color_scnprintf, _fmttype);			\
 }
 
-#define __HPP_ENTRY_ACC_PERCENT_FN(_type, _field)				\
+#define __HPP_ENTRY_ACC_PERCENT_FN(_type, _field, _fmttype)			\
 static int hpp__entry_##_type(struct perf_hpp_fmt *fmt,				\
 			      struct perf_hpp *hpp, struct hist_entry *he) 	\
 {										\
 	return hpp__fmt_acc(fmt, hpp, he, he_get_acc_##_field, " %*.2f%%",	\
-			    hpp_entry_scnprintf, PERF_HPP_FMT_TYPE__PERCENT);	\
+			    hpp_entry_scnprintf, _fmttype);			\
 }
 
 #define __HPP_SORT_ACC_FN(_type, _field)					\
@@ -452,15 +717,32 @@ static int64_t hpp__sort_##_type(struct perf_hpp_fmt *fmt __maybe_unused, 	\
 	return __hpp__sort(a, b, he_get_##_field);				\
 }
 
+#define __HPP_COLOR_MEM_STAT_FN(_name, _type)					\
+static int hpp__color_mem_stat_##_name(struct perf_hpp_fmt *fmt,		\
+				       struct perf_hpp *hpp,			\
+				       struct hist_entry *he)			\
+{										\
+	return hpp__fmt_mem_stat(fmt, hpp, he, PERF_MEM_STAT_##_type,		\
+				 " %5.1f%%", hpp_color_scnprintf);		\
+}
 
-#define HPP_PERCENT_FNS(_type, _field)					\
-__HPP_COLOR_PERCENT_FN(_type, _field)					\
-__HPP_ENTRY_PERCENT_FN(_type, _field)					\
+#define __HPP_ENTRY_MEM_STAT_FN(_name, _type)					\
+static int hpp__entry_mem_stat_##_name(struct perf_hpp_fmt *fmt, 		\
+				       struct perf_hpp *hpp,			\
+				       struct hist_entry *he)			\
+{										\
+	return hpp__fmt_mem_stat(fmt, hpp, he, PERF_MEM_STAT_##_type,		\
+				 " %5.1f%%", hpp_entry_scnprintf);		\
+}
+
+#define HPP_PERCENT_FNS(_type, _field, _fmttype)			\
+__HPP_COLOR_PERCENT_FN(_type, _field, _fmttype)				\
+__HPP_ENTRY_PERCENT_FN(_type, _field, _fmttype)				\
 __HPP_SORT_FN(_type, _field)
 
-#define HPP_PERCENT_ACC_FNS(_type, _field)				\
-__HPP_COLOR_ACC_PERCENT_FN(_type, _field)				\
-__HPP_ENTRY_ACC_PERCENT_FN(_type, _field)				\
+#define HPP_PERCENT_ACC_FNS(_type, _field, _fmttype)			\
+__HPP_COLOR_ACC_PERCENT_FN(_type, _field, _fmttype)			\
+__HPP_ENTRY_ACC_PERCENT_FN(_type, _field, _fmttype)			\
 __HPP_SORT_ACC_FN(_type, _field)
 
 #define HPP_RAW_FNS(_type, _field)					\
@@ -471,12 +753,18 @@ __HPP_SORT_RAW_FN(_type, _field)
 __HPP_ENTRY_AVERAGE_FN(_type, _field)					\
 __HPP_SORT_AVERAGE_FN(_type, _field)
 
-HPP_PERCENT_FNS(overhead, period)
-HPP_PERCENT_FNS(overhead_sys, period_sys)
-HPP_PERCENT_FNS(overhead_us, period_us)
-HPP_PERCENT_FNS(overhead_guest_sys, period_guest_sys)
-HPP_PERCENT_FNS(overhead_guest_us, period_guest_us)
-HPP_PERCENT_ACC_FNS(overhead_acc, period)
+#define HPP_MEM_STAT_FNS(_name, _type)					\
+__HPP_COLOR_MEM_STAT_FN(_name, _type)					\
+__HPP_ENTRY_MEM_STAT_FN(_name, _type)
+
+HPP_PERCENT_FNS(overhead, period, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_FNS(latency, latency, PERF_HPP_FMT_TYPE__LATENCY)
+HPP_PERCENT_FNS(overhead_sys, period_sys, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_FNS(overhead_us, period_us, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_FNS(overhead_guest_sys, period_guest_sys, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_FNS(overhead_guest_us, period_guest_us, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_ACC_FNS(overhead_acc, period, PERF_HPP_FMT_TYPE__PERCENT)
+HPP_PERCENT_ACC_FNS(latency_acc, latency, PERF_HPP_FMT_TYPE__LATENCY)
 
 HPP_RAW_FNS(samples, nr_events)
 HPP_RAW_FNS(period, period)
@@ -485,11 +773,22 @@ HPP_AVERAGE_FNS(weight1, weight1)
 HPP_AVERAGE_FNS(weight2, weight2)
 HPP_AVERAGE_FNS(weight3, weight3)
 
+HPP_MEM_STAT_FNS(op, OP)
+HPP_MEM_STAT_FNS(cache, CACHE)
+HPP_MEM_STAT_FNS(memory, MEMORY)
+HPP_MEM_STAT_FNS(snoop, SNOOP)
+HPP_MEM_STAT_FNS(dtlb, DTLB)
+
 static int64_t hpp__nop_cmp(struct perf_hpp_fmt *fmt __maybe_unused,
 			    struct hist_entry *a __maybe_unused,
 			    struct hist_entry *b __maybe_unused)
 {
 	return 0;
+}
+
+static bool perf_hpp__is_mem_stat_entry(struct perf_hpp_fmt *fmt)
+{
+	return fmt->sort == hpp__sort_mem_stat;
 }
 
 static bool perf_hpp__is_hpp_entry(struct perf_hpp_fmt *a)
@@ -503,6 +802,14 @@ static bool hpp__equal(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b)
 		return false;
 
 	return a->idx == b->idx;
+}
+
+static bool hpp__equal_mem_stat(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b)
+{
+	if (!perf_hpp__is_mem_stat_entry(a) || !perf_hpp__is_mem_stat_entry(b))
+		return false;
+
+	return a->entry == b->entry;
 }
 
 #define HPP__COLOR_PRINT_FNS(_name, _fn, _idx)		\
@@ -546,18 +853,39 @@ static bool hpp__equal(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b)
 		.equal	= hpp__equal,			\
 	}
 
+#define HPP__MEM_STAT_PRINT_FNS(_name, _fn, _type)	\
+	{						\
+		.name   = _name,			\
+		.header	= hpp__header_mem_stat_fn,	\
+		.width	= hpp__width_fn,		\
+		.color	= hpp__color_mem_stat_ ## _fn,	\
+		.entry	= hpp__entry_mem_stat_ ## _fn,	\
+		.cmp	= hpp__nop_cmp,			\
+		.collapse = hpp__nop_cmp,		\
+		.sort	= hpp__sort_mem_stat,		\
+		.idx	= PERF_HPP__MEM_STAT_ ## _type,	\
+		.equal	= hpp__equal_mem_stat,		\
+	}
+
 struct perf_hpp_fmt perf_hpp__format[] = {
 	HPP__COLOR_PRINT_FNS("Overhead", overhead, OVERHEAD),
+	HPP__COLOR_PRINT_FNS("Latency", latency, LATENCY),
 	HPP__COLOR_PRINT_FNS("sys", overhead_sys, OVERHEAD_SYS),
 	HPP__COLOR_PRINT_FNS("usr", overhead_us, OVERHEAD_US),
 	HPP__COLOR_PRINT_FNS("guest sys", overhead_guest_sys, OVERHEAD_GUEST_SYS),
 	HPP__COLOR_PRINT_FNS("guest usr", overhead_guest_us, OVERHEAD_GUEST_US),
 	HPP__COLOR_ACC_PRINT_FNS("Children", overhead_acc, OVERHEAD_ACC),
+	HPP__COLOR_ACC_PRINT_FNS("Latency", latency_acc, LATENCY_ACC),
 	HPP__PRINT_FNS("Samples", samples, SAMPLES),
 	HPP__PRINT_FNS("Period", period, PERIOD),
 	HPP__PRINT_FNS("Weight1", weight1, WEIGHT1),
 	HPP__PRINT_FNS("Weight2", weight2, WEIGHT2),
 	HPP__PRINT_FNS("Weight3", weight3, WEIGHT3),
+	HPP__MEM_STAT_PRINT_FNS("Mem Op", op, OP),
+	HPP__MEM_STAT_PRINT_FNS("Cache", cache, CACHE),
+	HPP__MEM_STAT_PRINT_FNS("Memory", memory, MEMORY),
+	HPP__MEM_STAT_PRINT_FNS("Snoop", snoop, SNOOP),
+	HPP__MEM_STAT_PRINT_FNS("D-TLB", dtlb, DTLB),
 };
 
 struct perf_hpp_list perf_hpp_list = {
@@ -569,11 +897,13 @@ struct perf_hpp_list perf_hpp_list = {
 #undef HPP__COLOR_PRINT_FNS
 #undef HPP__COLOR_ACC_PRINT_FNS
 #undef HPP__PRINT_FNS
+#undef HPP__MEM_STAT_PRINT_FNS
 
 #undef HPP_PERCENT_FNS
 #undef HPP_PERCENT_ACC_FNS
 #undef HPP_RAW_FNS
 #undef HPP_AVERAGE_FNS
+#undef HPP_MEM_STAT_FNS
 
 #undef __HPP_HEADER_FN
 #undef __HPP_WIDTH_FN
@@ -583,6 +913,9 @@ struct perf_hpp_list perf_hpp_list = {
 #undef __HPP_ENTRY_ACC_PERCENT_FN
 #undef __HPP_ENTRY_RAW_FN
 #undef __HPP_ENTRY_AVERAGE_FN
+#undef __HPP_COLOR_MEM_STAT_FN
+#undef __HPP_ENTRY_MEM_STAT_FN
+
 #undef __HPP_SORT_FN
 #undef __HPP_SORT_ACC_FN
 #undef __HPP_SORT_RAW_FN
@@ -599,6 +932,11 @@ static void fmt_free(struct perf_hpp_fmt *fmt)
 
 	if (fmt->free)
 		fmt->free(fmt);
+}
+
+static bool fmt_equal(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b)
+{
+	return a->equal && a->equal(a, b);
 }
 
 void perf_hpp__init(void)
@@ -621,28 +959,48 @@ void perf_hpp__init(void)
 	if (is_strict_order(field_order))
 		return;
 
+	/*
+	 * Overhead and latency columns are added in setup_overhead(),
+	 * so they are added implicitly here only if they were added
+	 * by setup_overhead() before (have was_taken flag set).
+	 * This is required because setup_overhead() has more complex
+	 * logic, in particular it does not add "overhead" if user
+	 * specified "latency" in sort order, and vise versa.
+	 */
 	if (symbol_conf.cumulate_callchain) {
-		hpp_dimension__add_output(PERF_HPP__OVERHEAD_ACC);
+		/*
+		 * Addition of fields is idempotent, so we add latency
+		 * column twice to get desired order with simpler logic.
+		 */
+		if (symbol_conf.prefer_latency)
+			hpp_dimension__add_output(PERF_HPP__LATENCY_ACC, true);
+		hpp_dimension__add_output(PERF_HPP__OVERHEAD_ACC, true);
+		if (symbol_conf.enable_latency)
+			hpp_dimension__add_output(PERF_HPP__LATENCY_ACC, true);
 		perf_hpp__format[PERF_HPP__OVERHEAD].name = "Self";
 	}
 
-	hpp_dimension__add_output(PERF_HPP__OVERHEAD);
+	if (symbol_conf.prefer_latency)
+		hpp_dimension__add_output(PERF_HPP__LATENCY, true);
+	hpp_dimension__add_output(PERF_HPP__OVERHEAD, true);
+	if (symbol_conf.enable_latency)
+		hpp_dimension__add_output(PERF_HPP__LATENCY, true);
 
 	if (symbol_conf.show_cpu_utilization) {
-		hpp_dimension__add_output(PERF_HPP__OVERHEAD_SYS);
-		hpp_dimension__add_output(PERF_HPP__OVERHEAD_US);
+		hpp_dimension__add_output(PERF_HPP__OVERHEAD_SYS, false);
+		hpp_dimension__add_output(PERF_HPP__OVERHEAD_US, false);
 
 		if (perf_guest) {
-			hpp_dimension__add_output(PERF_HPP__OVERHEAD_GUEST_SYS);
-			hpp_dimension__add_output(PERF_HPP__OVERHEAD_GUEST_US);
+			hpp_dimension__add_output(PERF_HPP__OVERHEAD_GUEST_SYS, false);
+			hpp_dimension__add_output(PERF_HPP__OVERHEAD_GUEST_US, false);
 		}
 	}
 
 	if (symbol_conf.show_nr_samples)
-		hpp_dimension__add_output(PERF_HPP__SAMPLES);
+		hpp_dimension__add_output(PERF_HPP__SAMPLES, false);
 
 	if (symbol_conf.show_total_period)
-		hpp_dimension__add_output(PERF_HPP__PERIOD);
+		hpp_dimension__add_output(PERF_HPP__PERIOD, false);
 }
 
 void perf_hpp_list__column_register(struct perf_hpp_list *list,
@@ -666,33 +1024,79 @@ void perf_hpp_list__prepend_sort_field(struct perf_hpp_list *list,
 static void perf_hpp__column_unregister(struct perf_hpp_fmt *format)
 {
 	list_del_init(&format->list);
+	list_del_init(&format->sort_list);
 	fmt_free(format);
 }
 
-void perf_hpp__cancel_cumulate(void)
+void perf_hpp__cancel_cumulate(struct evlist *evlist)
 {
-	struct perf_hpp_fmt *fmt, *acc, *ovh, *tmp;
+	struct perf_hpp_fmt *fmt, *acc, *ovh, *acc_lat, *tmp;
+	struct evsel *evsel;
 
 	if (is_strict_order(field_order))
 		return;
 
 	ovh = &perf_hpp__format[PERF_HPP__OVERHEAD];
 	acc = &perf_hpp__format[PERF_HPP__OVERHEAD_ACC];
+	acc_lat = &perf_hpp__format[PERF_HPP__LATENCY_ACC];
 
 	perf_hpp_list__for_each_format_safe(&perf_hpp_list, fmt, tmp) {
-		if (acc->equal(acc, fmt)) {
+		if (fmt_equal(acc, fmt) || fmt_equal(acc_lat, fmt)) {
 			perf_hpp__column_unregister(fmt);
 			continue;
 		}
 
-		if (ovh->equal(ovh, fmt))
+		if (fmt_equal(ovh, fmt))
 			fmt->name = "Overhead";
+	}
+
+	evlist__for_each_entry(evlist, evsel) {
+		struct hists *hists = evsel__hists(evsel);
+		struct perf_hpp_list_node *node;
+
+		list_for_each_entry(node, &hists->hpp_formats, list) {
+			perf_hpp_list__for_each_format_safe(&node->hpp, fmt, tmp) {
+				if (fmt_equal(acc, fmt) || fmt_equal(acc_lat, fmt)) {
+					perf_hpp__column_unregister(fmt);
+					continue;
+				}
+
+				if (fmt_equal(ovh, fmt))
+					fmt->name = "Overhead";
+			}
+		}
 	}
 }
 
-static bool fmt_equal(struct perf_hpp_fmt *a, struct perf_hpp_fmt *b)
+void perf_hpp__cancel_latency(struct evlist *evlist)
 {
-	return a->equal && a->equal(a, b);
+	struct perf_hpp_fmt *fmt, *lat, *acc, *tmp;
+	struct evsel *evsel;
+
+	if (is_strict_order(field_order))
+		return;
+	if (sort_order && strstr(sort_order, "latency"))
+		return;
+
+	lat = &perf_hpp__format[PERF_HPP__LATENCY];
+	acc = &perf_hpp__format[PERF_HPP__LATENCY_ACC];
+
+	perf_hpp_list__for_each_format_safe(&perf_hpp_list, fmt, tmp) {
+		if (fmt_equal(lat, fmt) || fmt_equal(acc, fmt))
+			perf_hpp__column_unregister(fmt);
+	}
+
+	evlist__for_each_entry(evlist, evsel) {
+		struct hists *hists = evsel__hists(evsel);
+		struct perf_hpp_list_node *node;
+
+		list_for_each_entry(node, &hists->hpp_formats, list) {
+			perf_hpp_list__for_each_format_safe(&node->hpp, fmt, tmp) {
+				if (fmt_equal(lat, fmt) || fmt_equal(acc, fmt))
+					perf_hpp__column_unregister(fmt);
+			}
+		}
+	}
 }
 
 void perf_hpp__setup_output_field(struct perf_hpp_list *list)
@@ -743,18 +1147,12 @@ void perf_hpp__reset_output_field(struct perf_hpp_list *list)
 	struct perf_hpp_fmt *fmt, *tmp;
 
 	/* reset output fields */
-	perf_hpp_list__for_each_format_safe(list, fmt, tmp) {
-		list_del_init(&fmt->list);
-		list_del_init(&fmt->sort_list);
-		fmt_free(fmt);
-	}
+	perf_hpp_list__for_each_format_safe(list, fmt, tmp)
+		perf_hpp__column_unregister(fmt);
 
 	/* reset sort keys */
-	perf_hpp_list__for_each_sort_list_safe(list, fmt, tmp) {
-		list_del_init(&fmt->list);
-		list_del_init(&fmt->sort_list);
-		fmt_free(fmt);
-	}
+	perf_hpp_list__for_each_sort_list_safe(list, fmt, tmp)
+		perf_hpp__column_unregister(fmt);
 }
 
 /*
@@ -819,6 +1217,7 @@ void perf_hpp__reset_width(struct perf_hpp_fmt *fmt, struct hists *hists)
 
 	switch (fmt->idx) {
 	case PERF_HPP__OVERHEAD:
+	case PERF_HPP__LATENCY:
 	case PERF_HPP__OVERHEAD_SYS:
 	case PERF_HPP__OVERHEAD_US:
 	case PERF_HPP__OVERHEAD_ACC:
@@ -839,6 +1238,14 @@ void perf_hpp__reset_width(struct perf_hpp_fmt *fmt, struct hists *hists)
 	case PERF_HPP__WEIGHT2:
 	case PERF_HPP__WEIGHT3:
 		fmt->len = 8;
+		break;
+
+	case PERF_HPP__MEM_STAT_OP:
+	case PERF_HPP__MEM_STAT_CACHE:
+	case PERF_HPP__MEM_STAT_MEMORY:
+	case PERF_HPP__MEM_STAT_SNOOP:
+	case PERF_HPP__MEM_STAT_DTLB:
+		fmt->len = MEM_STAT_LEN * MEM_STAT_PRINT_LEN;
 		break;
 
 	default:
@@ -945,4 +1352,154 @@ int perf_hpp__setup_hists_formats(struct perf_hpp_list *list,
 	}
 
 	return 0;
+}
+
+int perf_hpp__alloc_mem_stats(struct perf_hpp_list *list, struct evlist *evlist)
+{
+	struct perf_hpp_fmt *fmt;
+	struct evsel *evsel;
+	enum mem_stat_type mst[16];
+	unsigned nr_mem_stats = 0;
+
+	perf_hpp_list__for_each_format(list, fmt) {
+		if (!perf_hpp__is_mem_stat_entry(fmt))
+			continue;
+
+		assert(nr_mem_stats < ARRAY_SIZE(mst));
+		mst[nr_mem_stats++] = hpp__mem_stat_type(fmt);
+	}
+
+	if (nr_mem_stats == 0)
+		return 0;
+
+	list->nr_header_lines = 2;
+
+	evlist__for_each_entry(evlist, evsel) {
+		struct hists *hists = evsel__hists(evsel);
+
+		hists->mem_stat_types = calloc(nr_mem_stats,
+					       sizeof(*hists->mem_stat_types));
+		if (hists->mem_stat_types == NULL)
+			return -ENOMEM;
+
+		hists->mem_stat_total = calloc(nr_mem_stats,
+					       sizeof(*hists->mem_stat_total));
+		if (hists->mem_stat_total == NULL)
+			return -ENOMEM;
+
+		memcpy(hists->mem_stat_types, mst, nr_mem_stats * sizeof(*mst));
+		hists->nr_mem_stats = nr_mem_stats;
+	}
+	return 0;
+}
+
+float hist_entry__get_percent_limit_merged(struct hist_entry *he)
+{
+	struct hist_entry *pair;
+	u64 period = he->stat.period;
+	u64 total_period = hists__total_period(he->hists);
+	struct evsel *evsel = hists_to_evsel(he->hists);
+	struct evsel *pos;
+
+	/* Accumulate global total_period across all merged hists matching hybrid type */
+	for_each_group_member(pos, evsel) {
+		if (pos->first_wildcard_match == evsel)
+			total_period += hists__total_period(evsel__hists(pos));
+	}
+
+	if (unlikely(total_period == 0))
+		return 0;
+
+	if (symbol_conf.cumulate_callchain) {
+		period = he->stat_acc->period;
+		list_for_each_entry(pair, &he->pairs.head, pairs.node) {
+			struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+			if (pair_evsel->first_wildcard_match == evsel)
+				period += pair->stat_acc->period;
+		}
+	} else {
+		/* Accumulate symbol specific period across pairs matching hybrid type */
+		list_for_each_entry(pair, &he->pairs.head, pairs.node) {
+			struct evsel *pair_evsel = hists_to_evsel(pair->hists);
+
+			if (pair_evsel->first_wildcard_match == evsel)
+				period += pair->stat.period;
+		}
+	}
+
+	return period * 100.0 / total_period;
+}
+
+void evlist__merge_hists_hybrid(struct evlist *evlist, bool refresh_hists)
+{
+	struct evsel *pos;
+	struct evsel *member;
+	bool hybrid_group;
+
+	/*
+	 * Merged hists display all the events of a group in a single set of
+	 * entries, which the hierarchy display has no way to render. Keeping
+	 * hists->merge_entries false here means the rest of the display code
+	 * can assume merge_entries implies !symbol_conf.report_hierarchy.
+	 */
+	if (symbol_conf.report_hierarchy)
+		return;
+
+	/* Set merge_entries flag strictly on leaders formulated by hybrid topology */
+	evlist__for_each_entry(evlist, pos) {
+		if (evsel__is_dummy_event(pos))
+			continue;
+
+		if (pos->core.leader == &pos->core && pos->core.nr_members > 1) {
+			hybrid_group = false;
+
+			if (pos->first_wildcard_match || pos->merged_hybrid_group) {
+				hybrid_group = true;
+			} else {
+				for_each_group_member(member, pos) {
+					if (member->first_wildcard_match ||
+					    member->merged_hybrid_group) {
+						hybrid_group = true;
+						break;
+					}
+				}
+			}
+
+			if (hybrid_group) {
+				evsel__hists(pos)->merge_entries = true;
+				symbol_conf.event_group = true;
+				symbol_conf.hybrid_merge = true;
+				if (!pos->group_name) {
+					pos->group_name = strdup("Merged hybrid events");
+					if (!pos->group_name)
+						pr_warning("Failed to allocate hybrid group name\n");
+				}
+			}
+		}
+	}
+
+	if (!refresh_hists)
+		return;
+
+	evlist__for_each_entry(evlist, pos) {
+		/* Match histograms dynamically since parsing happened before group toggling */
+		if (symbol_conf.event_group && !evsel__is_group_leader(pos)) {
+			struct hists *leader_hists = evsel__hists(evsel__leader(pos));
+			struct hists *hists = evsel__hists(pos);
+
+			hists__match(leader_hists, hists);
+			hists__link(leader_hists, hists);
+		}
+	}
+
+	/* Now that links are formed, safely resort the active tree so the UI renders accurately */
+	if (symbol_conf.event_group) {
+		evlist__for_each_entry(evlist, pos) {
+			if (evsel__is_dummy_event(pos) || !evsel__is_group_leader(pos))
+				continue;
+			if (pos->core.nr_members > 1 && evsel__hists(pos)->merge_entries)
+				hists__output_resort(evsel__hists(pos), NULL);
+		}
+	}
 }

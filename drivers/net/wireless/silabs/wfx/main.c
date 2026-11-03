@@ -121,6 +121,12 @@ static const struct ieee80211_iface_combination wfx_iface_combinations[] = {
 	}
 };
 
+#ifdef CONFIG_PM
+static const struct wiphy_wowlan_support wfx_wowlan_support = {
+	.flags = WIPHY_WOWLAN_ANY | WIPHY_WOWLAN_DISCONNECT,
+};
+#endif
+
 static const struct ieee80211_ops wfx_ops = {
 	.start                   = wfx_start,
 	.stop                    = wfx_stop,
@@ -153,6 +159,11 @@ static const struct ieee80211_ops wfx_ops = {
 	.unassign_vif_chanctx    = wfx_unassign_vif_chanctx,
 	.remain_on_channel       = wfx_remain_on_channel,
 	.cancel_remain_on_channel = wfx_cancel_remain_on_channel,
+#ifdef CONFIG_PM
+	.suspend                 = wfx_suspend,
+	.resume                  = wfx_resume,
+	.set_wakeup              = wfx_set_wakeup,
+#endif
 };
 
 bool wfx_api_older_than(struct wfx_dev *wdev, int major, int minor)
@@ -289,6 +300,9 @@ struct wfx_dev *wfx_init_common(struct device *dev, const struct wfx_platform_da
 					NL80211_PROBE_RESP_OFFLOAD_SUPPORT_P2P |
 					NL80211_PROBE_RESP_OFFLOAD_SUPPORT_80211U;
 	hw->wiphy->features |= NL80211_FEATURE_AP_SCAN;
+#ifdef CONFIG_PM
+	hw->wiphy->wowlan = &wfx_wowlan_support;
+#endif
 	hw->wiphy->flags |= WIPHY_FLAG_AP_PROBE_RESP_OFFLOAD;
 	hw->wiphy->flags |= WIPHY_FLAG_AP_UAPSD;
 	hw->wiphy->max_remain_on_channel_duration = 5000;
@@ -348,24 +362,31 @@ int wfx_probe(struct wfx_dev *wdev)
 	 */
 	gpio_saved = wdev->pdata.gpio_wakeup;
 	wdev->pdata.gpio_wakeup = NULL;
-	wdev->poll_irq = true;
 
-	wdev->bh_wq = alloc_workqueue("wfx_bh_wq", WQ_HIGHPRI, 0);
+	wdev->bh_wq = alloc_workqueue("wfx_bh_wq", WQ_HIGHPRI | WQ_PERCPU, 0);
 	if (!wdev->bh_wq)
 		return -ENOMEM;
 
 	wfx_bh_register(wdev);
 
+	if (!wdev->poll_irq) {
+		err = wdev->hwbus_ops->irq_subscribe(wdev->hwbus_priv);
+		if (err)
+			goto bh_unregister;
+	}
+
 	err = wfx_init_device(wdev);
 	if (err)
-		goto bh_unregister;
+		goto irq_unsubscribe;
 
-	wfx_bh_poll_irq(wdev);
+	if (wdev->poll_irq)
+		wfx_bh_poll_irq(wdev);
+
 	err = wait_for_completion_timeout(&wdev->firmware_ready, 1 * HZ);
 	if (err == 0) {
 		dev_err(wdev->dev, "timeout while waiting for startup indication\n");
 		err = -ETIMEDOUT;
-		goto bh_unregister;
+		goto irq_unsubscribe;
 	}
 
 	/* FIXME: fill wiphy::hw_version */
@@ -385,12 +406,13 @@ int wfx_probe(struct wfx_dev *wdev)
 		dev_err(wdev->dev, "unsupported firmware API version (expect 1 while firmware returns %d)\n",
 			wdev->hw_caps.api_version_major);
 		err = -EOPNOTSUPP;
-		goto bh_unregister;
+		goto irq_unsubscribe;
 	}
 
 	if (wdev->hw_caps.link_mode == SEC_LINK_ENFORCED) {
 		dev_err(wdev->dev, "chip require secure_link, but can't negotiate it\n");
-		goto bh_unregister;
+		err = -EOPNOTSUPP;
+		goto irq_unsubscribe;
 	}
 
 	if (wdev->hw_caps.region_sel_mode) {
@@ -406,12 +428,14 @@ int wfx_probe(struct wfx_dev *wdev)
 	dev_dbg(wdev->dev, "sending configuration file %s\n", wdev->pdata.file_pds);
 	err = wfx_send_pdata_pds(wdev);
 	if (err < 0 && err != -ENOENT)
-		goto bh_unregister;
+		goto irq_unsubscribe;
 
-	wdev->poll_irq = false;
-	err = wdev->hwbus_ops->irq_subscribe(wdev->hwbus_priv);
-	if (err)
-		goto bh_unregister;
+	if (wdev->poll_irq) {
+		err = wdev->hwbus_ops->irq_subscribe(wdev->hwbus_priv);
+		if (err)
+			goto bh_unregister;
+		wdev->poll_irq = false;
+	}
 
 	err = wfx_hif_use_multi_tx_conf(wdev, true);
 	if (err)
@@ -460,9 +484,11 @@ int wfx_probe(struct wfx_dev *wdev)
 ieee80211_unregister:
 	ieee80211_unregister_hw(wdev->hw);
 irq_unsubscribe:
-	wdev->hwbus_ops->irq_unsubscribe(wdev->hwbus_priv);
+	if (!wdev->poll_irq)
+		wdev->hwbus_ops->irq_unsubscribe(wdev->hwbus_priv);
 bh_unregister:
 	wfx_bh_unregister(wdev);
+	cancel_delayed_work_sync(&wdev->cooling_timeout_work);
 	destroy_workqueue(wdev->bh_wq);
 	return err;
 }
@@ -473,6 +499,7 @@ void wfx_release(struct wfx_dev *wdev)
 	wfx_hif_shutdown(wdev);
 	wdev->hwbus_ops->irq_unsubscribe(wdev->hwbus_priv);
 	wfx_bh_unregister(wdev);
+	cancel_delayed_work_sync(&wdev->cooling_timeout_work);
 	destroy_workqueue(wdev->bh_wq);
 }
 

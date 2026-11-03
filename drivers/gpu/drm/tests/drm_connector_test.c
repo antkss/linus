@@ -9,6 +9,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
+#include <drm/drm_file.h>
 #include <drm/drm_kunit_helpers.h>
 #include <drm/drm_modes.h>
 
@@ -24,7 +25,26 @@ struct drm_connector_init_priv {
 	struct i2c_adapter ddc;
 };
 
+static int accept_infoframe_clear_infoframe(struct drm_connector *connector)
+{
+	return 0;
+}
+
+static int accept_infoframe_write_infoframe(struct drm_connector *connector,
+					    const u8 *buffer, size_t len)
+{
+	return 0;
+}
+
 static const struct drm_connector_hdmi_funcs dummy_hdmi_funcs = {
+	.avi = {
+		.clear_infoframe = accept_infoframe_clear_infoframe,
+		.write_infoframe = accept_infoframe_write_infoframe,
+	},
+	.hdmi = {
+		.clear_infoframe = accept_infoframe_clear_infoframe,
+		.write_infoframe = accept_infoframe_write_infoframe,
+	},
 };
 
 static const struct drm_connector_funcs dummy_funcs = {
@@ -181,6 +201,465 @@ static struct kunit_suite drmm_connector_init_test_suite = {
 	.test_cases = drmm_connector_init_tests,
 };
 
+static const struct drm_connector_funcs dummy_dynamic_init_funcs = {
+	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
+	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
+	.reset			= drm_atomic_helper_connector_reset,
+	.destroy		= drm_connector_cleanup,
+};
+
+/*
+ * Test that the initialization of a bog standard dynamic connector works
+ * as expected and doesn't report any error.
+ */
+static void drm_test_drm_connector_dynamic_init(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 DRM_MODE_CONNECTOR_DisplayPort,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+static void drm_test_connector_dynamic_init_cleanup(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+
+	drm_connector_cleanup(connector);
+}
+
+/*
+ * Test that the initialization of a dynamic connector without a DDC adapter
+ * doesn't report any error.
+ */
+static void drm_test_drm_connector_dynamic_init_null_ddc(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 DRM_MODE_CONNECTOR_DisplayPort,
+					 NULL);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+/*
+ * Test that the initialization of a dynamic connector doesn't add the
+ * connector to the connector list.
+ */
+static void drm_test_drm_connector_dynamic_init_not_added(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 DRM_MODE_CONNECTOR_DisplayPort,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_PTR_EQ(test, connector->head.next, &connector->head);
+}
+
+static void test_connector_property(struct kunit *test,
+				    struct drm_connector *connector,
+				    const struct drm_property *expected_prop)
+{
+	struct drm_property *prop;
+	uint64_t val;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, expected_prop);
+	prop = drm_mode_obj_find_prop_id(&connector->base, expected_prop->base.id);
+	KUNIT_ASSERT_PTR_EQ_MSG(test, prop, expected_prop,
+				"Can't find property %s", expected_prop->name);
+
+	ret = drm_object_property_get_default_value(&connector->base, prop, &val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, val, 0);
+
+	/* TODO: Check property value in the connector state. */
+}
+
+/*
+ * Test that the initialization of a dynamic connector adds all the expected
+ * properties to it.
+ */
+static void drm_test_drm_connector_dynamic_init_properties(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	struct drm_mode_config *config = &priv->drm.mode_config;
+	const struct drm_property *props[] = {
+		config->edid_property,
+		config->dpms_property,
+		config->link_status_property,
+		config->non_desktop_property,
+		config->tile_property,
+		config->prop_crtc_id,
+	};
+	int ret;
+	int i;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 DRM_MODE_CONNECTOR_DisplayPort,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	for (i = 0; i < ARRAY_SIZE(props); i++)
+		test_connector_property(test, connector, props[i]);
+}
+
+/*
+ * Test that the initialization of a dynamic connector succeeds for all
+ * possible connector types.
+ */
+static void drm_test_drm_connector_dynamic_init_type_valid(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	unsigned int connector_type = *(unsigned int *)test->param_value;
+	int ret;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 connector_type,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+/*
+ * Test that the initialization of a dynamic connector sets the expected name
+ * for it for all possible connector types.
+ */
+static void drm_test_drm_connector_dynamic_init_name(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	unsigned int connector_type = *(unsigned int *)test->param_value;
+	char expected_name[128];
+	int ret;
+
+	ret = drm_connector_dynamic_init(&priv->drm, connector,
+					 &dummy_dynamic_init_funcs,
+					 connector_type,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	snprintf(expected_name, sizeof(expected_name), "%s-%d",
+		 drm_get_connector_type_name(connector_type), connector->connector_type_id);
+	KUNIT_ASSERT_STREQ(test, connector->name, expected_name);
+}
+
+static struct kunit_case drm_connector_dynamic_init_tests[] = {
+	KUNIT_CASE(drm_test_drm_connector_dynamic_init),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_init_null_ddc),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_init_not_added),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_init_properties),
+	KUNIT_CASE_PARAM(drm_test_drm_connector_dynamic_init_type_valid,
+			 drm_connector_init_type_valid_gen_params),
+	KUNIT_CASE_PARAM(drm_test_drm_connector_dynamic_init_name,
+			 drm_connector_init_type_valid_gen_params),
+	{}
+};
+
+static struct kunit_suite drm_connector_dynamic_init_test_suite = {
+	.name = "drm_connector_dynamic_init",
+	.init = drm_test_connector_init,
+	.exit = drm_test_connector_dynamic_init_cleanup,
+	.test_cases = drm_connector_dynamic_init_tests,
+};
+
+static int drm_test_connector_dynamic_register_early_init(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv;
+	int ret;
+
+	ret = drm_test_connector_init(test);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	priv = test->priv;
+
+	ret = drm_connector_dynamic_init(&priv->drm, &priv->connector,
+					 &dummy_dynamic_init_funcs,
+					 DRM_MODE_CONNECTOR_DisplayPort,
+					 &priv->ddc);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	return 0;
+}
+
+static void drm_test_connector_dynamic_register_early_cleanup(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+
+	drm_connector_unregister(connector);
+	drm_connector_put(connector);
+}
+
+/*
+ * Test that registration of a dynamic connector adds it to the connector list.
+ */
+static void drm_test_drm_connector_dynamic_register_early_on_list(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	KUNIT_ASSERT_TRUE(test, list_empty(&connector->head));
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	KUNIT_ASSERT_PTR_EQ(test, connector->head.next, &priv->drm.mode_config.connector_list);
+}
+
+/*
+ * Test that the registration of a dynamic connector before the drm device is
+ * registered results in deferring the connector's user interface registration.
+ */
+static void drm_test_drm_connector_dynamic_register_early_defer(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	KUNIT_ASSERT_EQ(test, connector->registration_state, DRM_CONNECTOR_INITIALIZING);
+}
+
+/*
+ * Test that the registration of a dynamic connector fails, if this is done before
+ * the connector is initialized.
+ */
+static void drm_test_drm_connector_dynamic_register_early_no_init(struct kunit *test)
+{
+	struct drm_connector *connector;
+	int ret;
+
+	connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL); /* auto freed */
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, -EINVAL);
+}
+
+/*
+ * Test that the registration of a dynamic connector before the drm device is
+ * registered results in deferring adding a mode object for the connector.
+ */
+static void drm_test_drm_connector_dynamic_register_early_no_mode_object(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	struct drm_connector *tmp_connector;
+	int ret;
+
+	ret = drm_connector_dynamic_register(&priv->connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	tmp_connector = drm_connector_lookup(connector->dev, NULL, connector->base.id);
+	KUNIT_ASSERT_NULL(test, tmp_connector);
+}
+
+static struct kunit_case drm_connector_dynamic_register_early_tests[] = {
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_early_on_list),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_early_defer),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_early_no_init),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_early_no_mode_object),
+	{ }
+};
+
+static struct kunit_suite drm_connector_dynamic_register_early_test_suite = {
+	.name = "drm_connector_dynamic_register_early",
+	.init = drm_test_connector_dynamic_register_early_init,
+	.exit = drm_test_connector_dynamic_register_early_cleanup,
+	.test_cases = drm_connector_dynamic_register_early_tests,
+};
+
+static int drm_test_connector_dynamic_register_init(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv;
+	int ret;
+
+	ret = drm_test_connector_dynamic_register_early_init(test);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	priv = test->priv;
+
+	ret = drm_dev_register(priv->connector.dev, 0);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	return 0;
+}
+
+static void drm_test_connector_dynamic_register_cleanup(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_device *dev = priv->connector.dev;
+
+	drm_connector_unregister(&priv->connector);
+	drm_connector_put(&priv->connector);
+
+	drm_dev_unregister(dev);
+
+	drm_test_connector_dynamic_register_early_cleanup(test);
+}
+
+static void drm_test_drm_connector_dynamic_register_on_list(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	int ret;
+
+	KUNIT_ASSERT_TRUE(test, list_empty(&priv->connector.head));
+
+	ret = drm_connector_dynamic_register(&priv->connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	KUNIT_ASSERT_PTR_EQ(test, priv->connector.head.next, &priv->drm.mode_config.connector_list);
+}
+
+/*
+ * Test that the registration of a dynamic connector doesn't get deferred if
+ * this is done after the drm device is registered.
+ */
+static void drm_test_drm_connector_dynamic_register_no_defer(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, priv->connector.registration_state, DRM_CONNECTOR_INITIALIZING);
+
+	ret = drm_connector_dynamic_register(&priv->connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	KUNIT_ASSERT_EQ(test, priv->connector.registration_state, DRM_CONNECTOR_REGISTERED);
+}
+
+/*
+ * Test that the registration of a dynamic connector fails if this is done after the
+ * drm device is registered, but before the connector is initialized.
+ */
+static void drm_test_drm_connector_dynamic_register_no_init(struct kunit *test)
+{
+	struct drm_connector *connector;
+	int ret;
+
+	connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL); /* auto freed */
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, -EINVAL);
+}
+
+/*
+ * Test that the registration of a dynamic connector after the drm device is
+ * registered adds the mode object for the connector.
+ */
+static void drm_test_drm_connector_dynamic_register_mode_object(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	struct drm_connector *tmp_connector;
+	int ret;
+
+	tmp_connector = drm_connector_lookup(connector->dev, NULL, connector->base.id);
+	KUNIT_ASSERT_NULL(test, tmp_connector);
+
+	ret = drm_connector_dynamic_register(&priv->connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	tmp_connector = drm_connector_lookup(connector->dev, NULL, connector->base.id);
+	KUNIT_ASSERT_PTR_EQ(test, tmp_connector, connector);
+}
+
+/*
+ * Test that the registration of a dynamic connector after the drm device is
+ * registered adds the connector to sysfs.
+ */
+static void drm_test_drm_connector_dynamic_register_sysfs(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	int ret;
+
+	KUNIT_ASSERT_NULL(test, connector->kdev);
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	KUNIT_ASSERT_NOT_NULL(test, connector->kdev);
+}
+
+/*
+ * Test that the registration of a dynamic connector after the drm device is
+ * registered sets the connector's sysfs name as expected.
+ */
+static void drm_test_drm_connector_dynamic_register_sysfs_name(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	struct drm_connector *connector = &priv->connector;
+	char expected_name[128];
+	int ret;
+
+	ret = drm_connector_dynamic_register(connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	snprintf(expected_name, sizeof(expected_name), "card%d-%s",
+		 connector->dev->primary->index, connector->name);
+
+	KUNIT_ASSERT_STREQ(test, dev_name(connector->kdev), expected_name);
+}
+
+/*
+ * Test that the registration of a dynamic connector after the drm device is
+ * registered adds the connector to debugfs.
+ */
+static void drm_test_drm_connector_dynamic_register_debugfs(struct kunit *test)
+{
+	struct drm_connector_init_priv *priv = test->priv;
+	int ret;
+
+	KUNIT_ASSERT_NULL(test, priv->connector.debugfs_entry);
+
+	ret = drm_connector_dynamic_register(&priv->connector);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	if (IS_ENABLED(CONFIG_DEBUG_FS))
+		KUNIT_ASSERT_NOT_NULL(test, priv->connector.debugfs_entry);
+	else
+		KUNIT_ASSERT_NULL(test, priv->connector.debugfs_entry);
+}
+
+static struct kunit_case drm_connector_dynamic_register_tests[] = {
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_on_list),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_no_defer),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_no_init),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_mode_object),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_sysfs),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_sysfs_name),
+	KUNIT_CASE(drm_test_drm_connector_dynamic_register_debugfs),
+	{ }
+};
+
+static struct kunit_suite drm_connector_dynamic_register_test_suite = {
+	.name = "drm_connector_dynamic_register",
+	.init = drm_test_connector_dynamic_register_init,
+	.exit = drm_test_connector_dynamic_register_cleanup,
+	.test_cases = drm_connector_dynamic_register_tests,
+};
+
 /*
  * Test that the registration of a bog standard connector works as
  * expected and doesn't report any error.
@@ -190,13 +669,13 @@ static void drm_test_connector_hdmi_init_valid(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 }
@@ -210,13 +689,13 @@ static void drm_test_connector_hdmi_init_null_ddc(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       NULL,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 }
@@ -230,13 +709,13 @@ static void drm_test_connector_hdmi_init_null_vendor(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       NULL, "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -250,13 +729,13 @@ static void drm_test_connector_hdmi_init_null_product(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", NULL,
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -276,13 +755,13 @@ static void drm_test_connector_hdmi_init_product_valid(struct kunit *test)
 
 	KUNIT_ASSERT_LT(test, strlen(product_name), DRM_CONNECTOR_HDMI_PRODUCT_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", product_name,
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_MEMEQ(test,
@@ -309,13 +788,13 @@ static void drm_test_connector_hdmi_init_product_length_exact(struct kunit *test
 
 	KUNIT_ASSERT_EQ(test, strlen(product_name), DRM_CONNECTOR_HDMI_PRODUCT_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", product_name,
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_MEMEQ(test,
@@ -336,13 +815,13 @@ static void drm_test_connector_hdmi_init_product_length_too_long(struct kunit *t
 
 	KUNIT_ASSERT_GT(test, strlen(product_name), DRM_CONNECTOR_HDMI_PRODUCT_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", product_name,
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -362,13 +841,13 @@ static void drm_test_connector_hdmi_init_vendor_valid(struct kunit *test)
 
 	KUNIT_ASSERT_LT(test, strlen(vendor_name), DRM_CONNECTOR_HDMI_VENDOR_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       vendor_name, "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_MEMEQ(test,
@@ -394,13 +873,13 @@ static void drm_test_connector_hdmi_init_vendor_length_exact(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, strlen(vendor_name), DRM_CONNECTOR_HDMI_VENDOR_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       vendor_name, "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 	KUNIT_EXPECT_MEMEQ(test,
@@ -421,13 +900,13 @@ static void drm_test_connector_hdmi_init_vendor_length_too_long(struct kunit *te
 
 	KUNIT_ASSERT_GT(test, strlen(vendor_name), DRM_CONNECTOR_HDMI_VENDOR_LEN);
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       vendor_name, "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -441,13 +920,13 @@ static void drm_test_connector_hdmi_init_bpc_invalid(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       9);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -461,13 +940,13 @@ static void drm_test_connector_hdmi_init_bpc_null(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       0);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -486,13 +965,13 @@ static void drm_test_connector_hdmi_init_bpc_8(struct kunit *test)
 	uint64_t val;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
@@ -527,13 +1006,13 @@ static void drm_test_connector_hdmi_init_bpc_10(struct kunit *test)
 	uint64_t val;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       10);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
@@ -568,13 +1047,13 @@ static void drm_test_connector_hdmi_init_bpc_12(struct kunit *test)
 	uint64_t val;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       12);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
@@ -604,7 +1083,7 @@ static void drm_test_connector_hdmi_init_formats_empty(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
@@ -624,15 +1103,73 @@ static void drm_test_connector_hdmi_init_formats_no_rgb(struct kunit *test)
 	struct drm_connector_init_priv *priv = test->priv;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_YUV422),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
+}
+
+struct drm_connector_hdmi_init_formats_yuv420_allowed_test {
+	unsigned long supported_formats;
+	bool yuv420_allowed;
+	int expected_result;
+};
+
+#define YUV420_ALLOWED_TEST(_formats, _allowed, _result)			\
+	{									\
+		.supported_formats = BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) | (_formats),	\
+		.yuv420_allowed = _allowed,					\
+		.expected_result = _result,					\
+	}
+
+static const struct drm_connector_hdmi_init_formats_yuv420_allowed_test
+drm_connector_hdmi_init_formats_yuv420_allowed_tests[] = {
+	YUV420_ALLOWED_TEST(BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420), true, 0),
+	YUV420_ALLOWED_TEST(BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420), false, -EINVAL),
+	YUV420_ALLOWED_TEST(BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422), true, -EINVAL),
+	YUV420_ALLOWED_TEST(BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422), false, 0),
+};
+
+static void
+drm_connector_hdmi_init_formats_yuv420_allowed_desc(const struct drm_connector_hdmi_init_formats_yuv420_allowed_test *t,
+						    char *desc)
+{
+	sprintf(desc, "supported_formats=0x%lx yuv420_allowed=%d",
+		t->supported_formats, t->yuv420_allowed);
+}
+
+KUNIT_ARRAY_PARAM(drm_connector_hdmi_init_formats_yuv420_allowed,
+		  drm_connector_hdmi_init_formats_yuv420_allowed_tests,
+		  drm_connector_hdmi_init_formats_yuv420_allowed_desc);
+
+/*
+ * Test that the registration of an HDMI connector succeeds only when
+ * the presence of YUV420 in the supported formats matches the value
+ * of the ycbcr_420_allowed flag.
+ */
+static void drm_test_connector_hdmi_init_formats_yuv420_allowed(struct kunit *test)
+{
+	const struct drm_connector_hdmi_init_formats_yuv420_allowed_test *params;
+	struct drm_connector_init_priv *priv = test->priv;
+	int ret;
+
+	params = test->param_value;
+	priv->connector.ycbcr_420_allowed = params->yuv420_allowed;
+
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
+				       "Vendor", "Product",
+				       &dummy_funcs,
+				       &dummy_hdmi_funcs,
+				       DRM_MODE_CONNECTOR_HDMIA,
+				       &priv->ddc,
+				       params->supported_formats,
+				       8);
+	KUNIT_EXPECT_EQ(test, ret, params->expected_result);
 }
 
 /*
@@ -645,13 +1182,13 @@ static void drm_test_connector_hdmi_init_type_valid(struct kunit *test)
 	unsigned int connector_type = *(unsigned int *)test->param_value;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       connector_type,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 }
@@ -680,13 +1217,13 @@ static void drm_test_connector_hdmi_init_type_invalid(struct kunit *test)
 	unsigned int connector_type = *(unsigned int *)test->param_value;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, &priv->connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, &priv->connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       connector_type,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_LT(test, ret, 0);
 }
@@ -726,6 +1263,8 @@ static struct kunit_case drmm_connector_hdmi_init_tests[] = {
 	KUNIT_CASE(drm_test_connector_hdmi_init_bpc_null),
 	KUNIT_CASE(drm_test_connector_hdmi_init_formats_empty),
 	KUNIT_CASE(drm_test_connector_hdmi_init_formats_no_rgb),
+	KUNIT_CASE_PARAM(drm_test_connector_hdmi_init_formats_yuv420_allowed,
+			 drm_connector_hdmi_init_formats_yuv420_allowed_gen_params),
 	KUNIT_CASE(drm_test_connector_hdmi_init_null_ddc),
 	KUNIT_CASE(drm_test_connector_hdmi_init_null_product),
 	KUNIT_CASE(drm_test_connector_hdmi_init_null_vendor),
@@ -893,10 +1432,10 @@ static void drm_test_drm_hdmi_connector_get_output_format_name(struct kunit *tes
 static const
 struct drm_hdmi_connector_get_output_format_name_test
 drm_hdmi_connector_get_output_format_name_valid_tests[] = {
-	OUTPUT_FORMAT_TEST(HDMI_COLORSPACE_RGB, "RGB"),
-	OUTPUT_FORMAT_TEST(HDMI_COLORSPACE_YUV420, "YUV 4:2:0"),
-	OUTPUT_FORMAT_TEST(HDMI_COLORSPACE_YUV422, "YUV 4:2:2"),
-	OUTPUT_FORMAT_TEST(HDMI_COLORSPACE_YUV444, "YUV 4:4:4"),
+	OUTPUT_FORMAT_TEST(DRM_OUTPUT_COLOR_FORMAT_RGB444, "RGB"),
+	OUTPUT_FORMAT_TEST(DRM_OUTPUT_COLOR_FORMAT_YCBCR420, "YUV 4:2:0"),
+	OUTPUT_FORMAT_TEST(DRM_OUTPUT_COLOR_FORMAT_YCBCR422, "YUV 4:2:2"),
+	OUTPUT_FORMAT_TEST(DRM_OUTPUT_COLOR_FORMAT_YCBCR444, "YUV 4:4:4"),
 };
 
 static void
@@ -955,13 +1494,13 @@ static void drm_test_drm_connector_attach_broadcast_rgb_property_hdmi_connector(
 	struct drm_property *prop;
 	int ret;
 
-	ret = drmm_connector_hdmi_init(&priv->drm, connector,
+	ret = drmm_connector_hdmi_ini2(&priv->drm, connector,
 				       "Vendor", "Product",
 				       &dummy_funcs,
 				       &dummy_hdmi_funcs,
 				       DRM_MODE_CONNECTOR_HDMIA,
 				       &priv->ddc,
-				       BIT(HDMI_COLORSPACE_RGB),
+				       BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444),
 				       8);
 	KUNIT_EXPECT_EQ(test, ret, 0);
 
@@ -1001,7 +1540,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb(struct kunit *test)
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 8, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 8, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1000ULL, rate);
 }
@@ -1022,7 +1561,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb_10bpc(struct kunit *test)
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 10, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 10, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1250, rate);
 }
@@ -1041,7 +1580,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb_10bpc_vic_1(struct kunit *t
 	mode = drm_kunit_display_mode_from_cea_vic(test, drm, 1);
 	KUNIT_ASSERT_NOT_NULL(test, mode);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 10, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 10, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_EXPECT_EQ(test, rate, 0);
 }
 
@@ -1061,7 +1600,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb_12bpc(struct kunit *test)
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 12, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 12, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1500, rate);
 }
@@ -1080,7 +1619,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb_12bpc_vic_1(struct kunit *t
 	mode = drm_kunit_display_mode_from_cea_vic(test, drm, 1);
 	KUNIT_ASSERT_NOT_NULL(test, mode);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 12, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 12, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_EXPECT_EQ(test, rate, 0);
 }
 
@@ -1100,7 +1639,7 @@ static void drm_test_drm_hdmi_compute_mode_clock_rgb_double(struct kunit *test)
 
 	KUNIT_ASSERT_TRUE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 8, HDMI_COLORSPACE_RGB);
+	rate = drm_hdmi_compute_mode_clock(mode, 8, DRM_OUTPUT_COLOR_FORMAT_RGB444);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, (mode->clock * 1000ULL) * 2, rate);
 }
@@ -1123,7 +1662,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv420_valid(struct kunit
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 8, HDMI_COLORSPACE_YUV420);
+	rate = drm_hdmi_compute_mode_clock(mode, 8, DRM_OUTPUT_COLOR_FORMAT_YCBCR420);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, (mode->clock * 1000ULL) / 2, rate);
 }
@@ -1160,7 +1699,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv420_10_bpc(struct kuni
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 10, HDMI_COLORSPACE_YUV420);
+	rate = drm_hdmi_compute_mode_clock(mode, 10, DRM_OUTPUT_COLOR_FORMAT_YCBCR420);
 	KUNIT_ASSERT_GT(test, rate, 0);
 
 	KUNIT_EXPECT_EQ(test, mode->clock * 625, rate);
@@ -1185,7 +1724,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv420_12_bpc(struct kuni
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 12, HDMI_COLORSPACE_YUV420);
+	rate = drm_hdmi_compute_mode_clock(mode, 12, DRM_OUTPUT_COLOR_FORMAT_YCBCR420);
 	KUNIT_ASSERT_GT(test, rate, 0);
 
 	KUNIT_EXPECT_EQ(test, mode->clock * 750, rate);
@@ -1208,7 +1747,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv422_8_bpc(struct kunit
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 8, HDMI_COLORSPACE_YUV422);
+	rate = drm_hdmi_compute_mode_clock(mode, 8, DRM_OUTPUT_COLOR_FORMAT_YCBCR422);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1000, rate);
 }
@@ -1230,7 +1769,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv422_10_bpc(struct kuni
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 10, HDMI_COLORSPACE_YUV422);
+	rate = drm_hdmi_compute_mode_clock(mode, 10, DRM_OUTPUT_COLOR_FORMAT_YCBCR422);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1000, rate);
 }
@@ -1252,7 +1791,7 @@ static void drm_test_connector_hdmi_compute_mode_clock_yuv422_12_bpc(struct kuni
 
 	KUNIT_ASSERT_FALSE(test, mode->flags & DRM_MODE_FLAG_DBLCLK);
 
-	rate = drm_hdmi_compute_mode_clock(mode, 12, HDMI_COLORSPACE_YUV422);
+	rate = drm_hdmi_compute_mode_clock(mode, 12, DRM_OUTPUT_COLOR_FORMAT_YCBCR422);
 	KUNIT_ASSERT_GT(test, rate, 0);
 	KUNIT_EXPECT_EQ(test, mode->clock * 1000, rate);
 }
@@ -1283,6 +1822,9 @@ static struct kunit_suite drm_hdmi_compute_mode_clock_test_suite = {
 kunit_test_suites(
 	&drmm_connector_hdmi_init_test_suite,
 	&drmm_connector_init_test_suite,
+	&drm_connector_dynamic_init_test_suite,
+	&drm_connector_dynamic_register_early_test_suite,
+	&drm_connector_dynamic_register_test_suite,
 	&drm_connector_attach_broadcast_rgb_property_test_suite,
 	&drm_get_tv_mode_from_name_test_suite,
 	&drm_hdmi_compute_mode_clock_test_suite,

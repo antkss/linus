@@ -3,7 +3,7 @@
  * Copyright (C) 2017-2023 Oracle.  All Rights Reserved.
  * Author: Darrick J. Wong <djwong@kernel.org>
  */
-#include "xfs.h"
+#include "xfs_platform.h"
 #include "xfs_fs.h"
 #include "xfs_shared.h"
 #include "xfs_format.h"
@@ -102,7 +102,7 @@ xchk_setup_inode(
 		xchk_fsgates_enable(sc, XCHK_FSGATES_DRAIN);
 
 	/* We want to scan the opened inode, so lock it and exit. */
-	if (sc->sm->sm_ino == 0 || sc->sm->sm_ino == ip_in->i_ino) {
+	if (sc->sm->sm_ino == 0 || sc->sm->sm_ino == I_INO(ip_in)) {
 		error = xchk_install_live_inode(sc, ip_in);
 		if (error)
 			return error;
@@ -212,7 +212,7 @@ xchk_setup_inode(
 	 * make repairs to the ondisk inode buffer.
 	 */
 	if (xchk_could_repair(sc))
-		xrep_setup_inode(sc, &imap);
+		return xrep_setup_inode(sc, &imap);
 	return 0;
 
 out_cancel:
@@ -260,12 +260,7 @@ xchk_inode_extsize(
 		xchk_ino_set_warning(sc, ino);
 }
 
-/*
- * Validate di_cowextsize hint.
- *
- * The rules are documented at xfs_ioctl_setattr_check_cowextsize().
- * These functions must be kept in sync with each other.
- */
+/* Validate di_cowextsize hint. */
 STATIC void
 xchk_inode_cowextsize(
 	struct xfs_scrub	*sc,
@@ -276,12 +271,32 @@ xchk_inode_cowextsize(
 	uint64_t		flags2)
 {
 	xfs_failaddr_t		fa;
+	uint32_t		value = be32_to_cpu(dip->di_cowextsize);
 
-	fa = xfs_inode_validate_cowextsize(sc->mp,
-			be32_to_cpu(dip->di_cowextsize), mode, flags,
-			flags2);
+	/*
+	 * The used block counter for rtrmap is checked and repaired elsewhere.
+	 */
+	if (xfs_has_zoned(sc->mp) &&
+	    dip->di_metatype == cpu_to_be16(XFS_METAFILE_RTRMAP))
+		return;
+
+	fa = xfs_inode_validate_cowextsize(sc->mp, value, mode, flags, flags2);
 	if (fa)
 		xchk_ino_set_corrupt(sc, ino);
+
+	/*
+	 * XFS allows a sysadmin to change the rt extent size when adding a rt
+	 * section to a filesystem after formatting.  If there are any
+	 * directories with cowextsize and rtinherit set, the hint could become
+	 * misaligned with the new rextsize.  The verifier doesn't check this,
+	 * because we allow rtinherit directories even without an rt device.
+	 * Flag this as an administrative warning since we will clean this up
+	 * eventually.
+	 */
+	if ((flags & XFS_DIFLAG_RTINHERIT) &&
+	    (flags2 & XFS_DIFLAG2_COWEXTSIZE) &&
+	    value % sc->mp->m_sb.sb_rextsize > 0)
+		xchk_ino_set_warning(sc, ino);
 }
 
 /* Make sure the di_flags make sense for the inode. */
@@ -360,8 +375,9 @@ xchk_inode_flags2(
 	if ((flags2 & XFS_DIFLAG2_REFLINK) && !S_ISREG(mode))
 		goto bad;
 
-	/* realtime and reflink make no sense, currently */
-	if ((flags & XFS_DIFLAG_REALTIME) && (flags2 & XFS_DIFLAG2_REFLINK))
+	/* realtime and reflink don't always go together */
+	if ((flags & XFS_DIFLAG_REALTIME) && (flags2 & XFS_DIFLAG2_REFLINK) &&
+	    !xfs_has_rtreflink(mp))
 		goto bad;
 
 	/* no bigtime iflag without the bigtime feature */
@@ -502,6 +518,10 @@ xchk_dinode(
 		if (!S_ISREG(mode) && !S_ISDIR(mode))
 			xchk_ino_set_corrupt(sc, ino);
 		break;
+	case XFS_DINODE_FMT_META_BTREE:
+		if (!S_ISREG(mode))
+			xchk_ino_set_corrupt(sc, ino);
+		break;
 	case XFS_DINODE_FMT_UUID:
 	default:
 		xchk_ino_set_corrupt(sc, ino);
@@ -587,7 +607,7 @@ xchk_dinode(
 	}
 
 	/* di_forkoff */
-	if (XFS_DFORK_BOFF(dip) >= mp->m_sb.sb_inodesize)
+	if (dip->di_forkoff >= XFS_B_TO_FORKOFFT(XFS_LITINO(mp)))
 		xchk_ino_set_corrupt(sc, ino);
 	if (naextents != 0 && dip->di_forkoff == 0)
 		xchk_ino_set_corrupt(sc, ino);
@@ -686,23 +706,21 @@ xchk_inode_xref_bmap(
 		return;
 
 	/* Walk all the extents to check nextents/naextents/nblocks. */
-	error = xfs_bmap_count_blocks(sc->tp, sc->ip, XFS_DATA_FORK,
-			&nextents, &count);
+	error = xchk_inode_count_blocks(sc, XFS_DATA_FORK, &nextents, &count);
 	if (!xchk_should_check_xref(sc, &error, NULL))
 		return;
 	if (nextents < xfs_dfork_data_extents(dip))
-		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ip_xref_set_corrupt(sc, sc->ip);
 
-	error = xfs_bmap_count_blocks(sc->tp, sc->ip, XFS_ATTR_FORK,
-			&nextents, &acount);
+	error = xchk_inode_count_blocks(sc, XFS_ATTR_FORK, &nextents, &acount);
 	if (!xchk_should_check_xref(sc, &error, NULL))
 		return;
 	if (nextents != xfs_dfork_attr_extents(dip))
-		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ip_xref_set_corrupt(sc, sc->ip);
 
 	/* Check nblocks against the inode. */
 	if (count + acount != be64_to_cpu(dip->di_nblocks))
-		xchk_ino_xref_set_corrupt(sc, sc->ip->i_ino);
+		xchk_ip_xref_set_corrupt(sc, sc->ip);
 }
 
 /* Cross-reference with the other btrees. */
@@ -722,7 +740,7 @@ xchk_inode_xref(
 	agno = XFS_INO_TO_AGNO(sc->mp, ino);
 	agbno = XFS_INO_TO_AGBNO(sc->mp, ino);
 
-	error = xchk_ag_init_existing(sc, agno, &sc->sa);
+	error = xchk_ag_init_existing(sc, agno);
 	if (!xchk_xref_process_error(sc, agno, agbno, &error))
 		goto out_free;
 
@@ -734,7 +752,7 @@ xchk_inode_xref(
 	xchk_inode_xref_bmap(sc, dip);
 
 out_free:
-	xchk_ag_free(sc, &sc->sa);
+	xchk_ag_free(sc);
 }
 
 /*
@@ -776,10 +794,10 @@ xchk_inode_check_unlinked(
 {
 	if (VFS_I(sc->ip)->i_nlink == 0) {
 		if (!xfs_inode_on_unlinked_list(sc->ip))
-			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+			xchk_ino_set_corrupt(sc, I_INO(sc->ip));
 	} else {
 		if (xfs_inode_on_unlinked_list(sc->ip))
-			xchk_ino_set_corrupt(sc, sc->ip->i_ino);
+			xchk_ino_set_corrupt(sc, I_INO(sc->ip));
 	}
 }
 
@@ -803,7 +821,7 @@ xchk_inode(
 
 	/* Scrub the inode core. */
 	xfs_inode_to_disk(sc->ip, &di, 0);
-	xchk_dinode(sc, &di, sc->ip->i_ino);
+	xchk_dinode(sc, &di, I_INO(sc->ip));
 	if (sc->sm->sm_flags & XFS_SCRUB_OFLAG_CORRUPT)
 		goto out;
 
@@ -813,11 +831,11 @@ xchk_inode(
 	 * we scrubbed the dinode.
 	 */
 	if (S_ISREG(VFS_I(sc->ip)->i_mode))
-		xchk_inode_check_reflink_iflag(sc, sc->ip->i_ino);
+		xchk_inode_check_reflink_iflag(sc, I_INO(sc->ip));
 
 	xchk_inode_check_unlinked(sc);
 
-	xchk_inode_xref(sc, sc->ip->i_ino, &di);
+	xchk_inode_xref(sc, I_INO(sc->ip), &di);
 out:
 	return error;
 }

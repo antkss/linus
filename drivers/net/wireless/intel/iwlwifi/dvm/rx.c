@@ -3,7 +3,7 @@
  *
  * Copyright(c) 2003 - 2014 Intel Corporation. All rights reserved.
  * Copyright(c) 2015 Intel Deutschland GmbH
- * Copyright(c) 2018, 2020-2021 Intel Corporation
+ * Copyright(c) 2018, 2020-2021, 2025-2026 Intel Corporation
  *
  * Portions of this file are derived from the ipw3945 project, as well
  * as portionhelp of the ieee80211 subsystem header files.
@@ -16,7 +16,6 @@
 #include <linux/unaligned.h>
 
 #include "iwl-trans.h"
-#include "iwl-io.h"
 #include "dev.h"
 #include "calib.h"
 #include "agn.h"
@@ -50,7 +49,7 @@ static void iwlagn_rx_csa(struct iwl_priv *priv, struct iwl_rx_cmd_buffer *rxb)
 	 * See iwlagn_mac_channel_switch.
 	 */
 	struct iwl_rxon_context *ctx = &priv->contexts[IWL_RXON_CTX_BSS];
-	struct iwl_rxon_cmd *rxon = (void *)&ctx->active;
+	struct iwl_rxon_cmd *rxon = (void *)(uintptr_t)&ctx->active;
 
 	if (!test_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status))
 		return;
@@ -429,7 +428,7 @@ static void iwlagn_rx_statistics(struct iwl_priv *priv,
 	 * thermal update even if the uCode doesn't give
 	 * us one */
 	mod_timer(&priv->statistics_periodic, jiffies +
-		  msecs_to_jiffies(reg_recalib_period * 1000));
+		  secs_to_jiffies(reg_recalib_period));
 
 	if (unlikely(!test_bit(STATUS_SCANNING, &priv->status)) &&
 	    (pkt->hdr.cmd == STATISTICS_NOTIFICATION)) {
@@ -482,17 +481,17 @@ static void iwlagn_rx_card_state_notif(struct iwl_priv *priv,
 	if (flags & (SW_CARD_DISABLED | HW_CARD_DISABLED |
 		     CT_CARD_DISABLED)) {
 
-		iwl_write32(priv->trans, CSR_UCODE_DRV_GP1_SET,
-			    CSR_UCODE_DRV_GP1_BIT_CMD_BLOCKED);
+		iwl_trans_write32(priv->trans, CSR_UCODE_DRV_GP1_SET,
+				  CSR_UCODE_DRV_GP1_BIT_CMD_BLOCKED);
 
-		iwl_write_direct32(priv->trans, HBUS_TARG_MBX_C,
-					HBUS_TARG_MBX_C_REG_BIT_CMD_BLOCKED);
+		iwl_trans_write_direct32(priv->trans, HBUS_TARG_MBX_C,
+					 HBUS_TARG_MBX_C_REG_BIT_CMD_BLOCKED);
 
 		if (!(flags & RXON_CARD_DISABLED)) {
-			iwl_write32(priv->trans, CSR_UCODE_DRV_GP1_CLR,
-				    CSR_UCODE_DRV_GP1_BIT_CMD_BLOCKED);
-			iwl_write_direct32(priv->trans, HBUS_TARG_MBX_C,
-					HBUS_TARG_MBX_C_REG_BIT_CMD_BLOCKED);
+			iwl_trans_write32(priv->trans, CSR_UCODE_DRV_GP1_CLR,
+					  CSR_UCODE_DRV_GP1_BIT_CMD_BLOCKED);
+			iwl_trans_write_direct32(priv->trans, HBUS_TARG_MBX_C,
+						 HBUS_TARG_MBX_C_REG_BIT_CMD_BLOCKED);
 		}
 		if (flags & CT_CARD_DISABLED)
 			iwl_tt_enter_ct_kill(priv);
@@ -643,8 +642,8 @@ static void iwlagn_pass_packet_to_mac80211(struct iwl_priv *priv,
 	fraglen = len - hdrlen;
 
 	if (fraglen) {
-		int offset = (void *)hdr + hdrlen -
-			     rxb_addr(rxb) + rxb_offset(rxb);
+		int offset = (u8 *)hdr + hdrlen -
+			     (u8 *)rxb_addr(rxb) + rxb_offset(rxb);
 
 		skb_add_rx_frag(skb, 0, rxb_steal_page(rxb), offset,
 				fraglen, rxb->truesize);
@@ -915,7 +914,7 @@ static void iwlagn_rx_noa_notification(struct iwl_priv *priv,
 		len += 1 + 2;
 		copylen += 1 + 2;
 
-		new_data = kmalloc(struct_size(new_data, data, len), GFP_ATOMIC);
+		new_data = kmalloc_flex(*new_data, data, len, GFP_ATOMIC);
 		if (new_data) {
 			new_data->length = len;
 			new_data->data[0] = WLAN_EID_VENDOR_SPECIFIC;

@@ -25,7 +25,7 @@
 #define AT91_PM_ULP1		0x03
 #define	AT91_PM_BACKUP		0x04
 
-#ifndef __ASSEMBLY__
+#ifndef __ASSEMBLER__
 struct at91_pm_data {
 	void __iomem *pmc;
 	void __iomem *ramc[2];
@@ -39,6 +39,7 @@ struct at91_pm_data {
 	unsigned int suspend_mode;
 	unsigned int pmc_mckr_offset;
 	unsigned int pmc_version;
+	unsigned int pmc_mcks;
 };
 #endif
 

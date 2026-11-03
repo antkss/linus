@@ -7,6 +7,7 @@
 
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/string_choices.h>
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 #include <linux/mmc/sdio_func.h>
@@ -42,9 +43,16 @@ bool btmrvl_check_evtpkt(struct btmrvl_private *priv, struct sk_buff *skb)
 {
 	struct hci_event_hdr *hdr = (void *) skb->data;
 
+	if (skb->len < sizeof(*hdr))
+		return true;
+
 	if (hdr->evt == HCI_EV_CMD_COMPLETE) {
 		struct hci_ev_cmd_complete *ec;
 		u16 opcode;
+
+		if (hdr->plen < sizeof(*ec) ||
+		    skb->len < HCI_EVENT_HDR_SIZE + sizeof(*ec))
+			return true;
 
 		ec = (void *) (skb->data + HCI_EVENT_HDR_SIZE);
 		opcode = __le16_to_cpu(ec->opcode);
@@ -73,28 +81,34 @@ int btmrvl_process_event(struct btmrvl_private *priv, struct sk_buff *skb)
 	struct btmrvl_event *event;
 	int ret = 0;
 
+	if (skb->len <= offsetof(typeof(*event), data[0]))
+		return -EINVAL;
+
 	event = (struct btmrvl_event *) skb->data;
 	if (event->ec != 0xff) {
 		BT_DBG("Not Marvell Event=%x", event->ec);
-		ret = -EINVAL;
-		goto exit;
+		return -EINVAL;
 	}
 
 	switch (event->data[0]) {
 	case BT_EVENT_AUTO_SLEEP_MODE:
+		if (skb->len <= offsetof(typeof(*event), data[2]))
+			return -EINVAL;
 		if (!event->data[2]) {
 			if (event->data[1] == BT_PS_ENABLE)
 				adapter->psmode = 1;
 			else
 				adapter->psmode = 0;
 			BT_DBG("PS Mode:%s",
-				(adapter->psmode) ? "Enable" : "Disable");
+			       str_enable_disable(adapter->psmode));
 		} else {
 			BT_DBG("PS Mode command failed");
 		}
 		break;
 
 	case BT_EVENT_HOST_SLEEP_CONFIG:
+		if (skb->len <= offsetof(typeof(*event), data[3]))
+			return -EINVAL;
 		if (!event->data[3])
 			BT_DBG("gpio=%x, gap=%x", event->data[1],
 							event->data[2]);
@@ -103,6 +117,8 @@ int btmrvl_process_event(struct btmrvl_private *priv, struct sk_buff *skb)
 		break;
 
 	case BT_EVENT_HOST_SLEEP_ENABLE:
+		if (skb->len <= offsetof(typeof(*event), data[1]))
+			return -EINVAL;
 		if (!event->data[1]) {
 			adapter->hs_state = HS_ACTIVATED;
 			if (adapter->psmode)
@@ -115,6 +131,8 @@ int btmrvl_process_event(struct btmrvl_private *priv, struct sk_buff *skb)
 		break;
 
 	case BT_EVENT_MODULE_CFG_REQ:
+		if (skb->len <= offsetof(typeof(*event), data[2]))
+			return -EINVAL;
 		if (priv->btmrvl_dev.sendcmdflag &&
 				event->data[1] == MODULE_BRINGUP_REQ) {
 			BT_DBG("EVENT:%s",
@@ -132,6 +150,8 @@ int btmrvl_process_event(struct btmrvl_private *priv, struct sk_buff *skb)
 		break;
 
 	case BT_EVENT_POWER_STATE:
+		if (skb->len <= offsetof(typeof(*event), data[1]))
+			return -EINVAL;
 		if (event->data[1] == BT_PS_SLEEP)
 			adapter->ps_state = PS_SLEEP;
 		BT_DBG("EVENT:%s",
@@ -144,7 +164,6 @@ int btmrvl_process_event(struct btmrvl_private *priv, struct sk_buff *skb)
 		break;
 	}
 
-exit:
 	if (!ret)
 		kfree_skb(skb);
 
@@ -709,13 +728,13 @@ struct btmrvl_private *btmrvl_add_card(void *card)
 {
 	struct btmrvl_private *priv;
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = kzalloc_obj(*priv);
 	if (!priv) {
 		BT_ERR("Can not allocate priv");
 		goto err_priv;
 	}
 
-	priv->adapter = kzalloc(sizeof(*priv->adapter), GFP_KERNEL);
+	priv->adapter = kzalloc_obj(*priv->adapter);
 	if (!priv->adapter) {
 		BT_ERR("Allocate buffer for btmrvl_adapter failed!");
 		goto err_adapter;

@@ -16,9 +16,14 @@
 #include "xe_bo_types.h"
 #include "xe_vm.h"
 
+#define __dev_name_xe(xe)	dev_name((xe)->drm.dev)
 #define __dev_name_bo(bo)	dev_name(xe_bo_device(bo)->drm.dev)
 #define __dev_name_vm(vm)	dev_name((vm)->xe->drm.dev)
 #define __dev_name_vma(vma)	__dev_name_vm(xe_vma_vm(vma))
+
+#define XE_VM_TRACE_MODE_DMA_FENCE	0
+#define XE_VM_TRACE_MODE_PREEMPT_FENCE	1
+#define XE_VM_TRACE_MODE_FAULT		2
 
 DECLARE_EVENT_CLASS(xe_bo,
 		    TP_PROTO(struct xe_bo *bo),
@@ -33,7 +38,7 @@ DECLARE_EVENT_CLASS(xe_bo,
 
 		    TP_fast_assign(
 			   __assign_str(dev);
-			   __entry->size = bo->size;
+			   __entry->size = xe_bo_size(bo);
 			   __entry->flags = bo->flags;
 			   __entry->vm = bo->vm;
 			   ),
@@ -48,6 +53,16 @@ DEFINE_EVENT(xe_bo, xe_bo_cpu_fault,
 	     TP_ARGS(bo)
 );
 
+DEFINE_EVENT(xe_bo, xe_bo_validate,
+	     TP_PROTO(struct xe_bo *bo),
+	     TP_ARGS(bo)
+);
+
+DEFINE_EVENT(xe_bo, xe_bo_create,
+	     TP_PROTO(struct xe_bo *bo),
+	     TP_ARGS(bo)
+);
+
 TRACE_EVENT(xe_bo_move,
 	    TP_PROTO(struct xe_bo *bo, uint32_t new_placement, uint32_t old_placement,
 		     bool move_lacks_source),
@@ -55,24 +70,24 @@ TRACE_EVENT(xe_bo_move,
 	    TP_STRUCT__entry(
 		     __field(struct xe_bo *, bo)
 		     __field(size_t, size)
-		     __field(u32, new_placement)
-		     __field(u32, old_placement)
+		     __string(new_placement_name, xe_mem_type_to_name[new_placement])
+		     __string(old_placement_name, xe_mem_type_to_name[old_placement])
 		     __string(device_id, __dev_name_bo(bo))
 		     __field(bool, move_lacks_source)
 			),
 
 	    TP_fast_assign(
 		   __entry->bo      = bo;
-		   __entry->size = bo->size;
-		   __entry->new_placement = new_placement;
-		   __entry->old_placement = old_placement;
+		   __entry->size = xe_bo_size(bo);
+		   __assign_str(new_placement_name);
+		   __assign_str(old_placement_name);
 		   __assign_str(device_id);
 		   __entry->move_lacks_source = move_lacks_source;
 		   ),
 	    TP_printk("move_lacks_source:%s, migrate object %p [size %zu] from %s to %s device_id:%s",
 		      __entry->move_lacks_source ? "yes" : "no", __entry->bo, __entry->size,
-		      xe_mem_type_to_name[__entry->old_placement],
-		      xe_mem_type_to_name[__entry->new_placement], __get_str(device_id))
+		      __get_str(old_placement_name),
+		      __get_str(new_placement_name), __get_str(device_id))
 );
 
 DECLARE_EVENT_CLASS(xe_vma,
@@ -82,6 +97,7 @@ DECLARE_EVENT_CLASS(xe_vma,
 		    TP_STRUCT__entry(
 			     __string(dev, __dev_name_vma(vma))
 			     __field(struct xe_vma *, vma)
+			     __field(struct xe_vm *, vm)
 			     __field(u32, asid)
 			     __field(u64, start)
 			     __field(u64, end)
@@ -91,14 +107,16 @@ DECLARE_EVENT_CLASS(xe_vma,
 		    TP_fast_assign(
 			   __assign_str(dev);
 			   __entry->vma = vma;
+			   __entry->vm = xe_vma_vm(vma);
 			   __entry->asid = xe_vma_vm(vma)->usm.asid;
 			   __entry->start = xe_vma_start(vma);
 			   __entry->end = xe_vma_end(vma) - 1;
 			   __entry->ptr = xe_vma_userptr(vma);
 			   ),
 
-		    TP_printk("dev=%s, vma=%p, asid=0x%05x, start=0x%012llx, end=0x%012llx, userptr=0x%012llx,",
-			      __get_str(dev), __entry->vma, __entry->asid, __entry->start,
+		    TP_printk("dev=%s, vma=%p, vm=%p, asid=0x%05x, start=0x%012llx, end=0x%012llx, userptr=0x%012llx",
+			      __get_str(dev), __entry->vma, __entry->vm,
+			      __entry->asid, __entry->start,
 			      __entry->end, __entry->ptr)
 )
 
@@ -180,16 +198,29 @@ DECLARE_EVENT_CLASS(xe_vm,
 			     __string(dev, __dev_name_vm(vm))
 			     __field(struct xe_vm *, vm)
 			     __field(u32, asid)
+			     __field(u32, flags)
+			     __field(u8, mode)
 			     ),
 
 		    TP_fast_assign(
 			   __assign_str(dev);
 			   __entry->vm = vm;
 			   __entry->asid = vm->usm.asid;
+			   __entry->flags = vm->flags;
+			   __entry->mode = xe_vm_in_fault_mode(vm) ?
+					   XE_VM_TRACE_MODE_FAULT :
+					   xe_vm_in_preempt_fence_mode(vm) ?
+					   XE_VM_TRACE_MODE_PREEMPT_FENCE :
+					   XE_VM_TRACE_MODE_DMA_FENCE;
 			   ),
 
-		    TP_printk("dev=%s, vm=%p, asid=0x%05x", __get_str(dev),
-			      __entry->vm, __entry->asid)
+		    TP_printk("dev=%s, vm=%p, asid=0x%05x, vm flags=0x%05x, mode=%s",
+			      __get_str(dev), __entry->vm, __entry->asid,
+			      __entry->flags,
+			      __print_symbolic(__entry->mode,
+					       { XE_VM_TRACE_MODE_DMA_FENCE, "dma-fence" },
+					       { XE_VM_TRACE_MODE_PREEMPT_FENCE, "preempt-fence" },
+					       { XE_VM_TRACE_MODE_FAULT, "fault" }))
 );
 
 DEFINE_EVENT(xe_vm, xe_vm_kill,
@@ -203,6 +234,16 @@ DEFINE_EVENT(xe_vm, xe_vm_create,
 );
 
 DEFINE_EVENT(xe_vm, xe_vm_free,
+	     TP_PROTO(struct xe_vm *vm),
+	     TP_ARGS(vm)
+);
+
+DEFINE_EVENT(xe_vm, xe_vm_close_and_put,
+	     TP_PROTO(struct xe_vm *vm),
+	     TP_ARGS(vm)
+);
+
+DEFINE_EVENT(xe_vm, xe_vm_asid_release,
 	     TP_PROTO(struct xe_vm *vm),
 	     TP_ARGS(vm)
 );
@@ -235,6 +276,35 @@ DEFINE_EVENT(xe_vm, xe_vm_rebind_worker_exit,
 DEFINE_EVENT(xe_vm, xe_vm_ops_fail,
 	     TP_PROTO(struct xe_vm *vm),
 	     TP_ARGS(vm)
+);
+
+TRACE_EVENT(xe_pagefault_fail,
+	    TP_PROTO(struct xe_device *xe, struct xe_vm *vm, struct xe_vma *vma,
+		     u32 asid, u64 page_addr, u8 reason, int err),
+	    TP_ARGS(xe, vm, vma, asid, page_addr, reason, err),
+
+	    TP_STRUCT__entry(__string(dev, __dev_name_xe(xe))
+		     __field(struct xe_vm *, vm)
+		     __field(struct xe_vma *, vma)
+		     __field(u32, asid)
+		     __field(u64, page_addr)
+		     __field(u8, reason)
+		     __field(int, err)
+		     ),
+
+	    TP_fast_assign(__assign_str(dev);
+		   __entry->vm = vm;
+		   __entry->vma = vma;
+		   __entry->asid = asid;
+		   __entry->page_addr = page_addr;
+		   __entry->reason = reason;
+		   __entry->err = err;
+		   ),
+
+	    TP_printk("dev=%s, vm=%p, vma=%p, asid=0x%05x, page_addr=0x%012llx, reason=%u, err=%d",
+		      __get_str(dev), __entry->vm, __entry->vma,
+		      __entry->asid, __entry->page_addr, __entry->reason,
+		      __entry->err)
 );
 
 #endif

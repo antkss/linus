@@ -91,6 +91,7 @@ ieee802154_alloc_hw(size_t priv_data_len, const struct ieee802154_ops *ops)
 	INIT_LIST_HEAD(&local->interfaces);
 	INIT_LIST_HEAD(&local->rx_beacon_list);
 	INIT_LIST_HEAD(&local->rx_mac_cmd_list);
+	spin_lock_init(&local->rx_lock);
 	mutex_init(&local->iflist_mtx);
 
 	tasklet_setup(&local->tasklet, ieee802154_tasklet_handler);
@@ -104,6 +105,7 @@ ieee802154_alloc_hw(size_t priv_data_len, const struct ieee802154_ops *ops)
 	INIT_WORK(&local->rx_mac_cmd_work, mac802154_rx_mac_cmd_worker);
 
 	init_completion(&local->assoc_done);
+	spin_lock_init(&local->assoc_lock);
 
 	/* init supported flags with 802.15.4 default ranges */
 	phy->supported.max_minbe = 8;
@@ -213,8 +215,8 @@ int ieee802154_register_hw(struct ieee802154_hw *hw)
 		goto out_wq;
 	}
 
-	hrtimer_init(&local->ifs_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	local->ifs_timer.function = ieee802154_xmit_ifs_timer;
+	hrtimer_setup(&local->ifs_timer, ieee802154_xmit_ifs_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 
 	wpan_phy_set_dev(local->phy, local->hw.parent);
 

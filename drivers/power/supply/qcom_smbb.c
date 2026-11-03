@@ -880,7 +880,7 @@ static int smbb_charger_probe(struct platform_device *pdev)
 	}
 
 	bat_cfg.drv_data = chg;
-	bat_cfg.of_node = pdev->dev.of_node;
+	bat_cfg.fwnode = dev_fwnode(&pdev->dev);
 	chg->bat_psy = devm_power_supply_register(&pdev->dev,
 						  &bat_psy_desc,
 						  &bat_cfg);
@@ -937,11 +937,8 @@ static int smbb_charger_probe(struct platform_device *pdev)
 		rc = devm_request_threaded_irq(&pdev->dev, irq, NULL,
 				smbb_charger_irqs[i].handler, IRQF_ONESHOT,
 				smbb_charger_irqs[i].name, chg);
-		if (rc) {
-			dev_err(&pdev->dev, "failed to request irq '%s'\n",
-				smbb_charger_irqs[i].name);
+		if (rc)
 			return rc;
-		}
 	}
 
 	/*

@@ -6,12 +6,22 @@
 # Usage: kvm-remote.sh "systems" [ <kvm.sh args> ]
 #	 kvm-remote.sh "systems" /path/to/old/run [ <kvm-again.sh args> ]
 #
+# The caller may set the KVM_REMOTE_SSH environment in order to specify
+# an alternative ssh command, which is necessary in some environments
+# for authentication purposes.  This alternative ssn command must support
+# ssh's usual arguments.
+#
 # Copyright (C) 2021 Facebook, Inc.
 #
 # Authors: Paul E. McKenney <paulmck@kernel.org>
 
 scriptname=$0
 args="$*"
+
+if test -z "${KVM_REMOTE_SSH}"
+then
+	KVM_REMOTE_SSH=ssh; export KVM_REMOTE_SSH
+fi
 
 if ! test -d tools/testing/selftests/rcutorture/bin
 then
@@ -137,7 +147,7 @@ chmod +x $T/bin/kvm-remote-*.sh
 # Check first to avoid the need for cleanup for system-name typos
 for i in $systems
 do
-	ssh -o BatchMode=yes $i getconf _NPROCESSORS_ONLN > $T/ssh.stdout 2> $T/ssh.stderr
+	${KVM_REMOTE_SSH} -o BatchMode=yes $i getconf _NPROCESSORS_ONLN > $T/ssh.stdout 2> $T/ssh.stderr
 	ret=$?
 	if test "$ret" -ne 0
 	then
@@ -158,14 +168,14 @@ echo Build-products tarball: `du -h $T/binres.tgz` | tee -a "$oldrun/remote-log"
 for i in $systems
 do
 	echo Downloading tarball to $i `date` | tee -a "$oldrun/remote-log"
-	cat $T/binres.tgz | ssh -o BatchMode=yes $i "cd /tmp; tar -xzf -"
+	cat $T/binres.tgz | ${KVM_REMOTE_SSH} -o BatchMode=yes $i "cd /tmp; tar -xzf -"
 	ret=$?
 	tries=0
 	while test "$ret" -ne 0
 	do
 		echo Unable to download $T/binres.tgz to system $i, waiting and then retrying.  $tries prior retries. | tee -a "$oldrun/remote-log"
 		sleep 60
-		cat $T/binres.tgz | ssh -o BatchMode=yes $i "cd /tmp; tar -xzf -"
+		cat $T/binres.tgz | ${KVM_REMOTE_SSH} -o BatchMode=yes $i "cd /tmp; tar -xzf -"
 		ret=$?
 		if test "$ret" -ne 0
 		then
@@ -181,20 +191,26 @@ done
 
 # Function to check for presence of a file on the specified system.
 # Complain if the system cannot be reached, and retry after a wait.
-# Currently just waits forever if a machine disappears.
+# Currently just waits 15 minutes if a machine disappears.
 #
 # Usage: checkremotefile system pathname
 checkremotefile () {
+	local nsshfails=0
 	local ret
 	local sleeptime=60
 
 	while :
 	do
-		ssh -o BatchMode=yes $1 "test -f \"$2\""
+		${KVM_REMOTE_SSH} -o BatchMode=yes $1 "test -f \"$2\""
 		ret=$?
 		if test "$ret" -eq 255
 		then
 			echo " ---" ssh failure to $1 checking for file $2, retry after $sleeptime seconds. `date` | tee -a "$oldrun/remote-log"
+			nsshfails=$((nsshfails+1))
+			if ((nsshfails > 15))
+			then
+				return 255
+			fi
 		elif test "$ret" -eq 0
 		then
 			return 0
@@ -233,7 +249,7 @@ startbatches () {
 		then
 			continue # System still running last test, skip.
 		fi
-		ssh -o BatchMode=yes "$i" "cd \"$resdir/$ds\"; touch remote.run; PATH=\"$T/bin:$PATH\" nohup kvm-remote-$curbatch.sh > kvm-remote-$curbatch.sh.out 2>&1 &" 1>&2
+		${KVM_REMOTE_SSH} -o BatchMode=yes "$i" "cd \"$resdir/$ds\"; touch remote.run; PATH=\"$T/bin:$PATH\" nohup kvm-remote-$curbatch.sh > kvm-remote-$curbatch.sh.out 2>&1 &" 1>&2
 		ret=$?
 		if test "$ret" -ne 0
 		then
@@ -268,12 +284,23 @@ echo All batches started. `date` | tee -a "$oldrun/remote-log"
 for i in $systems
 do
 	echo " ---" Waiting for $i `date` | tee -a "$oldrun/remote-log"
-	while checkremotefile "$i" "$resdir/$ds/remote.run"
+	while :
 	do
+		checkremotefile "$i" "$resdir/$ds/remote.run"
+		ret=$?
+		if test "$ret" -eq 1
+		then
+			echo " ---" Collecting results from $i `date` | tee -a "$oldrun/remote-log"
+			( cd "$oldrun"; ${KVM_REMOTE_SSH} -o BatchMode=yes $i "cd $rundir; tar -czf - kvm-remote-*.sh.out */console.log */kvm-test-1-run*.sh.out */qemu[_-]pid */qemu-retval */qemu-affinity; rm -rf $T > /dev/null 2>&1" | tar -xzf - )
+			break;
+		fi
+		if test "$ret" -eq 255
+		then
+			echo System $i persistent ssh failure, lost results `date` | tee -a "$oldrun/remote-log"
+			break;
+		fi
 		sleep 30
 	done
-	echo " ---" Collecting results from $i `date` | tee -a "$oldrun/remote-log"
-	( cd "$oldrun"; ssh -o BatchMode=yes $i "cd $rundir; tar -czf - kvm-remote-*.sh.out */console.log */kvm-test-1-run*.sh.out */qemu[_-]pid */qemu-retval */qemu-affinity; rm -rf $T > /dev/null 2>&1" | tar -xzf - )
 done
 
 ( kvm-end-run-stats.sh "$oldrun" "$starttime"; echo $? > $T/exitcode ) | tee -a "$oldrun/remote-log"

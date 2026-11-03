@@ -16,11 +16,11 @@
 /* 4 MAX3100s should be enough for everyone */
 #define MAX_MAX3100 4
 
+#include <linux/bitops.h>
 #include <linux/container_of.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/freezer.h>
-#include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/pm.h>
 #include <linux/property.h>
@@ -133,7 +133,7 @@ static int max3100_do_parity(struct max3100_port *s, u16 c)
 	else
 		c &= 0xff;
 
-	parity = parity ^ (hweight8(c) & 1);
+	parity = parity ^ parity8(c);
 	return parity;
 }
 
@@ -308,7 +308,7 @@ static void max3100_dowork(struct max3100_port *s)
 
 static void max3100_timeout(struct timer_list *t)
 {
-	struct max3100_port *s = from_timer(s, t, timer);
+	struct max3100_port *s = timer_container_of(s, t, timer);
 
 	max3100_dowork(s);
 	mod_timer(&s->timer, jiffies + uart_poll_timeout(&s->port));
@@ -506,7 +506,7 @@ max3100_set_termios(struct uart_port *port, struct ktermios *termios,
 			MAX3100_STATUS_PE | MAX3100_STATUS_FE |
 			MAX3100_STATUS_OE;
 
-	del_timer_sync(&s->timer);
+	timer_delete_sync(&s->timer);
 	uart_update_timeout(port, termios->c_cflag, baud);
 
 	spin_lock(&s->conf_lock);
@@ -532,14 +532,14 @@ static void max3100_shutdown(struct uart_port *port)
 
 	s->force_end_work = 1;
 
-	del_timer_sync(&s->timer);
+	timer_delete_sync(&s->timer);
 
 	if (s->workqueue) {
+		free_irq(port->irq, s);
+		cancel_work_sync(&s->work);
 		destroy_workqueue(s->workqueue);
 		s->workqueue = NULL;
 	}
-	if (port->irq)
-		free_irq(port->irq, s);
 
 	/* set shutdown mode to save power */
 	max3100_sr(s, MAX3100_WC | MAX3100_SHDN, &rx);
@@ -704,10 +704,10 @@ static int max3100_probe(struct spi_device *spi)
 			break;
 	if (i == MAX_MAX3100) {
 		mutex_unlock(&max3100s_lock);
-		return dev_err_probe(dev, -ENOMEM, "too many MAX3100 chips\n");
+		return dev_err_probe(dev, -ENOSPC, "too many MAX3100 chips\n");
 	}
 
-	max3100s[i] = kzalloc(sizeof(struct max3100_port), GFP_KERNEL);
+	max3100s[i] = kzalloc_obj(struct max3100_port);
 	if (!max3100s[i]) {
 		mutex_unlock(&max3100s_lock);
 		return -ENOMEM;
@@ -724,6 +724,7 @@ static int max3100_probe(struct spi_device *spi)
 	max3100s[i]->port.ops = &max3100_ops;
 	max3100s[i]->port.flags = UPF_SKIP_TEST | UPF_BOOT_AUTOCONF;
 	max3100s[i]->port.line = i;
+	max3100s[i]->port.iotype = UPIO_BUS;
 	max3100s[i]->port.type = PORT_MAX3100;
 	max3100s[i]->port.dev = &spi->dev;
 
@@ -752,6 +753,15 @@ static void max3100_remove(struct spi_device *spi)
 		if (max3100s[i] == s) {
 			dev_dbg(&spi->dev, "%s: removing port %d\n", __func__, i);
 			uart_remove_one_port(&max3100_uart_driver, &max3100s[i]->port);
+
+			s->force_end_work = 1;
+			timer_shutdown_sync(&s->timer);
+			if (s->workqueue) {
+				free_irq(s->port.irq, s);
+				cancel_work_sync(&s->work);
+				destroy_workqueue(s->workqueue);
+				s->workqueue = NULL;
+			}
 			kfree(max3100s[i]);
 			max3100s[i] = NULL;
 			break;

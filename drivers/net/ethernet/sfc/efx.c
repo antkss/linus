@@ -34,6 +34,7 @@
 #include "selftest.h"
 #include "sriov.h"
 #include "efx_devlink.h"
+#include "efx_cxl.h"
 
 #include "mcdi_port_common.h"
 #include "mcdi_pcol.h"
@@ -476,28 +477,6 @@ void efx_get_irq_moderation(struct efx_nic *efx, unsigned int *tx_usecs,
 
 /**************************************************************************
  *
- * ioctls
- *
- *************************************************************************/
-
-/* Net device ioctl
- * Context: process, rtnl_lock() held.
- */
-static int efx_ioctl(struct net_device *net_dev, struct ifreq *ifr, int cmd)
-{
-	struct efx_nic *efx = efx_netdev_priv(net_dev);
-	struct mii_ioctl_data *data = if_mii(ifr);
-
-	/* Convert phy_id from older PRTAD/DEVAD format */
-	if ((cmd == SIOCGMIIREG || cmd == SIOCSMIIREG) &&
-	    (data->phy_id & 0xfc00) == 0x0400)
-		data->phy_id ^= MDIO_PHY_ID_C45 | 0x0400;
-
-	return mdio_mii_ioctl(&efx->mdio, data, cmd);
-}
-
-/**************************************************************************
- *
  * Kernel net device interface
  *
  *************************************************************************/
@@ -593,7 +572,6 @@ static const struct net_device_ops efx_netdev_ops = {
 	.ndo_tx_timeout		= efx_watchdog,
 	.ndo_start_xmit		= efx_hard_start_xmit,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_eth_ioctl		= efx_ioctl,
 	.ndo_change_mtu		= efx_change_mtu,
 	.ndo_set_mac_address	= efx_set_mac_address,
 	.ndo_set_rx_mode	= efx_set_rx_mode,
@@ -926,6 +904,10 @@ static const struct pci_device_id efx_pci_table[] = {
 	 .driver_data = (unsigned long)&efx_x4_nic_type},
 	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x2c03),  /* X4 PF (FF only) */
 	 .driver_data = (unsigned long)&efx_x4_nic_type},
+	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0x8c03),  /* X4D PF (FF/LL) */
+	 .driver_data = (unsigned long)&efx_x4_nic_type},
+	{PCI_DEVICE(PCI_VENDOR_ID_SOLARFLARE, 0xac03),  /* X4D PF (FF only) */
+	 .driver_data = (unsigned long)&efx_x4_nic_type},
 	{0}			/* end of list */
 };
 
@@ -1004,12 +986,15 @@ static void efx_pci_remove(struct pci_dev *pci_dev)
 	efx_pci_remove_main(efx);
 
 	efx_fini_io(efx);
+
+	probe_data = container_of(efx, struct efx_probe_data, efx);
+	efx_cxl_exit(probe_data);
+
 	pci_dbg(efx->pci_dev, "shutdown successful\n");
 
 	efx_fini_devlink_and_unlock(efx);
 	efx_fini_struct(efx);
 	free_netdev(efx->net_dev);
-	probe_data = container_of(efx, struct efx_probe_data, efx);
 	kfree(probe_data);
 };
 
@@ -1178,7 +1163,7 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 	int rc;
 
 	/* Allocate probe data and struct efx_nic */
-	probe_data = kzalloc(sizeof(*probe_data), GFP_KERNEL);
+	probe_data = kzalloc_obj(*probe_data);
 	if (!probe_data)
 		return -ENOMEM;
 	probe_data->pci_dev = pci_dev;
@@ -1201,7 +1186,6 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 	rc = efx_init_struct(efx, pci_dev);
 	if (rc)
 		goto fail1;
-	efx->mdio.dev = net_dev;
 
 	pci_info(pci_dev, "Solarflare NIC detected\n");
 
@@ -1213,6 +1197,17 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 			 efx->type->mem_map_size(efx));
 	if (rc)
 		goto fail2;
+
+	/* A successful cxl initialization implies a CXL region created to be
+	 * used for PIO buffers. If there is no CXL support legacy PIO buffers
+	 * defined at specific PCI BAR regions will be used. If there is CXL
+	 * support and the cxl initialization fails, the driver probe fails.
+	 */
+	rc = efx_cxl_init(probe_data);
+	if (rc) {
+		pci_err(pci_dev, "CXL initialization failed with error %d\n", rc);
+		goto fail3;
+	}
 
 	rc = efx_pci_probe_post_io(efx);
 	if (rc) {
@@ -1252,6 +1247,7 @@ static int efx_pci_probe(struct pci_dev *pci_dev,
 	return 0;
 
  fail3:
+	efx_cxl_exit(probe_data);
 	efx_fini_io(efx);
  fail2:
 	efx_fini_struct(efx);

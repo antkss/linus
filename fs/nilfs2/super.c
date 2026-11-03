@@ -309,6 +309,8 @@ int nilfs_commit_super(struct super_block *sb, int flag)
  * This function restores state flags in the on-disk super block.
  * This will set "clean" flag (i.e. NILFS_VALID_FS) unless the
  * filesystem was not clean previously.
+ *
+ * Return: 0 on success, %-EIO if I/O error or superblock is corrupted.
  */
 int nilfs_cleanup_super(struct super_block *sb)
 {
@@ -339,6 +341,8 @@ int nilfs_cleanup_super(struct super_block *sb)
  * nilfs_move_2nd_super - relocate secondary super block
  * @sb: super block instance
  * @sb2off: new offset of the secondary super block (in bytes)
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 static int nilfs_move_2nd_super(struct super_block *sb, loff_t sb2off)
 {
@@ -420,6 +424,8 @@ out:
  * nilfs_resize_fs - resize the filesystem
  * @sb: super block instance
  * @newsize: new size of the filesystem (in bytes)
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 int nilfs_resize_fs(struct super_block *sb, __u64 newsize)
 {
@@ -648,7 +654,7 @@ static int nilfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 			/*
 			 * If nilfs_palloc_count_max_entries() returns
 			 * -ERANGE error code then we simply treat
-			 * curent inodes count as maximum possible and
+			 * current inodes count as maximum possible and
 			 * zero as free inodes value.
 			 */
 			nmaxinodes = atomic64_read(&root->inodes_count);
@@ -818,13 +824,9 @@ static int nilfs_setup_super(struct super_block *sb, int is_mount)
 	max_mnt_count = le16_to_cpu(sbp[0]->s_max_mnt_count);
 	mnt_count = le16_to_cpu(sbp[0]->s_mnt_count);
 
-	if (nilfs->ns_mount_state & NILFS_ERROR_FS) {
+	if (nilfs->ns_mount_state & NILFS_ERROR_FS)
 		nilfs_warn(sb, "mounting fs with errors");
-#if 0
-	} else if (max_mnt_count >= 0 && mnt_count >= max_mnt_count) {
-		nilfs_warn(sb, "maximal mount count reached");
-#endif
-	}
+
 	if (!max_mnt_count)
 		sbp[0]->s_max_mnt_count = cpu_to_le16(NILFS_DFL_MAX_MNT_COUNT);
 
@@ -987,7 +989,7 @@ static int nilfs_attach_snapshot(struct super_block *s, __u64 cno,
  * nilfs_tree_is_busy() - try to shrink dentries of a checkpoint
  * @root_dentry: root dentry of the tree to be shrunk
  *
- * This function returns true if the tree was in-use.
+ * Return: true if the tree was in-use, false otherwise.
  */
 static bool nilfs_tree_is_busy(struct dentry *root_dentry)
 {
@@ -1033,6 +1035,8 @@ int nilfs_checkpoint_is_mounted(struct super_block *sb, __u64 cno)
  *
  * This function is called exclusively by nilfs->ns_mount_mutex.
  * So, the recovery process is protected from other simultaneous mounts.
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 static int
 nilfs_fill_super(struct super_block *sb, struct fs_context *fc)
@@ -1061,8 +1065,6 @@ nilfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_root = NULL;
 	sb->s_time_gran = 1;
 	sb->s_max_links = NILFS_LINK_MAX;
-
-	sb->s_bdi = bdi_get(sb->s_bdev->bd_disk->bdi);
 
 	err = load_nilfs(nilfs, sb);
 	if (err)
@@ -1284,7 +1286,7 @@ static int nilfs_init_fs_context(struct fs_context *fc)
 {
 	struct nilfs_fs_context *ctx;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kzalloc_obj(*ctx);
 	if (!ctx)
 		return -ENOMEM;
 

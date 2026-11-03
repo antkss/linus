@@ -58,7 +58,7 @@ struct test_data_offset {
 	int size;
 };
 
-struct test_data_offset offsets[] = {
+static struct test_data_offset offsets[] = {
 	/* Fill first cache page. */
 	{
 		.offset = 10,
@@ -106,12 +106,23 @@ struct test_data_offset offsets[] = {
 /* move it from util/dso.c for compatibility */
 static int dso__data_fd(struct dso *dso, struct machine *machine)
 {
-	int fd = dso__data_get_fd(dso, machine);
+	int fd = -1;
 
-	if (fd >= 0)
+	if (dso__data_get_fd(dso, machine, &fd))
 		dso__data_put_fd(dso);
 
 	return fd;
+}
+
+static void dsos__delete(struct dsos *dsos)
+{
+	for (unsigned int i = 0; i < dsos->cnt; i++) {
+		struct dso *dso = dsos->dsos[i];
+
+		dso__data_close(dso);
+		unlink(dso__name(dso));
+	}
+	dsos__exit(dsos);
 }
 
 static int test__dso_data(struct test_suite *test __maybe_unused, int subtest __maybe_unused)
@@ -127,6 +138,10 @@ static int test__dso_data(struct test_suite *test __maybe_unused, int subtest __
 	dsos__init(&machine.dsos);
 
 	dso = dso__new(file);
+	TEST_ASSERT_VAL("Failed to get dso", dso);
+	/* override the binary type for dso data access */
+	dso__set_binary_type(dso, DSO_BINARY_TYPE__SYSTEM_PATH_DSO);
+	dso__set_bintype_searched(dso);
 	TEST_ASSERT_VAL("Failed to add dso", !dsos__add(&machine.dsos, dso));
 	TEST_ASSERT_VAL("Failed to access to dso",
 			dso__data_fd(dso, &machine) >= 0);
@@ -172,7 +187,7 @@ static int test__dso_data(struct test_suite *test __maybe_unused, int subtest __
 	}
 
 	dso__put(dso);
-	dsos__exit(&machine.dsos);
+	dsos__delete(&machine.dsos);
 	unlink(file);
 	return 0;
 }
@@ -215,22 +230,14 @@ static int dsos__create(int cnt, int size, struct dsos *dsos)
 		TEST_ASSERT_VAL("failed to get dso file", file);
 		dso = dso__new(file);
 		TEST_ASSERT_VAL("failed to get dso", dso);
+		/* override the binary type for dso data access */
+		dso__set_binary_type(dso, DSO_BINARY_TYPE__SYSTEM_PATH_DSO);
+		dso__set_bintype_searched(dso);
 		TEST_ASSERT_VAL("failed to add dso", !dsos__add(dsos, dso));
 		dso__put(dso);
 	}
 
 	return 0;
-}
-
-static void dsos__delete(struct dsos *dsos)
-{
-	for (unsigned int i = 0; i < dsos->cnt; i++) {
-		struct dso *dso = dsos->dsos[i];
-
-		dso__data_close(dso);
-		unlink(dso__name(dso));
-	}
-	dsos__exit(dsos);
 }
 
 static int set_fd_limit(int n)

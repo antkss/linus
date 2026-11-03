@@ -44,6 +44,7 @@ struct cpuinfo_arm64 {
 	u64		reg_dczid;
 	u64		reg_midr;
 	u64		reg_revidr;
+	u64		reg_aidr;
 	u64		reg_gmid;
 	u64		reg_smidr;
 	u64		reg_mpamidr;
@@ -72,10 +73,8 @@ struct cpuinfo_arm64 {
 DECLARE_PER_CPU(struct cpuinfo_arm64, cpu_data);
 
 void cpuinfo_store_cpu(void);
-void __init cpuinfo_store_boot_cpu(void);
+void update_cpu_features(int cpu);
 
-void __init init_cpu_features(struct cpuinfo_arm64 *info);
-void update_cpu_features(int cpu, struct cpuinfo_arm64 *info,
-				 struct cpuinfo_arm64 *boot);
+void __init validate_ftr_regs(void);
 
 #endif /* __ASM_CPU_H */

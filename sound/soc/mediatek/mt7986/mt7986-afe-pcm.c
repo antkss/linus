@@ -334,7 +334,7 @@ static int mt7986_init_clock(struct mtk_base_afe *afe)
 
 	ret = devm_clk_bulk_get(afe->dev, afe_priv->num_clks, afe_priv->clks);
 	if (ret)
-		return dev_err_probe(afe->dev, ret, "Failed to get clocks\n");
+		return ret;
 
 	return 0;
 }
@@ -414,7 +414,7 @@ static int mt7986_afe_runtime_resume(struct device *dev)
 
 	ret = clk_bulk_prepare_enable(afe_priv->num_clks, afe_priv->clks);
 	if (ret)
-		return dev_err_probe(afe->dev, ret, "Failed to enable clocks\n");
+		return ret;
 
 	if (!afe->regmap || afe_priv->pm_runtime_bypass_reg_ctl)
 		return 0;
@@ -484,7 +484,7 @@ static int mt7986_afe_pcm_dev_probe(struct platform_device *pdev)
 	/* initial audio related clock */
 	ret = mt7986_init_clock(afe);
 	if (ret)
-		return dev_err_probe(dev, ret, "Cannot initialize clocks\n");
+		return ret;
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
@@ -535,7 +535,7 @@ static int mt7986_afe_pcm_dev_probe(struct platform_device *pdev)
 	ret = devm_request_irq(dev, irq_id, mt7986_afe_irq_handler,
 			       IRQF_TRIGGER_NONE, "asys-isr", (void *)afe);
 	if (ret)
-		return dev_err_probe(dev, ret, "Failed to request irq for asys-isr\n");
+		return ret;
 
 	/* init sub_dais */
 	INIT_LIST_HEAD(&afe->sub_dais);
@@ -589,15 +589,15 @@ static const struct of_device_id mt7986_afe_pcm_dt_match[] = {
 MODULE_DEVICE_TABLE(of, mt7986_afe_pcm_dt_match);
 
 static const struct dev_pm_ops mt7986_afe_pm_ops = {
-	SET_RUNTIME_PM_OPS(mt7986_afe_runtime_suspend,
-			   mt7986_afe_runtime_resume, NULL)
+	RUNTIME_PM_OPS(mt7986_afe_runtime_suspend,
+		       mt7986_afe_runtime_resume, NULL)
 };
 
 static struct platform_driver mt7986_afe_pcm_driver = {
 	.driver = {
 		   .name = "mt7986-audio",
 		   .of_match_table = mt7986_afe_pcm_dt_match,
-		   .pm = &mt7986_afe_pm_ops,
+		   .pm = pm_ptr(&mt7986_afe_pm_ops),
 	},
 	.probe = mt7986_afe_pcm_dev_probe,
 	.remove = mt7986_afe_pcm_dev_remove,

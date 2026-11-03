@@ -148,9 +148,7 @@ nilfs_mdt_submit_block(struct inode *inode, unsigned long blkoff, blk_opf_t opf,
 	}
 	map_bh(bh, inode->i_sb, (sector_t)blknum);
 
-	bh->b_end_io = end_buffer_read_sync;
-	get_bh(bh);
-	submit_bh(opf, bh);
+	bh_submit(bh, opf, bh_end_read);
 	ret = 0;
 
 	trace_nilfs2_mdt_submit_block(inode, inode->i_ino, blkoff,
@@ -203,7 +201,7 @@ static int nilfs_mdt_read_block(struct inode *inode, unsigned long block,
 	err = -EIO;
 	if (!buffer_uptodate(first_bh)) {
 		nilfs_err(inode->i_sb,
-			  "I/O error reading meta-data file (ino=%lu, block-offset=%lu)",
+			  "I/O error reading meta-data file (ino=%llu, block-offset=%lu)",
 			  inode->i_ino, block);
 		goto failed_bh;
 	}
@@ -226,20 +224,21 @@ static int nilfs_mdt_read_block(struct inode *inode, unsigned long block,
  * @out_bh: output of a pointer to the buffer_head
  *
  * nilfs_mdt_get_block() looks up the specified buffer and tries to create
- * a new buffer if @create is not zero.  On success, the returned buffer is
- * assured to be either existing or formatted using a buffer lock on success.
- * @out_bh is substituted only when zero is returned.
+ * a new buffer if @create is not zero.  If (and only if) this function
+ * succeeds, it stores a pointer to the retrieved buffer head in the location
+ * pointed to by @out_bh.
  *
- * Return Value: On success, it returns 0. On error, the following negative
- * error code is returned.
+ * The retrieved buffer may be either an existing one or a newly allocated one.
+ * For a newly created buffer, if the callback function argument @init_block
+ * is non-NULL, the callback will be called with the buffer locked to format
+ * the block.
  *
- * %-ENOMEM - Insufficient memory available.
- *
- * %-EIO - I/O error
- *
- * %-ENOENT - the specified block does not exist (hole block)
- *
- * %-EROFS - Read only filesystem (for create mode)
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOENT	- The specified block does not exist (hole block).
+ * * %-ENOMEM	- Insufficient memory available.
+ * * %-EROFS	- Read only filesystem (for create mode).
  */
 int nilfs_mdt_get_block(struct inode *inode, unsigned long blkoff, int create,
 			void (*init_block)(struct inode *,
@@ -275,14 +274,11 @@ int nilfs_mdt_get_block(struct inode *inode, unsigned long blkoff, int create,
  * @out_bh, and block offset to @blkoff, respectively.  @out_bh and
  * @blkoff are substituted only when zero is returned.
  *
- * Return Value: On success, it returns 0. On error, the following negative
- * error code is returned.
- *
- * %-ENOMEM - Insufficient memory available.
- *
- * %-EIO - I/O error
- *
- * %-ENOENT - no block was found in the range
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOENT	- No block was found in the range.
+ * * %-ENOMEM	- Insufficient memory available.
  */
 int nilfs_mdt_find_block(struct inode *inode, unsigned long start,
 			 unsigned long end, unsigned long *blkoff,
@@ -321,12 +317,11 @@ out:
  * @inode: inode of the meta data file
  * @block: block offset
  *
- * Return Value: On success, zero is returned.
- * On error, one of the following negative error code is returned.
- *
- * %-ENOMEM - Insufficient memory available.
- *
- * %-EIO - I/O error
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EIO	- I/O error (including metadata corruption).
+ * * %-ENOENT	- Non-existent block.
+ * * %-ENOMEM	- Insufficient memory available.
  */
 int nilfs_mdt_delete_block(struct inode *inode, unsigned long block)
 {
@@ -349,12 +344,10 @@ int nilfs_mdt_delete_block(struct inode *inode, unsigned long block)
  * nilfs_mdt_forget_block() clears a dirty flag of the specified buffer, and
  * tries to release the page including the buffer from a page cache.
  *
- * Return Value: On success, 0 is returned. On error, one of the following
- * negative error code is returned.
- *
- * %-EBUSY - page has an active buffer.
- *
- * %-ENOENT - page cache has no page addressed by the offset.
+ * Return: 0 on success, or one of the following negative error codes on
+ * failure:
+ * * %-EBUSY	- Page has an active buffer.
+ * * %-ENOENT	- Page cache has no page addressed by the offset.
  */
 int nilfs_mdt_forget_block(struct inode *inode, unsigned long block)
 {
@@ -398,51 +391,31 @@ int nilfs_mdt_fetch_dirty(struct inode *inode)
 	return test_bit(NILFS_I_DIRTY, &ii->i_state);
 }
 
-static int nilfs_mdt_write_folio(struct folio *folio,
+static int nilfs_mdt_writeback(struct address_space *mapping,
 		struct writeback_control *wbc)
 {
-	struct inode *inode = folio->mapping->host;
-	struct super_block *sb;
+	struct inode *inode = mapping->host;
 	int err = 0;
-
-	if (inode && sb_rdonly(inode->i_sb)) {
-		/*
-		 * It means that filesystem was remounted in read-only
-		 * mode because of error or metadata corruption. But we
-		 * have dirty folios that try to be flushed in background.
-		 * So, here we simply discard this dirty folio.
-		 */
-		nilfs_clear_folio_dirty(folio);
-		folio_unlock(folio);
-		return -EROFS;
-	}
-
-	folio_redirty_for_writepage(wbc, folio);
-	folio_unlock(folio);
 
 	if (!inode)
 		return 0;
 
-	sb = inode->i_sb;
+	if (sb_rdonly(inode->i_sb)) {
+		/*
+		 * It means that filesystem was remounted in read-only
+		 * mode because of error or metadata corruption. But we
+		 * have dirty folios that try to be flushed in background.
+		 * So, here we simply discard these dirty folios.
+		 */
+		nilfs_clear_dirty_pages(mapping, false);
+		return -EROFS;
+	}
 
-	if (wbc->sync_mode == WB_SYNC_ALL)
-		err = nilfs_construct_segment(sb);
-	else if (wbc->for_reclaim)
-		nilfs_flush_segment(sb, inode->i_ino);
+	if (wbc->sync_mode == WB_SYNC_ALL &&
+		mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+		err = nilfs_construct_segment(inode->i_sb);
 
 	return err;
-}
-
-static int nilfs_mdt_writeback(struct address_space *mapping,
-		struct writeback_control *wbc)
-{
-	struct folio *folio = NULL;
-	int error;
-
-	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
-		error = nilfs_mdt_write_folio(folio, wbc);
-
-	return error;
 }
 
 static const struct address_space_operations def_mdt_aops = {
@@ -524,6 +497,8 @@ void nilfs_mdt_set_entry_size(struct inode *inode, unsigned int entry_size,
  * nilfs_mdt_setup_shadow_map - setup shadow map and bind it to metadata file
  * @inode: inode of the metadata file
  * @shadow: shadow mapping
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 int nilfs_mdt_setup_shadow_map(struct inode *inode,
 			       struct nilfs_shadow_map *shadow)
@@ -545,6 +520,8 @@ int nilfs_mdt_setup_shadow_map(struct inode *inode,
 /**
  * nilfs_mdt_save_to_shadow_map - copy bmap and dirty pages to shadow map
  * @inode: inode of the metadata file
+ *
+ * Return: 0 on success, or a negative error code on failure.
  */
 int nilfs_mdt_save_to_shadow_map(struct inode *inode)
 {
@@ -653,10 +630,10 @@ void nilfs_mdt_restore_from_shadow_map(struct inode *inode)
 	if (mi->mi_palloc_cache)
 		nilfs_palloc_clear_cache(inode);
 
-	nilfs_clear_dirty_pages(inode->i_mapping);
+	nilfs_clear_dirty_pages(inode->i_mapping, true);
 	nilfs_copy_back_pages(inode->i_mapping, shadow->inode->i_mapping);
 
-	nilfs_clear_dirty_pages(ii->i_assoc_inode->i_mapping);
+	nilfs_clear_dirty_pages(ii->i_assoc_inode->i_mapping, true);
 	nilfs_copy_back_pages(ii->i_assoc_inode->i_mapping,
 			      NILFS_I(shadow->inode)->i_assoc_inode->i_mapping);
 

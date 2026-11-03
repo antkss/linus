@@ -6,7 +6,9 @@
  *			 <benh@kernel.crashing.org>
  */
 
-#include <linux/mod_devicetable.h>
+#include <linux/types.h>
+#include <linux/err.h>
+#include <linux/device-id/of.h>
 
 struct device;
 struct device_node;
@@ -46,8 +48,6 @@ struct of_dev_auxdata {
 #define OF_DEV_AUXDATA(_compat,_phys,_name,_pdata) \
 	{ .compatible = _compat, .phys_addr = _phys, .name = _name, \
 	  .platform_data = _pdata }
-
-extern const struct of_device_id of_default_bus_match_table[];
 
 /* Platform drivers register/unregister */
 extern struct platform_device *of_device_alloc(struct device_node *np,

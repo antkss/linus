@@ -94,9 +94,9 @@ static ssize_t ds1343_show_glitchfilter(struct device *dev,
 	glitch_filt_status = !!(data & DS1343_EGFIL);
 
 	if (glitch_filt_status)
-		return sprintf(buf, "enabled\n");
+		return sysfs_emit(buf, "enabled\n");
 	else
-		return sprintf(buf, "disabled\n");
+		return sysfs_emit(buf, "disabled\n");
 }
 
 static ssize_t ds1343_store_glitchfilter(struct device *dev,
@@ -120,7 +120,7 @@ static ssize_t ds1343_store_glitchfilter(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(glitch_filter, S_IRUGO | S_IWUSR, ds1343_show_glitchfilter,
+static DEVICE_ATTR(glitch_filter, 0644, ds1343_show_glitchfilter,
 			ds1343_store_glitchfilter);
 
 static int ds1343_nvram_write(void *priv, unsigned int off, void *val,
@@ -180,10 +180,10 @@ static ssize_t ds1343_show_tricklecharger(struct device *dev,
 		}
 	}
 
-	return sprintf(buf, "%s %s\n", diodes, resistors);
+	return sysfs_emit(buf, "%s %s\n", diodes, resistors);
 }
 
-static DEVICE_ATTR(trickle_charger, S_IRUGO, ds1343_show_tricklecharger, NULL);
+static DEVICE_ATTR(trickle_charger, 0444, ds1343_show_tricklecharger, NULL);
 
 static struct attribute *ds1343_attrs[] = {
 	&dev_attr_glitch_filter.attr,
@@ -312,11 +312,11 @@ static irqreturn_t ds1343_thread(int irq, void *dev_id)
 	unsigned int stat;
 	int res = 0;
 
-	rtc_lock(priv->rtc);
+	guard(rtc_ops)(priv->rtc);
 
 	res = regmap_read(priv->map, DS1343_STATUS_REG, &stat);
 	if (res)
-		goto out;
+		return IRQ_HANDLED;
 
 	if (stat & DS1343_IRQF0) {
 		stat &= ~DS1343_IRQF0;
@@ -328,8 +328,6 @@ static irqreturn_t ds1343_thread(int irq, void *dev_id)
 				   DS1343_A0IE, 0);
 	}
 
-out:
-	rtc_unlock(priv->rtc);
 	return IRQ_HANDLED;
 }
 
@@ -427,16 +425,11 @@ static int ds1343_probe(struct spi_device *spi)
 				"unable to request irq for rtc ds1343\n");
 		} else {
 			device_init_wakeup(&spi->dev, true);
-			dev_pm_set_wake_irq(&spi->dev, spi->irq);
+			devm_pm_set_wake_irq(&spi->dev, spi->irq);
 		}
 	}
 
 	return 0;
-}
-
-static void ds1343_remove(struct spi_device *spi)
-{
-	dev_pm_clear_wake_irq(&spi->dev);
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -471,7 +464,6 @@ static struct spi_driver ds1343_driver = {
 		.pm = &ds1343_pm,
 	},
 	.probe = ds1343_probe,
-	.remove = ds1343_remove,
 	.id_table = ds1343_id,
 };
 

@@ -431,7 +431,7 @@ void saa7134_input_irq(struct saa7134_dev *dev)
 
 static void saa7134_input_timer(struct timer_list *t)
 {
-	struct saa7134_card_ir *ir = from_timer(ir, t, timer);
+	struct saa7134_card_ir *ir = timer_container_of(ir, t, timer);
 	struct saa7134_dev *dev = ir->dev->priv;
 
 	build_key(dev);
@@ -496,7 +496,7 @@ void saa7134_ir_close(struct rc_dev *rc)
 	struct saa7134_card_ir *ir = dev->remote;
 
 	if (ir->polling)
-		del_timer_sync(&ir->timer);
+		timer_delete_sync(&ir->timer);
 
 	ir->running = false;
 }
@@ -768,8 +768,9 @@ int saa7134_input_init1(struct saa7134_dev *dev)
 		return -ENODEV;
 	}
 
-	ir = kzalloc(sizeof(*ir), GFP_KERNEL);
-	rc = rc_allocate_device(RC_DRIVER_SCANCODE);
+	ir = kzalloc_obj(*ir);
+	rc = rc_allocate_device(raw_decode ?
+				RC_DRIVER_IR_RAW : RC_DRIVER_SCANCODE);
 	if (!ir || !rc) {
 		err = -ENOMEM;
 		goto err_out_free;
@@ -792,10 +793,8 @@ int saa7134_input_init1(struct saa7134_dev *dev)
 	rc->priv = dev;
 	rc->open = saa7134_ir_open;
 	rc->close = saa7134_ir_close;
-	if (raw_decode) {
-		rc->driver_type = RC_DRIVER_IR_RAW;
+	if (raw_decode)
 		rc->allowed_protocols = RC_PROTO_BIT_ALL_IR_DECODER;
-	}
 
 	rc->device_name = saa7134_boards[dev->board].name;
 	rc->input_phys = ir->phys;
@@ -834,6 +833,7 @@ void saa7134_input_fini(struct saa7134_dev *dev)
 		return;
 
 	rc_unregister_device(dev->remote->dev);
+	rc_free_device(dev->remote->dev);
 	kfree(dev->remote);
 	dev->remote = NULL;
 }

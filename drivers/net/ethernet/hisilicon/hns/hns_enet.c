@@ -1230,7 +1230,7 @@ static void hns_nic_update_stats(struct net_device *netdev)
 	h->dev->ops->update_stats(h, &netdev->stats);
 }
 
-/* set mac addr if it is configed. or leave it to the AE driver */
+/* set mac addr if it is configured. or leave it to the AE driver */
 static void hns_init_mac_addr(struct net_device *ndev)
 {
 	struct hns_nic_priv *priv = netdev_priv(ndev);
@@ -1402,7 +1402,7 @@ static void hns_nic_net_down(struct net_device *ndev)
 	if (test_and_set_bit(NIC_STATE_DOWN, &priv->state))
 		return;
 
-	(void)del_timer_sync(&priv->service_timer);
+	(void) timer_delete_sync(&priv->service_timer);
 	netif_tx_stop_all_queues(ndev);
 	netif_carrier_off(ndev);
 	netif_tx_disable(ndev);
@@ -2075,7 +2075,7 @@ static void hns_nic_task_schedule(struct hns_nic_priv *priv)
 
 static void hns_nic_service_timer(struct timer_list *t)
 {
-	struct hns_nic_priv *priv = from_timer(priv, t, service_timer);
+	struct hns_nic_priv *priv = timer_container_of(priv, t, service_timer);
 
 	(void)mod_timer(&priv->service_timer, jiffies + SERVICE_TIMER_HZ);
 
@@ -2317,7 +2317,7 @@ static int hns_nic_dev_probe(struct platform_device *pdev)
 		ret = device_property_read_u32(dev, "port-id", &port_id);
 		if (ret)
 			goto out_read_prop_fail;
-		/* for old dts, we need to caculate the port offset */
+		/* for old dts, we need to calculate the port offset */
 		port_id = port_id < HNS_SRV_OFFSET ? port_id + HNS_DEBUG_OFFSET
 			: port_id - HNS_SRV_OFFSET;
 	}

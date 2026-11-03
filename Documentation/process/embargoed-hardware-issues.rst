@@ -187,7 +187,7 @@ security issues in the past.
 
 The mailing list operates in the same way as normal Linux development.
 Patches are posted, discussed, and reviewed and if agreed upon, applied to
-a non-public git repository which is only accessible to the participating
+a non-public Git repository which is only accessible to the participating
 developers via a secure connection. The repository contains the main
 development branch against the mainline kernel and backport branches for
 stable kernel versions as necessary.
@@ -290,7 +290,7 @@ an involved disclosed party. The current ambassadors list:
   AMD		Tom Lendacky <thomas.lendacky@amd.com>
   Ampere	Darren Hart <darren@os.amperecomputing.com>
   ARM		Catalin Marinas <catalin.marinas@arm.com>
-  IBM Power	Michael Ellerman <ellerman@au.ibm.com>
+  IBM Power	Madhavan Srinivasan <maddy@linux.ibm.com>
   IBM Z		Christian Borntraeger <borntraeger@de.ibm.com>
   Intel		Tony Luck <tony.luck@intel.com>
   Qualcomm	Trilok Soni <quic_tsoni@quicinc.com>

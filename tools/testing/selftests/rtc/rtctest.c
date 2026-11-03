@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../kselftest_harness.h"
+#include "kselftest_harness.h"
 
 #define NUM_UIE 3
 #define ALARM_DELTA 3
@@ -29,6 +29,7 @@ enum rtc_alarm_state {
 	RTC_ALARM_UNKNOWN,
 	RTC_ALARM_ENABLED,
 	RTC_ALARM_DISABLED,
+	RTC_ALARM_RES_MINUTE,
 };
 
 FIXTURE(rtc) {
@@ -48,7 +49,7 @@ TEST_F(rtc, date_read) {
 	struct rtc_time rtc_tm;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
 	/* Read the RTC time/date */
@@ -88,7 +89,7 @@ static void nanosleep_with_retries(long ns)
 	}
 }
 
-static enum rtc_alarm_state get_rtc_alarm_state(int fd)
+static enum rtc_alarm_state get_rtc_alarm_state(int fd, int need_seconds)
 {
 	struct rtc_param param = { 0 };
 	int rc;
@@ -103,6 +104,10 @@ static enum rtc_alarm_state get_rtc_alarm_state(int fd)
 	if ((param.uvalue & _BITUL(RTC_FEATURE_ALARM)) == 0)
 		return RTC_ALARM_DISABLED;
 
+	/* Check if alarm has desired granularity */
+	if (need_seconds && (param.uvalue & _BITUL(RTC_FEATURE_ALARM_RES_MINUTE)))
+		return RTC_ALARM_RES_MINUTE;
+
 	return RTC_ALARM_ENABLED;
 }
 
@@ -111,9 +116,10 @@ TEST_F_TIMEOUT(rtc, date_read_loop, READ_LOOP_DURATION_SEC + 2) {
 	long iter_count = 0;
 	struct rtc_time rtc_tm;
 	time_t start_rtc_read, prev_rtc_read;
+	struct timespec prev_mono, cur_mono;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
 	TH_LOG("Continuously reading RTC time for %ds (with %dms breaks after every read).",
@@ -121,25 +127,31 @@ TEST_F_TIMEOUT(rtc, date_read_loop, READ_LOOP_DURATION_SEC + 2) {
 
 	rc = ioctl(self->fd, RTC_RD_TIME, &rtc_tm);
 	ASSERT_NE(-1, rc);
+	clock_gettime(CLOCK_MONOTONIC, &prev_mono);
 	start_rtc_read = rtc_time_to_timestamp(&rtc_tm);
 	prev_rtc_read = start_rtc_read;
 
 	do  {
 		time_t rtc_read;
+		time_t delta_s = 0;
 
 		rc = ioctl(self->fd, RTC_RD_TIME, &rtc_tm);
 		ASSERT_NE(-1, rc);
+		clock_gettime(CLOCK_MONOTONIC, &cur_mono);
 
 		rtc_read = rtc_time_to_timestamp(&rtc_tm);
+		delta_s = cur_mono.tv_sec - prev_mono.tv_sec;
+
 		/* Time should not go backwards */
 		ASSERT_LE(prev_rtc_read, rtc_read);
-		/* Time should not increase more then 1s at a time */
-		ASSERT_GE(prev_rtc_read + 1, rtc_read);
+		/* Time should not increase more then elapsed time + 1s */
+		ASSERT_GE(prev_rtc_read + delta_s + 1, rtc_read);
 
 		/* Sleep 11ms to avoid killing / overheating the RTC */
 		nanosleep_with_retries(READ_LOOP_SLEEP_MS * 1000000);
 
 		prev_rtc_read = rtc_read;
+		prev_mono = cur_mono;
 		iter_count++;
 	} while (prev_rtc_read <= start_rtc_read + READ_LOOP_DURATION_SEC);
 
@@ -151,15 +163,14 @@ TEST_F_TIMEOUT(rtc, uie_read, NUM_UIE + 2) {
 	unsigned long data;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
 	/* Turn on update interrupts */
 	rc = ioctl(self->fd, RTC_UIE_ON, 0);
 	if (rc == -1) {
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip update IRQs not supported.");
-		return;
+		SKIP(return, "update IRQs are not supported.");
 	}
 
 	for (i = 0; i < NUM_UIE; i++) {
@@ -180,15 +191,14 @@ TEST_F(rtc, uie_select) {
 	unsigned long data;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
 	/* Turn on update interrupts */
 	rc = ioctl(self->fd, RTC_UIE_ON, 0);
 	if (rc == -1) {
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip update IRQs not supported.");
-		return;
+		SKIP(return, "update IRQs are not supported.");
 	}
 
 	for (i = 0; i < NUM_UIE; i++) {
@@ -224,12 +234,14 @@ TEST_F(rtc, alarm_alm_set) {
 	enum rtc_alarm_state alarm_state = RTC_ALARM_UNKNOWN;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
-	alarm_state = get_rtc_alarm_state(self->fd);
+	alarm_state = get_rtc_alarm_state(self->fd, 1);
 	if (alarm_state == RTC_ALARM_DISABLED)
-		SKIP(return, "Skipping test since alarms are not supported.");
+		SKIP(return, "alarms are not supported.");
+	if (alarm_state == RTC_ALARM_RES_MINUTE)
+		SKIP(return, "alarms has only minute granularity.");
 
 	rc = ioctl(self->fd, RTC_RD_TIME, &tm);
 	ASSERT_NE(-1, rc);
@@ -245,8 +257,7 @@ TEST_F(rtc, alarm_alm_set) {
 		 */
 		ASSERT_EQ(RTC_ALARM_UNKNOWN, alarm_state);
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip alarms are not supported.");
-		return;
+		SKIP(return, "alarms are not supported.");
 	}
 
 	rc = ioctl(self->fd, RTC_ALM_READ, &tm);
@@ -292,12 +303,14 @@ TEST_F(rtc, alarm_wkalm_set) {
 	enum rtc_alarm_state alarm_state = RTC_ALARM_UNKNOWN;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
-	alarm_state = get_rtc_alarm_state(self->fd);
+	alarm_state = get_rtc_alarm_state(self->fd, 1);
 	if (alarm_state == RTC_ALARM_DISABLED)
-		SKIP(return, "Skipping test since alarms are not supported.");
+		SKIP(return, "alarms are not supported.");
+	if (alarm_state == RTC_ALARM_RES_MINUTE)
+		SKIP(return, "alarms has only minute granularity.");
 
 	rc = ioctl(self->fd, RTC_RD_TIME, &alarm.time);
 	ASSERT_NE(-1, rc);
@@ -315,8 +328,7 @@ TEST_F(rtc, alarm_wkalm_set) {
 		 */
 		ASSERT_EQ(RTC_ALARM_UNKNOWN, alarm_state);
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip alarms are not supported.");
-		return;
+		SKIP(return, "alarms are not supported.");
 	}
 
 	rc = ioctl(self->fd, RTC_WKALM_RD, &alarm);
@@ -354,12 +366,12 @@ TEST_F_TIMEOUT(rtc, alarm_alm_set_minute, 65) {
 	enum rtc_alarm_state alarm_state = RTC_ALARM_UNKNOWN;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
-	alarm_state = get_rtc_alarm_state(self->fd);
+	alarm_state = get_rtc_alarm_state(self->fd, 0);
 	if (alarm_state == RTC_ALARM_DISABLED)
-		SKIP(return, "Skipping test since alarms are not supported.");
+		SKIP(return, "alarms are not supported.");
 
 	rc = ioctl(self->fd, RTC_RD_TIME, &tm);
 	ASSERT_NE(-1, rc);
@@ -375,8 +387,7 @@ TEST_F_TIMEOUT(rtc, alarm_alm_set_minute, 65) {
 		 */
 		ASSERT_EQ(RTC_ALARM_UNKNOWN, alarm_state);
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip alarms are not supported.");
-		return;
+		SKIP(return, "alarms are not supported.");
 	}
 
 	rc = ioctl(self->fd, RTC_ALM_READ, &tm);
@@ -422,12 +433,12 @@ TEST_F_TIMEOUT(rtc, alarm_wkalm_set_minute, 65) {
 	enum rtc_alarm_state alarm_state = RTC_ALARM_UNKNOWN;
 
 	if (self->fd == -1 && errno == ENOENT)
-		SKIP(return, "Skipping test since %s does not exist", rtc_file);
+		SKIP(return, "%s does not exist", rtc_file);
 	ASSERT_NE(-1, self->fd);
 
-	alarm_state = get_rtc_alarm_state(self->fd);
+	alarm_state = get_rtc_alarm_state(self->fd, 0);
 	if (alarm_state == RTC_ALARM_DISABLED)
-		SKIP(return, "Skipping test since alarms are not supported.");
+		SKIP(return, "alarms are not supported.");
 
 	rc = ioctl(self->fd, RTC_RD_TIME, &alarm.time);
 	ASSERT_NE(-1, rc);
@@ -445,8 +456,7 @@ TEST_F_TIMEOUT(rtc, alarm_wkalm_set_minute, 65) {
 		 */
 		ASSERT_EQ(RTC_ALARM_UNKNOWN, alarm_state);
 		ASSERT_EQ(EINVAL, errno);
-		TH_LOG("skip alarms are not supported.");
-		return;
+		SKIP(return, "alarms are not supported.");
 	}
 
 	rc = ioctl(self->fd, RTC_WKALM_RD, &alarm);
@@ -493,8 +503,7 @@ int main(int argc, char **argv)
 	if (access(rtc_file, R_OK) == 0)
 		ret = test_harness_run(argc, argv);
 	else
-		ksft_exit_skip("[SKIP]: Cannot access rtc file %s - Exiting\n",
-						rtc_file);
+		ksft_exit_skip("Cannot access rtc file %s - Exiting\n", rtc_file);
 
 	return ret;
 }

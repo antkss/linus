@@ -7,6 +7,7 @@
  * Author: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
  */
 
+#include <linux/acpi.h>
 #include <linux/cpufeature.h>
 #include <linux/cpuhotplug.h>
 #include <linux/fs.h>
@@ -21,6 +22,7 @@
 
 #include <asm/cpu_device_id.h>
 #include <asm/intel-family.h>
+#include <asm/msr.h>
 
 #include "isst_if_common.h"
 
@@ -84,11 +86,11 @@ static DECLARE_HASHTABLE(isst_hash, 8);
 static DEFINE_MUTEX(isst_hash_lock);
 
 static int isst_store_new_cmd(int cmd, u32 cpu, int mbox_cmd_type, u32 param,
-			      u32 data)
+			      u64 data)
 {
 	struct isst_cmd *sst_cmd;
 
-	sst_cmd = kmalloc(sizeof(*sst_cmd), GFP_KERNEL);
+	sst_cmd = kmalloc_obj(*sst_cmd);
 	if (!sst_cmd)
 		return -ENOMEM;
 
@@ -191,31 +193,12 @@ void isst_resume_common(void)
 			if (cb->registered)
 				isst_mbox_resume_command(cb, sst_cmd);
 		} else {
-			wrmsrl_safe_on_cpu(sst_cmd->cpu, sst_cmd->cmd,
+			wrmsrq_safe_on_cpu(sst_cmd->cpu, sst_cmd->cmd,
 					   sst_cmd->data);
 		}
 	}
 }
 EXPORT_SYMBOL_GPL(isst_resume_common);
-
-static void isst_restore_msr_local(int cpu)
-{
-	struct isst_cmd *sst_cmd;
-	int i;
-
-	mutex_lock(&isst_hash_lock);
-	for (i = 0; i < ARRAY_SIZE(punit_msr_white_list); ++i) {
-		if (!punit_msr_white_list[i])
-			break;
-
-		hash_for_each_possible(isst_hash, sst_cmd, hnode,
-				       punit_msr_white_list[i]) {
-			if (!sst_cmd->mbox_cmd_type && sst_cmd->cpu == cpu)
-				wrmsrl_safe(sst_cmd->cmd, sst_cmd->data);
-		}
-	}
-	mutex_unlock(&isst_hash_lock);
-}
 
 /**
  * isst_if_mbox_cmd_invalid() - Check invalid mailbox commands
@@ -406,7 +389,7 @@ static int isst_if_cpu_online(unsigned int cpu)
 
 	isst_cpu_info[cpu].numa_node = cpu_to_node(cpu);
 
-	ret = rdmsrl_safe(MSR_CPU_BUS_NUMBER, &data);
+	ret = rdmsrq_safe(MSR_CPU_BUS_NUMBER, &data);
 	if (ret) {
 		/* This is not a fatal error on MSR mailbox only I/F */
 		isst_cpu_info[cpu].bus_info[0] = -1;
@@ -420,12 +403,12 @@ static int isst_if_cpu_online(unsigned int cpu)
 
 	if (isst_hpm_support) {
 
-		ret = rdmsrl_safe(MSR_PM_LOGICAL_ID, &data);
+		ret = rdmsrq_safe(MSR_PM_LOGICAL_ID, &data);
 		if (!ret)
 			goto set_punit_id;
 	}
 
-	ret = rdmsrl_safe(MSR_THREAD_ID_INFO, &data);
+	ret = rdmsrq_safe(MSR_THREAD_ID_INFO, &data);
 	if (ret) {
 		isst_cpu_info[cpu].punit_cpu_id = -1;
 		return ret;
@@ -433,8 +416,6 @@ static int isst_if_cpu_online(unsigned int cpu)
 
 set_punit_id:
 	isst_cpu_info[cpu].punit_cpu_id = data;
-
-	isst_restore_msr_local(cpu);
 
 	return 0;
 }
@@ -445,15 +426,11 @@ static int isst_if_cpu_info_init(void)
 {
 	int ret;
 
-	isst_cpu_info = kcalloc(num_possible_cpus(),
-				sizeof(*isst_cpu_info),
-				GFP_KERNEL);
+	isst_cpu_info = kzalloc_objs(*isst_cpu_info, num_possible_cpus());
 	if (!isst_cpu_info)
 		return -ENOMEM;
 
-	isst_pkg_info = kcalloc(topology_max_packages(),
-				sizeof(*isst_pkg_info),
-				GFP_KERNEL);
+	isst_pkg_info = kzalloc_objs(*isst_pkg_info, topology_max_packages());
 	if (!isst_pkg_info) {
 		kfree(isst_cpu_info);
 		return -ENOMEM;
@@ -524,7 +501,7 @@ static long isst_if_msr_cmd_req(u8 *cmd_ptr, int *write_only, int resume)
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
 
-		ret = wrmsrl_safe_on_cpu(msr_cmd->logical_cpu,
+		ret = wrmsrq_safe_on_cpu(msr_cmd->logical_cpu,
 					 msr_cmd->msr,
 					 msr_cmd->data);
 		*write_only = 1;
@@ -535,7 +512,7 @@ static long isst_if_msr_cmd_req(u8 *cmd_ptr, int *write_only, int resume)
 	} else {
 		u64 data;
 
-		ret = rdmsrl_safe_on_cpu(msr_cmd->logical_cpu,
+		ret = rdmsrq_safe_on_cpu(msr_cmd->logical_cpu,
 					 msr_cmd->msr, &data);
 		if (!ret) {
 			msr_cmd->data = data;
@@ -798,18 +775,67 @@ void isst_if_cdev_unregister(int device_type)
 }
 EXPORT_SYMBOL_GPL(isst_if_cdev_unregister);
 
+#ifdef CONFIG_ACPI
+
+static bool isst_acpi_pm_profile_server(void)
+{
+	if (acpi_gbl_FADT.preferred_profile == PM_ENTERPRISE_SERVER ||
+	    acpi_gbl_FADT.preferred_profile == PM_PERFORMANCE_SERVER)
+		return true;
+
+	return false;
+}
+
+#else
+
+static bool isst_acpi_pm_profile_server(void)
+{
+	return false;
+}
+
+#endif
+
+static const struct x86_cpu_id isst_allowed_families[] = {
+	X86_MATCH_VENDOR_FAM(INTEL, 19, NULL),
+	{}
+};
+
+static bool isst_features_allowed(void)
+{
+	u64 data;
+
+	/* For hypervisors, explicit model addition is required */
+	if (cpu_feature_enabled(X86_FEATURE_HYPERVISOR))
+		return false;
+
+	/* SST is a server only feature */
+	if (!isst_acpi_pm_profile_server())
+		return false;
+
+	/*
+	 * Family 19 and the checks above guarantee the SST enumeration
+	 * interfaces are present
+	 */
+	if (!x86_match_cpu(isst_allowed_families))
+		return false;
+
+	/* MSR_PM_LOGICAL_ID is required to get PM logical CPU ID */
+	return !rdmsrq_safe(MSR_PM_LOGICAL_ID, &data);
+}
+
 #define SST_HPM_SUPPORTED	0x01
 #define SST_MBOX_SUPPORTED	0x02
 
 static const struct x86_cpu_id isst_cpu_ids[] = {
 	X86_MATCH_VFM(INTEL_ATOM_CRESTMONT,	SST_HPM_SUPPORTED),
 	X86_MATCH_VFM(INTEL_ATOM_CRESTMONT_X,	SST_HPM_SUPPORTED),
+	X86_MATCH_VFM(INTEL_ATOM_DARKMONT_X,	SST_HPM_SUPPORTED),
 	X86_MATCH_VFM(INTEL_EMERALDRAPIDS_X,	0),
 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_D,	SST_HPM_SUPPORTED),
 	X86_MATCH_VFM(INTEL_GRANITERAPIDS_X,	SST_HPM_SUPPORTED),
 	X86_MATCH_VFM(INTEL_ICELAKE_D,		0),
 	X86_MATCH_VFM(INTEL_ICELAKE_X,		0),
-	X86_MATCH_VFM(INTEL_PANTHERCOVE_X,	SST_HPM_SUPPORTED),
+	X86_MATCH_VFM(INTEL_DIAMONDRAPIDS_X,	SST_HPM_SUPPORTED),
 	X86_MATCH_VFM(INTEL_SAPPHIRERAPIDS_X,	0),
 	X86_MATCH_VFM(INTEL_SKYLAKE_X,		SST_MBOX_SUPPORTED),
 	{}
@@ -821,8 +847,13 @@ static int __init isst_if_common_init(void)
 	const struct x86_cpu_id *id;
 
 	id = x86_match_cpu(isst_cpu_ids);
-	if (!id)
+	if (!id) {
+		if (isst_features_allowed()) {
+			isst_hpm_support = true;
+			goto misc_reg;
+		}
 		return -ENODEV;
+	}
 
 	if (id->driver_data == SST_HPM_SUPPORTED) {
 		isst_hpm_support = true;
@@ -830,11 +861,12 @@ static int __init isst_if_common_init(void)
 		u64 data;
 
 		/* Can fail only on some Skylake-X generations */
-		if (rdmsrl_safe(MSR_OS_MAILBOX_INTERFACE, &data) ||
-		    rdmsrl_safe(MSR_OS_MAILBOX_DATA, &data))
+		if (rdmsrq_safe(MSR_OS_MAILBOX_INTERFACE, &data) ||
+		    rdmsrq_safe(MSR_OS_MAILBOX_DATA, &data))
 			return -ENODEV;
 	}
 
+misc_reg:
 	return isst_misc_reg();
 }
 module_init(isst_if_common_init)

@@ -203,12 +203,32 @@ For RFC postings specifically, if nobody responded in a week - reviewers
 either missed the posting or have no strong opinions. If the code is ready,
 repost as a PATCH.
 
+There are 2 services actively providing LLM-generated review on posted patches:
+
+- https://sashiko.dev/
+- https://netdev-ai.bots.linux.dev/sashiko/
+
+both use the Sashiko infrastructure on top of different models. Reviews are
+available after 24h. Patch authors are expected to proactively look into the
+AI-generated reviews and handle such feedback as any other kind of review:
+either debate it or address it. In both cases a reply on the mailing list is
+expected.
+
+Authors are strongly encouraged to run LLM reviews on the posted patches in
+advance of the actual post. Large series triggering a significant amount of
+AI-generated feedback will likely get little attention from maintainers and
+reviewers.
+
 Emails saying just "ping" or "bump" are considered rude. If you can't figure
 out the status of the patch from patchwork or where the discussion has
 landed - describe your best guess and ask if it's correct. For example::
 
   I don't understand what the next steps are. Person X seems to be unhappy
   with A, should I do B and repost the patches?
+
+Don't reach out to maintainers or reviewers via private email and/or other
+communications channels: all the discussion must remain public, and
+requesting special attention is unfair towards the community, at best.
 
 .. _Changes requested:
 
@@ -263,6 +283,38 @@ as a patch to the list with a commit message explaining the technical
 problems with the reverted commit. Reverts should be used as a last resort,
 when original change is completely wrong; incremental fixes are preferred.
 
+Bug fixes
+~~~~~~~~~
+
+All bug fixes must state how the issue was discovered and validated,
+and how the fix was tested. This should be done in plain English, not with
+special tags or annotations. That said, the information does not have to be
+provided if the existing trailers imply it (e.g. ``Reported-by: syzbot...``
+implies the discovery method and validation).
+
+Example statements describing discovery:
+
+ - discovered by a non-AI static analysis tool
+ - discovered by an AI code review agent
+ - discovered by manual code inspection
+ - triggered during code development
+ - triggered in CI testing
+ - observed on a machine in real use
+
+If the discovery method does not imply the issue was triggered, the commit
+message should describe the validation, i.e. how the bug was confirmed
+to be real. The commit message must disclose whether reproducing the issue
+required modifying the kernel (e.g. inserting a delay to widen a race, or
+writing a loadable module to issue the right sequence of calls) or using error
+injection. The reproduction steps should be included in the commit message
+if they are short (roughly 10 lines or fewer); longer reproducers can be posted
+online with a link included.
+
+The testing statement should explain whether the fix was tested against the
+reproducer and against kernel selftests. If the bug is in a hardware driver,
+the testing statement must include information about the HW on which the
+fix was tested.
+
 Stable tree
 ~~~~~~~~~~~
 
@@ -311,6 +363,14 @@ to the mailing list, e.g.::
 Posting as one thread is discouraged because it confuses patchwork
 (as of patchwork 2.2.2).
 
+Co-posting selftests
+~~~~~~~~~~~~~~~~~~~~
+
+Selftests should be part of the same series as the code changes.
+Specifically for fixes both code change and related test should go into
+the same tree (the tests may lack a Fixes tag, which is expected).
+Mixing code changes and test changes in a single commit is discouraged.
+
 Preparing changes
 -----------------
 
@@ -354,6 +414,18 @@ chunk of time. A small series can be reviewed in a short time, so Maintainers
 just do it. As a result, a sequence of smaller series gets merged quicker and
 with better review coverage. Re-posting large series also increases the mailing
 list traffic.
+
+Limit patches outstanding on mailing list
+-----------------------------------------
+
+Avoid having more than 15 patches, across all series, outstanding for
+review on the mailing list for a single tree. In other words, a maximum of
+15 patches under review on net, and a maximum of 15 patches under review on
+net-next.
+
+This limit is intended to focus developer effort on testing patches before
+upstream review. Aiding the quality of upstream submissions, and easing the
+load on reviewers.
 
 .. _rcs:
 
@@ -399,7 +471,7 @@ Clean-up patches
 Netdev discourages patches which perform simple clean-ups, which are not in
 the context of other work. For example:
 
-* Addressing ``checkpatch.pl`` warnings
+* Addressing ``checkpatch.pl``, and other trivial coding style warnings
 * Addressing :ref:`Local variable ordering<rcs>` issues
 * Conversions to device-managed APIs (``devm_`` helpers)
 
@@ -459,8 +531,14 @@ netdevsim
 
 ``netdevsim`` is a test driver which can be used to exercise driver
 configuration APIs without requiring capable hardware.
-Mock-ups and tests based on ``netdevsim`` are strongly encouraged when
-adding new APIs, but ``netdevsim`` in itself is **not** considered
+Mock-ups and tests based on ``netdevsim`` are encouraged when
+adding new APIs with complex logic in the stack. The tests should
+be written so that they can run both against ``netdevsim`` and a real
+device (see ``tools/testing/selftests/drivers/net/README.rst``).
+``netdevsim``-only tests should focus on testing corner cases
+and failure paths in the core which are hard to exercise with a real driver.
+
+``netdevsim`` in itself is **not** considered
 a use case/user. You must also implement the new APIs in a real driver.
 
 We give no guarantees that ``netdevsim`` won't change in the future
@@ -469,6 +547,52 @@ in a way which would break what would normally be considered uAPI.
 ``netdevsim`` is reserved for use by upstream tests only, so any
 new ``netdevsim`` features must be accompanied by selftests under
 ``tools/testing/selftests/``.
+
+Supported status for drivers
+----------------------------
+
+.. note: The following requirements apply only to Ethernet NIC drivers.
+
+Netdev defines additional requirements for drivers which want to acquire
+the ``Supported`` status in the MAINTAINERS file. ``Supported`` drivers must
+be running all upstream driver tests and reporting the results twice a day.
+Drivers which do not comply with this requirement should use the ``Maintained``
+status. There is currently no difference in how ``Supported`` and ``Maintained``
+drivers are treated upstream.
+
+The exact rules a driver must follow to acquire the ``Supported`` status:
+
+1. Must run all tests under ``drivers/net`` and ``drivers/net/hw`` targets
+   of Linux selftests. Running and reporting private / internal tests is
+   also welcome, but upstream tests are a must.
+
+2. The minimum run frequency is once every 12 hours. Must test the
+   designated branch from the selected branch feed. Note that branches
+   are auto-constructed and exposed to intentional malicious patch posting,
+   so the test systems must be isolated.
+
+3. Drivers supporting multiple generations of devices must test at
+   least one device from each generation. A testbed manifest (exact
+   format TBD) should describe the device models tested.
+
+4. The tests must run reliably, if multiple branches are skipped or tests
+   are failing due to execution environment problems the ``Supported``
+   status will be withdrawn.
+
+5. Test failures due to bugs either in the driver or the test itself,
+   or lack of support for the feature the test is targeting are
+   *not* a basis for losing the ``Supported`` status.
+
+netdev CI will maintain an official page of supported devices, listing their
+recent test results.
+
+The driver maintainer may arrange for someone else to run the test,
+there is no requirement for the person listed as maintainer (or their
+employer) to be responsible for running the tests. Collaboration between
+vendors, hosting GH CI, other repos under linux-netdev, etc. is most welcome.
+
+See https://github.com/linux-netdev/nipa/wiki for more information about
+netdev CI. Feel free to reach out to maintainers or the list with any questions.
 
 Reviewer guidance
 -----------------
@@ -479,10 +603,12 @@ helpful tips please see :ref:`development_advancedtopics_reviews`.
 
 It's safe to assume that netdev maintainers know the community and the level
 of expertise of the reviewers. The reviewers should not be concerned about
-their comments impeding or derailing the patch flow.
+their comments impeding or derailing the patch flow. A Reviewed-by tag
+is understood to mean "I have reviewed this code to the best of my ability"
+rather than "I can attest this code is correct".
 
-Less experienced reviewers are highly encouraged to do more in-depth
-review of submissions and not focus exclusively on trivial or subjective
+Reviewers are highly encouraged to do more in-depth review of submissions
+and not focus exclusively on process issues, trivial or subjective
 matters like code formatting, tags etc.
 
 Testimonials / feedback

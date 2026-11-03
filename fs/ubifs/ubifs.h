@@ -124,13 +124,6 @@
 #define OLD_ZNODE_AGE 20
 #define YOUNG_ZNODE_AGE 5
 
-/*
- * Some compressors, like LZO, may end up with more data then the input buffer.
- * So UBIFS always allocates larger output buffer, to be sure the compressor
- * will not corrupt memory in case of worst case compression.
- */
-#define WORST_COMPR_FACTOR 2
-
 #ifdef CONFIG_FS_ENCRYPTION
 #define UBIFS_CIPHER_BLOCK_SIZE FSCRYPT_CONTENTS_ALIGNMENT
 #else
@@ -141,7 +134,7 @@
  * How much memory is needed for a buffer where we compress a data node.
  */
 #define COMPRESSED_DATA_NODE_BUF_SZ \
-	(UBIFS_DATA_NODE_SZ + UBIFS_BLOCK_SIZE * WORST_COMPR_FACTOR)
+	(UBIFS_DATA_NODE_SZ + UBIFS_BLOCK_SIZE)
 
 /* Maximum expected tree height for use by bottom_up_buf */
 #define BOTTOM_UP_HEIGHT 64
@@ -270,6 +263,8 @@ enum {
 	ASSACT_PANIC,
 };
 
+struct folio;
+
 /**
  * struct ubifs_old_idx - index node obsoleted since last commit start.
  * @rb: rb-tree node
@@ -370,6 +365,7 @@ struct ubifs_gced_idx_leb {
  * @read_in_a_row: number of consecutive pages read in a row (for bulk read)
  * @data_len: length of the data attached to the inode
  * @data: inode's data
+ * @i_crypt_info: inode's fscrypt information
  *
  * @ui_mutex exists for two main reasons. At first it prevents inodes from
  * being written back while UBIFS changing them, being in the middle of an VFS
@@ -421,6 +417,9 @@ struct ubifs_inode {
 	pgoff_t read_in_a_row;
 	int data_len;
 	void *data;
+#ifdef CONFIG_FS_ENCRYPTION
+	struct fscrypt_inode_info *i_crypt_info;
+#endif
 };
 
 /**
@@ -739,6 +738,7 @@ struct ubifs_jhead {
  * struct ubifs_zbranch - key/coordinate/length branch stored in znodes.
  * @key: key
  * @znode: znode address in memory
+ * @leaf: leaf node
  * @lnum: LEB number of the target node (indexing node or data node)
  * @offs: target node offset within @lnum
  * @len: target node length
@@ -802,7 +802,7 @@ struct ubifs_znode {
  * @gc_seq: GC sequence number to detect races with GC
  * @cnt: number of data nodes for bulk read
  * @blk_cnt: number of data blocks including holes
- * @oef: end of file reached
+ * @eof: end of file reached
  */
 struct bu_info {
 	union ubifs_key key;
@@ -835,16 +835,12 @@ struct ubifs_node_range {
  * struct ubifs_compressor - UBIFS compressor description structure.
  * @compr_type: compressor type (%UBIFS_COMPR_LZO, etc)
  * @cc: cryptoapi compressor handle
- * @comp_mutex: mutex used during compression
- * @decomp_mutex: mutex used during decompression
  * @name: compressor name
  * @capi_name: cryptoapi compressor name
  */
 struct ubifs_compressor {
 	int compr_type;
-	struct crypto_comp *cc;
-	struct mutex *comp_mutex;
-	struct mutex *decomp_mutex;
+	struct crypto_acomp *cc;
 	const char *name;
 	const char *capi_name;
 };
@@ -990,7 +986,7 @@ struct ubifs_budg_info {
 };
 
 /**
- * ubifs_stats_info - per-FS statistics information.
+ * struct ubifs_stats_info - per-FS statistics information.
  * @magic_errors: number of bad magic numbers (will be reset with a new mount).
  * @node_errors: number of bad nodes (will be reset with a new mount).
  * @crc_errors: number of bad crcs (will be reset with a new mount).
@@ -1056,6 +1052,7 @@ struct ubifs_debug_info;
  * @rw_incompat: the media is not R/W compatible
  * @assert_action: action to take when a ubifs_assert() fails
  * @authenticated: flag indigating the FS is mounted in authenticated mode
+ * @superblock_need_write: superblock node needs to be written
  *
  * @tnc_mutex: protects the Tree Node Cache (TNC), @zroot, @cnext, @enext, and
  *             @calc_idx_sz
@@ -1593,8 +1590,9 @@ int ubifs_prepare_auth_node(struct ubifs_info *c, void *node,
  * @expected: first hash
  * @got: second hash
  *
- * Compare two hashes @expected and @got. Returns 0 when they are equal, a
- * negative error code otherwise.
+ * Compare two hashes @expected and @got.
+ *
+ * Returns: 0 when they are equal, a negative error code otherwise.
  */
 static inline int ubifs_check_hash(const struct ubifs_info *c,
 				   const u8 *expected, const u8 *got)
@@ -1608,8 +1606,9 @@ static inline int ubifs_check_hash(const struct ubifs_info *c,
  * @expected: first HMAC
  * @got: second HMAC
  *
- * Compare two hashes @expected and @got. Returns 0 when they are equal, a
- * negative error code otherwise.
+ * Compare two hashes @expected and @got.
+ *
+ * Returns: 0 when they are equal, a negative error code otherwise.
  */
 static inline int ubifs_check_hmac(const struct ubifs_info *c,
 				   const u8 *expected, const u8 *got)
@@ -1649,7 +1648,7 @@ static inline void ubifs_exit_authentication(struct ubifs_info *c)
  * @c: UBIFS file-system description object
  * @br: branch to get the hash from
  *
- * This returns a pointer to the hash of a branch. Since the key already is a
+ * Returns: a pointer to the hash of a branch. Since the key already is a
  * dynamically sized object we cannot use a struct member here.
  */
 static inline u8 *ubifs_branch_hash(struct ubifs_info *c,
@@ -1699,7 +1698,7 @@ static inline int ubifs_node_verify_hmac(const struct ubifs_info *c,
  * ubifs_auth_node_sz - returns the size of an authentication node
  * @c: UBIFS file-system description object
  *
- * This function returns the size of an authentication node which can
+ * Returns: the size of an authentication node which can
  * be 0 for unauthenticated filesystems or the real size of an auth node
  * authentication is enabled.
  */
@@ -1752,7 +1751,7 @@ int ubifs_write_node_hmac(struct ubifs_info *c, void *buf, int len, int lnum,
 int ubifs_check_node(const struct ubifs_info *c, const void *buf, int len,
 		     int lnum, int offs, int quiet, int must_chk_crc);
 void ubifs_init_node(struct ubifs_info *c, void *buf, int len, int pad);
-void ubifs_crc_node(struct ubifs_info *c, void *buf, int len);
+void ubifs_crc_node(void *buf, int len);
 void ubifs_prepare_node(struct ubifs_info *c, void *buf, int len, int pad);
 int ubifs_prepare_node_hmac(struct ubifs_info *c, void *node, int len,
 			    int hmac_offs, int pad);
@@ -1795,7 +1794,8 @@ int ubifs_jnl_update(struct ubifs_info *c, const struct inode *dir,
 		     const struct fscrypt_name *nm, const struct inode *inode,
 		     int deletion, int xent, int in_orphan);
 int ubifs_jnl_write_data(struct ubifs_info *c, const struct inode *inode,
-			 const union ubifs_key *key, const void *buf, int len);
+			 const union ubifs_key *key, struct folio *folio,
+			 size_t offset, int len);
 int ubifs_jnl_write_inode(struct ubifs_info *c, const struct inode *inode);
 int ubifs_jnl_delete_inode(struct ubifs_info *c, const struct inode *inode);
 int ubifs_jnl_xrename(struct ubifs_info *c, const struct inode *fst_dir,
@@ -2020,14 +2020,15 @@ int ubifs_calc_dark(const struct ubifs_info *c, int spc);
 
 /* file.c */
 int ubifs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
-int ubifs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int ubifs_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		  struct iattr *attr);
-int ubifs_update_time(struct inode *inode, int flags);
+int ubifs_update_time(struct inode *inode, enum fs_update_time type,
+		      unsigned int flags);
 
 /* dir.c */
 struct inode *ubifs_new_inode(struct ubifs_info *c, struct inode *dir,
 			      umode_t mode, bool is_xattr);
-int ubifs_getattr(struct mnt_idmap *idmap, const struct path *path,
+int ubifs_getattr(const struct mnt_idmap *idmap, const struct path *path,
 		  struct kstat *stat, u32 request_mask, unsigned int flags);
 int ubifs_check_dir_empty(struct inode *dir);
 
@@ -2081,9 +2082,9 @@ int ubifs_recover_size(struct ubifs_info *c, bool in_place);
 void ubifs_destroy_size_tree(struct ubifs_info *c);
 
 /* ioctl.c */
-int ubifs_fileattr_get(struct dentry *dentry, struct fileattr *fa);
-int ubifs_fileattr_set(struct mnt_idmap *idmap,
-		       struct dentry *dentry, struct fileattr *fa);
+int ubifs_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
+int ubifs_fileattr_set(const struct mnt_idmap *idmap,
+		       struct dentry *dentry, struct file_kattr *fa);
 long ubifs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 void ubifs_set_inode_flags(struct inode *inode);
 #ifdef CONFIG_COMPAT
@@ -2095,8 +2096,14 @@ int __init ubifs_compressors_init(void);
 void ubifs_compressors_exit(void);
 void ubifs_compress(const struct ubifs_info *c, const void *in_buf, int in_len,
 		    void *out_buf, int *out_len, int *compr_type);
+void ubifs_compress_folio(const struct ubifs_info *c, struct folio *folio,
+			 size_t offset, int in_len, void *out_buf,
+			 int *out_len, int *compr_type);
 int ubifs_decompress(const struct ubifs_info *c, const void *buf, int len,
 		     void *out, int *out_len, int compr_type);
+int ubifs_decompress_folio(const struct ubifs_info *c, const void *buf,
+			   int len, struct folio *folio, size_t offset,
+			   int *out_len, int compr_type);
 
 /* sysfs.c */
 int ubifs_sysfs_init(void);

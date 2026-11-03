@@ -29,6 +29,7 @@
 #include <linux/rbtree.h>
 
 #include <drm/drm_mm.h>
+#include <drm/intel/gtt_view_types.h>
 
 #include "gem/i915_gem_object_types.h"
 
@@ -65,22 +66,22 @@
  * Implementation and usage
  *
  * GGTT views are implemented using VMAs and are distinguished via enum
- * i915_gtt_view_type and struct i915_gtt_view.
+ * intel_gtt_view_type and struct intel_gtt_view.
  *
  * A new flavour of core GEM functions which work with GGTT bound objects were
  * added with the _ggtt_ infix, and sometimes with _view postfix to avoid
- * renaming  in large amounts of code. They take the struct i915_gtt_view
+ * renaming  in large amounts of code. They take the struct intel_gtt_view
  * parameter encapsulating all metadata required to implement a view.
  *
  * As a helper for callers which are only interested in the normal view,
- * globally const i915_gtt_view_normal singleton instance exists. All old core
+ * globally const intel_gtt_view_normal singleton instance exists. All old core
  * GEM API functions, the ones not taking the view parameter, are operating on,
  * or with the normal GGTT view.
  *
  * Code wanting to add or use a new GGTT view needs to:
  *
  * 1. Add a new enum with a suitable name.
- * 2. Extend the metadata in the i915_gtt_view structure if required.
+ * 2. Extend the metadata in the intel_gtt_view structure if required.
  * 3. Add support to i915_get_vma_pages().
  *
  * New views are required to build a scatter-gather table from within the
@@ -88,52 +89,12 @@
  * exists for the lifetime of an VMA.
  *
  * Core API is designed to have copy semantics which means that passed in
- * struct i915_gtt_view does not need to be persistent (left around after
+ * struct intel_gtt_view does not need to be persistent (left around after
  * calling the core API functions).
  *
  */
 
 struct i915_vma_resource;
-
-struct intel_remapped_plane_info {
-	/* in gtt pages */
-	u32 offset:31;
-	u32 linear:1;
-	union {
-		/* in gtt pages for !linear */
-		struct {
-			u16 width;
-			u16 height;
-			u16 src_stride;
-			u16 dst_stride;
-		};
-
-		/* in gtt pages for linear */
-		u32 size;
-	};
-} __packed;
-
-struct intel_remapped_info {
-	struct intel_remapped_plane_info plane[4];
-	/* in gtt pages */
-	u32 plane_alignment;
-} __packed;
-
-struct intel_rotation_info {
-	struct intel_remapped_plane_info plane[2];
-} __packed;
-
-struct intel_partial_info {
-	u64 offset;
-	unsigned int size;
-} __packed;
-
-enum i915_gtt_view_type {
-	I915_GTT_VIEW_NORMAL = 0,
-	I915_GTT_VIEW_ROTATED = sizeof(struct intel_rotation_info),
-	I915_GTT_VIEW_PARTIAL = sizeof(struct intel_partial_info),
-	I915_GTT_VIEW_REMAPPED = sizeof(struct intel_remapped_info),
-};
 
 static inline void assert_i915_gem_gtt_types(void)
 {
@@ -150,25 +111,15 @@ static inline void assert_i915_gem_gtt_types(void)
 	/* As we encode the size of each branch inside the union into its type,
 	 * we have to be careful that each branch has a unique size.
 	 */
-	switch ((enum i915_gtt_view_type)0) {
-	case I915_GTT_VIEW_NORMAL:
-	case I915_GTT_VIEW_PARTIAL:
-	case I915_GTT_VIEW_ROTATED:
-	case I915_GTT_VIEW_REMAPPED:
+	switch ((enum intel_gtt_view_type)0) {
+	case INTEL_GTT_VIEW_NORMAL:
+	case INTEL_GTT_VIEW_PARTIAL:
+	case INTEL_GTT_VIEW_ROTATED:
+	case INTEL_GTT_VIEW_REMAPPED:
 		/* gcc complains if these are identical cases */
 		break;
 	}
 }
-
-struct i915_gtt_view {
-	enum i915_gtt_view_type type;
-	union {
-		/* Members need to contain no holes/padding */
-		struct intel_partial_info partial;
-		struct intel_rotation_info rotated;
-		struct intel_remapped_info remapped;
-	};
-};
 
 /**
  * DOC: Virtual Memory Address
@@ -279,11 +230,11 @@ struct i915_vma {
 	/**
 	 * Support different GGTT views into the same object.
 	 * This means there can be multiple VMA mappings per object and per VM.
-	 * i915_gtt_view_type is used to distinguish between those entries.
-	 * The default one of zero (I915_GTT_VIEW_NORMAL) is default and also
+	 * intel_gtt_view_type is used to distinguish between those entries.
+	 * The default one of zero (INTEL_GTT_VIEW_NORMAL) is default and also
 	 * assumed in GEM functions which take no ggtt view parameter.
 	 */
-	struct i915_gtt_view gtt_view;
+	struct intel_gtt_view gtt_view;
 
 	/** This object's place on the active/inactive lists */
 	struct list_head vm_link;

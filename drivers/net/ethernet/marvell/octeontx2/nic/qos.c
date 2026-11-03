@@ -165,6 +165,11 @@ static void __otx2_qos_txschq_cfg(struct otx2_nic *pfvf,
 
 		otx2_config_sched_shaping(pfvf, node, cfg, &num_regs);
 	} else if (level == NIX_TXSCH_LVL_TL2) {
+		/* configure parent txschq */
+		cfg->reg[num_regs] = NIX_AF_TL2X_PARENT(node->schq);
+		cfg->regval[num_regs] = (u64)hw->tx_link << 16;
+		num_regs++;
+
 		/* configure link cfg */
 		if (level == pfvf->qos.link_cfg_lvl) {
 			cfg->reg[num_regs] = NIX_AF_TL3_TL2X_LINKX_CFG(node->schq, hw->tx_link);
@@ -230,13 +235,63 @@ static int otx2_qos_txschq_set_parent_topology(struct otx2_nic *pfvf,
 	return rc;
 }
 
+static int otx2_qos_reset_schq_topology(struct otx2_nic *pfvf, u16 lvl,
+					u16 schq)
+{
+	struct mbox *mbox = &pfvf->mbox;
+	struct nix_txschq_config *cfg;
+	int rc;
+
+	if (lvl < NIX_TXSCH_LVL_TL4 || lvl >= NIX_TXSCH_LVL_TL1)
+		return 0;
+
+	mutex_lock(&mbox->lock);
+
+	cfg = otx2_mbox_alloc_msg_nix_txschq_cfg(mbox);
+	if (!cfg) {
+		mutex_unlock(&mbox->lock);
+		return -ENOMEM;
+	}
+
+	cfg->lvl = lvl;
+	cfg->num_regs = 1;
+
+	if (lvl == NIX_TXSCH_LVL_TL4)
+		cfg->reg[0] = NIX_AF_TL4X_TOPOLOGY(schq);
+	else if (lvl == NIX_TXSCH_LVL_TL3)
+		cfg->reg[0] = NIX_AF_TL3X_TOPOLOGY(schq);
+	else if (lvl == NIX_TXSCH_LVL_TL2)
+		cfg->reg[0] = NIX_AF_TL2X_TOPOLOGY(schq);
+
+	cfg->regval[0] = 0;
+
+	rc = otx2_sync_mbox_msg(mbox);
+
+	mutex_unlock(&mbox->lock);
+
+	return rc;
+}
+
+static void otx2_qos_free_hw_schq(struct otx2_nic *pfvf, u16 lvl, u16 schq)
+{
+	int err;
+
+	err = otx2_qos_reset_schq_topology(pfvf, lvl, schq);
+	if (err)
+		netdev_warn(pfvf->netdev,
+			    "QoS: failed to reset topology for schq %u at level %u: %d\n",
+			    schq, lvl, err);
+
+	otx2_txschq_free_one(pfvf, lvl, schq);
+}
+
 static void otx2_qos_free_hw_node_schq(struct otx2_nic *pfvf,
 				       struct otx2_qos_node *parent)
 {
 	struct otx2_qos_node *node;
 
 	list_for_each_entry_reverse(node, &parent->child_schq_list, list)
-		otx2_txschq_free_one(pfvf, node->level, node->schq);
+		otx2_qos_free_hw_schq(pfvf, node->level, node->schq);
 }
 
 static void otx2_qos_free_hw_node(struct otx2_nic *pfvf,
@@ -247,7 +302,7 @@ static void otx2_qos_free_hw_node(struct otx2_nic *pfvf,
 	list_for_each_entry_safe(node, tmp, &parent->child_list, list) {
 		otx2_qos_free_hw_node(pfvf, node);
 		otx2_qos_free_hw_node_schq(pfvf, node);
-		otx2_txschq_free_one(pfvf, node->level, node->schq);
+		otx2_qos_free_hw_schq(pfvf, node->level, node->schq);
 	}
 }
 
@@ -261,7 +316,7 @@ static void otx2_qos_free_hw_cfg(struct otx2_nic *pfvf,
 	otx2_qos_free_hw_node_schq(pfvf, node);
 
 	/* free node hw mappings */
-	otx2_txschq_free_one(pfvf, node->level, node->schq);
+	otx2_qos_free_hw_schq(pfvf, node->level, node->schq);
 
 	mutex_unlock(&pfvf->qos.qos_lock);
 }
@@ -275,6 +330,8 @@ static void otx2_qos_sw_node_delete(struct otx2_nic *pfvf,
 		__clear_bit(node->qid, pfvf->qos.qos_sq_bmap);
 		otx2_qos_update_tx_netdev_queues(pfvf);
 	}
+
+	synchronize_net();
 
 	list_del(&node->list);
 	kfree(node);
@@ -402,7 +459,7 @@ otx2_qos_alloc_root(struct otx2_nic *pfvf)
 {
 	struct otx2_qos_node *node;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node);
 	if (!node)
 		return ERR_PTR(-ENOMEM);
 
@@ -458,7 +515,7 @@ static int otx2_qos_alloc_txschq_node(struct otx2_nic *pfvf,
 
 	parent = node;
 	for (lvl = node->level - 1; lvl >= NIX_TXSCH_LVL_MDQ; lvl--) {
-		txschq_node = kzalloc(sizeof(*txschq_node), GFP_KERNEL);
+		txschq_node = kzalloc_obj(*txschq_node);
 		if (!txschq_node)
 			goto err_out;
 
@@ -503,7 +560,7 @@ otx2_qos_sw_create_leaf_node(struct otx2_nic *pfvf,
 	struct otx2_qos_node *node;
 	int err;
 
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+	node = kzalloc_obj(*node);
 	if (!node)
 		return ERR_PTR(-ENOMEM);
 
@@ -908,7 +965,7 @@ static void otx2_qos_free_cfg(struct otx2_nic *pfvf, struct otx2_qos_cfg *cfg)
 	for (lvl = 0; lvl < NIX_TXSCH_LVL_CNT; lvl++) {
 		for (idx = 0; idx < cfg->schq[lvl]; idx++) {
 			schq = cfg->schq_list[lvl][idx];
-			otx2_txschq_free_one(pfvf, lvl, schq);
+			otx2_qos_free_hw_schq(pfvf, lvl, schq);
 		}
 	}
 
@@ -916,7 +973,7 @@ static void otx2_qos_free_cfg(struct otx2_nic *pfvf, struct otx2_qos_cfg *cfg)
 		for (idx = 0; idx < cfg->schq_contig[lvl]; idx++) {
 			if (cfg->schq_index_used[lvl][idx]) {
 				schq = cfg->schq_contig_list[lvl][idx];
-				otx2_txschq_free_one(pfvf, lvl, schq);
+				otx2_qos_free_hw_schq(pfvf, lvl, schq);
 			}
 		}
 	}
@@ -1040,7 +1097,7 @@ static int otx2_qos_root_add(struct otx2_nic *pfvf, u16 htb_maj_id, u16 htb_defc
 	}
 
 	/* allocate txschq queue */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		err = -ENOMEM;
@@ -1274,7 +1331,7 @@ static int otx2_qos_leaf_alloc_queue(struct otx2_nic *pfvf, u16 classid,
 	set_bit(prio, parent->prio_bmap);
 
 	/* read current txschq configuration */
-	old_cfg = kzalloc(sizeof(*old_cfg), GFP_KERNEL);
+	old_cfg = kzalloc_obj(*old_cfg);
 	if (!old_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1303,7 +1360,7 @@ static int otx2_qos_leaf_alloc_queue(struct otx2_nic *pfvf, u16 classid,
 	}
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1412,7 +1469,7 @@ static int otx2_qos_leaf_to_inner(struct otx2_nic *pfvf, u16 classid,
 	qid = node->qid;
 
 	/* read current txschq configuration */
-	old_cfg = kzalloc(sizeof(*old_cfg), GFP_KERNEL);
+	old_cfg = kzalloc_obj(*old_cfg);
 	if (!old_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1440,7 +1497,7 @@ static int otx2_qos_leaf_to_inner(struct otx2_nic *pfvf, u16 classid,
 	}
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		ret = -ENOMEM;
@@ -1633,6 +1690,7 @@ static int otx2_qos_leaf_del_last(struct otx2_nic *pfvf, u16 classid, bool force
 	if (!node->is_static)
 		dwrr_del_node = true;
 
+	WRITE_ONCE(node->qid, OTX2_QOS_QID_INNER);
 	/* destroy the leaf node */
 	otx2_qos_disable_sq(pfvf, qid);
 	otx2_qos_destroy_node(pfvf, node);
@@ -1662,7 +1720,7 @@ static int otx2_qos_leaf_del_last(struct otx2_nic *pfvf, u16 classid, bool force
 	__set_bit(qid, pfvf->qos.qos_sq_bmap);
 
 	/* push new txschq config to hw */
-	new_cfg = kzalloc(sizeof(*new_cfg), GFP_KERNEL);
+	new_cfg = kzalloc_obj(*new_cfg);
 	if (!new_cfg) {
 		NL_SET_ERR_MSG_MOD(extack, "Memory allocation error");
 		return -ENOMEM;
@@ -1676,9 +1734,6 @@ static int otx2_qos_leaf_del_last(struct otx2_nic *pfvf, u16 classid, bool force
 		return err;
 	}
 	kfree(new_cfg);
-
-	/* update tx_real_queues */
-	otx2_qos_update_tx_netdev_queues(pfvf);
 
 	return 0;
 }

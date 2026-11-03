@@ -164,7 +164,7 @@ void *ipu6_dma_alloc(struct ipu6_bus_device *sys, size_t size,
 	unsigned int i;
 	int ret;
 
-	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	info = kzalloc_obj(*info);
 	if (!info)
 		return NULL;
 
@@ -172,7 +172,7 @@ void *ipu6_dma_alloc(struct ipu6_bus_device *sys, size_t size,
 	count = PHYS_PFN(size);
 
 	iova = alloc_iova(&mmu->dmap->iovad, count,
-			  PHYS_PFN(dma_get_mask(dev)), 0);
+			  PHYS_PFN(mmu->dmap->mmu_info->aperture_end), 0);
 	if (!iova)
 		goto out_kfree;
 
@@ -286,7 +286,7 @@ void ipu6_dma_free(struct ipu6_bus_device *sys, size_t size, void *vaddr,
 
 	__free_buffer(pages, size, attrs);
 
-	mmu->tlb_invalidate(mmu);
+	mmu->ops->tlb_invalidate(mmu);
 
 	__free_iova(&mmu->dmap->iovad, iova);
 
@@ -366,10 +366,21 @@ void ipu6_dma_unmap_sg(struct ipu6_bus_device *sys, struct scatterlist *sglist,
 	ipu6_mmu_unmap(mmu->dmap->mmu_info, PFN_PHYS(iova->pfn_lo),
 		       PFN_PHYS(iova_size(iova)));
 
-	mmu->tlb_invalidate(mmu);
+	mmu->ops->tlb_invalidate(mmu);
 	__free_iova(&mmu->dmap->iovad, iova);
 }
 EXPORT_SYMBOL_NS_GPL(ipu6_dma_unmap_sg, "INTEL_IPU6");
+
+static struct iova *ipu7_get_fw_code_region(struct ipu6_bus_device *sys)
+{
+	struct ipu6_mmu *mmu = sys->mmu;
+	unsigned long lo, hi;
+
+	lo = iova_pfn(&mmu->dmap->iovad, IPU7_FW_CODE_REGION_START);
+	hi = iova_pfn(&mmu->dmap->iovad, IPU7_FW_CODE_REGION_END) - 1U;
+
+	return reserve_iova(&mmu->dmap->iovad, lo, hi);
+}
 
 int ipu6_dma_map_sg(struct ipu6_bus_device *sys, struct scatterlist *sglist,
 		    int nents, enum dma_data_direction dir,
@@ -397,10 +408,13 @@ int ipu6_dma_map_sg(struct ipu6_bus_device *sys, struct scatterlist *sglist,
 	dev_dbg(dev, "dmamap trying to map %d ents %zu pages\n",
 		nents, npages);
 
-	iova = alloc_iova(&mmu->dmap->iovad, npages,
-			  PHYS_PFN(dma_get_mask(dev)), 0);
+	if (attrs & DMA_ATTR_RESERVE_REGION)
+		iova = ipu7_get_fw_code_region(sys);
+	else
+		iova = alloc_iova(&mmu->dmap->iovad, npages,
+				  PHYS_PFN(mmu->dmap->mmu_info->aperture_end), 0);
 	if (!iova)
-		return 0;
+		return -ENOMEM;
 
 	dev_dbg(dev, "dmamap: iova low pfn %lu, high pfn %lu\n", iova->pfn_lo,
 		iova->pfn_hi);
@@ -457,36 +471,3 @@ void ipu6_dma_unmap_sgtable(struct ipu6_bus_device *sys, struct sg_table *sgt,
 	ipu6_dma_unmap_sg(sys, sgt->sgl, sgt->nents, dir, attrs);
 }
 EXPORT_SYMBOL_NS_GPL(ipu6_dma_unmap_sgtable, "INTEL_IPU6");
-
-/*
- * Create scatter-list for the already allocated DMA buffer
- */
-int ipu6_dma_get_sgtable(struct ipu6_bus_device *sys, struct sg_table *sgt,
-			 void *cpu_addr, dma_addr_t handle, size_t size,
-			 unsigned long attrs)
-{
-	struct device *dev = &sys->auxdev.dev;
-	struct ipu6_mmu *mmu = sys->mmu;
-	struct vm_info *info;
-	int n_pages;
-	int ret = 0;
-
-	info = get_vm_info(mmu, handle);
-	if (!info)
-		return -EFAULT;
-
-	if (!info->vaddr)
-		return -EFAULT;
-
-	if (WARN_ON(!info->pages))
-		return -ENOMEM;
-
-	n_pages = PFN_UP(size);
-
-	ret = sg_alloc_table_from_pages(sgt, info->pages, n_pages, 0, size,
-					GFP_KERNEL);
-	if (ret)
-		dev_warn(dev, "get sgt table failed\n");
-
-	return ret;
-}

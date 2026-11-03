@@ -163,7 +163,7 @@ int spk_synth_is_alive_restart(struct spk_synth *synth)
 		/* restart */
 		synth->alive = 1;
 		synth_printf("%s", synth->init);
-		return 2; /* reenabled */
+		return 2; /* re-enabled */
 	}
 	pr_warn("%s: can't restart synth\n", synth->long_name);
 	return 0;
@@ -521,7 +521,7 @@ void synth_release(void)
 	spin_lock_irqsave(&speakup_info.spinlock, flags);
 	pr_info("releasing synth %s\n", synth->name);
 	synth->alive = 0;
-	del_timer(&thread_timer);
+	timer_delete(&thread_timer);
 	spin_unlock_irqrestore(&speakup_info.spinlock, flags);
 	if (synth->attributes.name)
 		sysfs_remove_group(speakup_kobj, &synth->attributes);
@@ -574,4 +574,4 @@ struct spk_synth *synth_current(void)
 }
 EXPORT_SYMBOL_GPL(synth_current);
 
-short spk_punc_masks[] = { 0, SOME, MOST, PUNC, PUNC | B_SYM };
+u16 spk_punc_masks[] = { 0, SOME, MOST, PUNC, PUNC | B_SYM };

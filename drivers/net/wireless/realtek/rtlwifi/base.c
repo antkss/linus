@@ -445,7 +445,7 @@ static int _rtl_init_deferred_work(struct ieee80211_hw *hw)
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 	struct workqueue_struct *wq;
 
-	wq = alloc_workqueue("%s", 0, 0, rtlpriv->cfg->name);
+	wq = alloc_workqueue("%s", WQ_UNBOUND, 0, rtlpriv->cfg->name);
 	if (!wq)
 		return -ENOMEM;
 
@@ -473,7 +473,7 @@ void rtl_deinit_deferred_work(struct ieee80211_hw *hw, bool ips_wq)
 {
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
 
-	del_timer_sync(&rtlpriv->works.watchdog_timer);
+	timer_delete_sync(&rtlpriv->works.watchdog_timer);
 
 	cancel_delayed_work_sync(&rtlpriv->works.watchdog_wq);
 	if (ips_wq)
@@ -575,9 +575,15 @@ static void rtl_free_entries_from_ack_queue(struct ieee80211_hw *hw,
 
 void rtl_deinit_core(struct ieee80211_hw *hw)
 {
+	struct rtl_priv *rtlpriv = rtl_priv(hw);
+
 	rtl_c2hcmd_launcher(hw, 0);
 	rtl_free_entries_from_scan_list(hw);
 	rtl_free_entries_from_ack_queue(hw, false);
+	if (rtlpriv->works.rtl_wq) {
+		destroy_workqueue(rtlpriv->works.rtl_wq);
+		rtlpriv->works.rtl_wq = NULL;
+	}
 }
 EXPORT_SYMBOL_GPL(rtl_deinit_core);
 
@@ -1265,7 +1271,7 @@ void rtl_get_tcb_desc(struct ieee80211_hw *hw,
 			tcb_desc->disable_ratefallback = 1;
 		} else {
 			/*
-			 *because hw will nerver use hw_rate
+			 *because hw will never use hw_rate
 			 *when tcb_desc->use_driver_rate = false
 			 *so we never set highest N rate here,
 			 *and N rate will all be controlled by FW
@@ -1363,18 +1369,19 @@ bool rtl_action_proc(struct ieee80211_hw *hw, struct sk_buff *skb, u8 is_tx)
 	struct rtl_mac *mac = rtl_mac(rtl_priv(hw));
 	struct ieee80211_hdr *hdr = rtl_get_hdr(skb);
 	struct rtl_priv *rtlpriv = rtl_priv(hw);
+	struct ieee80211_mgmt *mgmt;
 	__le16 fc = rtl_get_fc(skb);
-	u8 *act = (u8 *)(((u8 *)skb->data + MAC80211_3ADDR_LEN));
-	u8 category;
 
 	if (!ieee80211_is_action(fc))
 		return true;
 
-	category = *act;
-	act++;
-	switch (category) {
+	mgmt = (void *)skb->data;
+	if (skb->len < IEEE80211_MIN_ACTION_SIZE(action_code))
+		return true;
+
+	switch (mgmt->u.action.category) {
 	case ACT_CAT_BA:
-		switch (*act) {
+		switch (mgmt->u.action.action_code) {
 		case ACT_ADDBAREQ:
 			if (mac->act_scanning)
 				return false;
@@ -1388,8 +1395,10 @@ bool rtl_action_proc(struct ieee80211_hw *hw, struct sk_buff *skb, u8 is_tx)
 				struct ieee80211_sta *sta = NULL;
 				struct rtl_sta_info *sta_entry = NULL;
 				struct rtl_tid_data *tid_data;
-				struct ieee80211_mgmt *mgmt = (void *)skb->data;
 				u16 capab = 0, tid = 0;
+
+				if (skb->len < IEEE80211_MIN_ACTION_SIZE(addba_req))
+					return true;
 
 				rcu_read_lock();
 				sta = rtl_find_sta(hw, hdr->addr3);
@@ -1403,7 +1412,7 @@ bool rtl_action_proc(struct ieee80211_hw *hw, struct sk_buff *skb, u8 is_tx)
 				sta_entry =
 					(struct rtl_sta_info *)sta->drv_priv;
 				capab =
-				  le16_to_cpu(mgmt->u.action.u.addba_req.capab);
+				  le16_to_cpu(mgmt->u.action.addba_req.capab);
 				tid = (capab &
 				       IEEE80211_ADDBA_PARAM_TID_MASK) >> 2;
 				if (tid >= MAX_TID_COUNT) {
@@ -2005,7 +2014,7 @@ void rtl_collect_scan_list(struct ieee80211_hw *hw, struct sk_buff *skb)
 	}
 
 	if (!entry) {
-		entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+		entry = kmalloc_obj(*entry, GFP_ATOMIC);
 
 		if (!entry)
 			goto label_err;
@@ -2214,7 +2223,8 @@ label_lps_done:
 
 void rtl_watch_dog_timer_callback(struct timer_list *t)
 {
-	struct rtl_priv *rtlpriv = from_timer(rtlpriv, t, works.watchdog_timer);
+	struct rtl_priv *rtlpriv = timer_container_of(rtlpriv, t,
+						      works.watchdog_timer);
 
 	queue_delayed_work(rtlpriv->works.rtl_wq,
 			   &rtlpriv->works.watchdog_wq, 0);
@@ -2385,35 +2395,35 @@ static struct sk_buff *rtl_make_smps_action(struct ieee80211_hw *hw,
 	struct sk_buff *skb;
 	struct ieee80211_mgmt *action_frame;
 
-	/* 27 = header + category + action + smps mode */
-	skb = dev_alloc_skb(27 + hw->extra_tx_headroom);
+	skb = dev_alloc_skb(IEEE80211_MIN_ACTION_SIZE(ht_smps) +
+			    hw->extra_tx_headroom);
 	if (!skb)
 		return NULL;
 
 	skb_reserve(skb, hw->extra_tx_headroom);
-	action_frame = skb_put_zero(skb, 27);
+	action_frame = skb_put_zero(skb, IEEE80211_MIN_ACTION_SIZE(ht_smps));
 	memcpy(action_frame->da, da, ETH_ALEN);
 	memcpy(action_frame->sa, rtlefuse->dev_addr, ETH_ALEN);
 	memcpy(action_frame->bssid, bssid, ETH_ALEN);
 	action_frame->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
 						  IEEE80211_STYPE_ACTION);
 	action_frame->u.action.category = WLAN_CATEGORY_HT;
-	action_frame->u.action.u.ht_smps.action = WLAN_HT_ACTION_SMPS;
+	action_frame->u.action.action_code = WLAN_HT_ACTION_SMPS;
 	switch (smps) {
 	case IEEE80211_SMPS_AUTOMATIC:/* 0 */
 	case IEEE80211_SMPS_NUM_MODES:/* 4 */
 		WARN_ON(1);
 		fallthrough;
 	case IEEE80211_SMPS_OFF:/* 1 */ /*MIMO_PS_NOLIMIT*/
-		action_frame->u.action.u.ht_smps.smps_control =
+		action_frame->u.action.ht_smps.smps_control =
 				WLAN_HT_SMPS_CONTROL_DISABLED;/* 0 */
 		break;
 	case IEEE80211_SMPS_STATIC:/* 2 */ /*MIMO_PS_STATIC*/
-		action_frame->u.action.u.ht_smps.smps_control =
+		action_frame->u.action.ht_smps.smps_control =
 				WLAN_HT_SMPS_CONTROL_STATIC;/* 1 */
 		break;
 	case IEEE80211_SMPS_DYNAMIC:/* 3 */ /*MIMO_PS_DYNAMIC*/
-		action_frame->u.action.u.ht_smps.smps_control =
+		action_frame->u.action.ht_smps.smps_control =
 				WLAN_HT_SMPS_CONTROL_DYNAMIC;/* 3 */
 		break;
 	}
@@ -2512,25 +2522,25 @@ struct sk_buff *rtl_make_del_ba(struct ieee80211_hw *hw,
 	struct ieee80211_mgmt *action_frame;
 	u16 params;
 
-	/* 27 = header + category + action + smps mode */
-	skb = dev_alloc_skb(34 + hw->extra_tx_headroom);
+	skb = dev_alloc_skb(IEEE80211_MIN_ACTION_SIZE(delba) +
+			    hw->extra_tx_headroom);
 	if (!skb)
 		return NULL;
 
 	skb_reserve(skb, hw->extra_tx_headroom);
-	action_frame = skb_put_zero(skb, 34);
+	action_frame = skb_put_zero(skb, IEEE80211_MIN_ACTION_SIZE(delba));
 	memcpy(action_frame->sa, sa, ETH_ALEN);
 	memcpy(action_frame->da, rtlefuse->dev_addr, ETH_ALEN);
 	memcpy(action_frame->bssid, bssid, ETH_ALEN);
 	action_frame->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
 						  IEEE80211_STYPE_ACTION);
 	action_frame->u.action.category = WLAN_CATEGORY_BACK;
-	action_frame->u.action.u.delba.action_code = WLAN_ACTION_DELBA;
+	action_frame->u.action.action_code = WLAN_ACTION_DELBA;
 	params = (u16)(1 << 11);	/* bit 11 initiator */
 	params |= (u16)(tid << 12);	/* bit 15:12 TID number */
 
-	action_frame->u.action.u.delba.params = cpu_to_le16(params);
-	action_frame->u.action.u.delba.reason_code =
+	action_frame->u.action.delba.params = cpu_to_le16(params);
+	action_frame->u.action.delba.reason_code =
 		cpu_to_le16(WLAN_REASON_QSTA_TIMEOUT);
 
 	return skb;
@@ -2696,9 +2706,6 @@ MODULE_AUTHOR("Larry Finger	<Larry.FInger@lwfinger.net>");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Realtek 802.11n PCI wireless core");
 
-struct rtl_global_var rtl_global_var = {};
-EXPORT_SYMBOL_GPL(rtl_global_var);
-
 static int __init rtl_core_module_init(void)
 {
 	BUILD_BUG_ON(TX_PWR_BY_RATE_NUM_RATE < TX_PWR_BY_RATE_NUM_SECTION);
@@ -2711,10 +2718,6 @@ static int __init rtl_core_module_init(void)
 
 	/* add debugfs */
 	rtl_debugfs_add_topdir();
-
-	/* init some global vars */
-	INIT_LIST_HEAD(&rtl_global_var.glb_priv_list);
-	spin_lock_init(&rtl_global_var.glb_list_lock);
 
 	return 0;
 }

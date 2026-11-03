@@ -18,7 +18,6 @@
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/module.h>
-#include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 #include <linux/sprintf.h>
 
@@ -69,7 +68,7 @@ static void amd_asf_process_target(struct work_struct *work)
 	/* Check if no error bits are set in target status register */
 	if (reg & ASF_ERROR_STATUS) {
 		/* Set bank as full */
-		cmd = 0;
+		cmd = 1;
 		reg |= GENMASK(3, 2);
 		outb_p(reg, ASFDATABNKSEL);
 	} else {
@@ -90,6 +89,10 @@ static void amd_asf_process_target(struct work_struct *work)
 		outb_p(reg, ASFDATABNKSEL);
 		cmd = inb_p(ASFINDEX);
 		len = inb_p(ASFDATARWPTR);
+
+		if (len > ASF_BLOCK_MAX_BYTES)
+			return;
+
 		for (idx = 0; idx < len; idx++)
 			data[idx] = inb_p(ASFINDEX);
 
@@ -272,9 +275,9 @@ static u32 amd_asf_func(struct i2c_adapter *adapter)
 }
 
 static const struct i2c_algorithm amd_asf_smbus_algorithm = {
-	.master_xfer = amd_asf_xfer,
-	.reg_slave = amd_asf_reg_target,
-	.unreg_slave = amd_asf_unreg_target,
+	.xfer = amd_asf_xfer,
+	.reg_target = amd_asf_reg_target,
+	.unreg_target = amd_asf_unreg_target,
 	.functionality = amd_asf_func,
 };
 
@@ -293,6 +296,7 @@ static irqreturn_t amd_asf_irq_handler(int irq, void *ptr)
 		amd_asf_update_ioport_target(piix4_smba, ASF_SLV_INTR, SMBHSTSTS, true);
 	}
 
+	iowrite32(irq, dev->eoi_base);
 	return IRQ_HANDLED;
 }
 
@@ -333,11 +337,11 @@ static int amd_asf_probe(struct platform_device *pdev)
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
-		return dev_err_probe(dev, irq, "missing IRQ resources\n");
+		return irq;
 
 	ret = devm_request_irq(dev, irq, amd_asf_irq_handler, IRQF_SHARED, "amd_asf", asf_dev);
 	if (ret)
-		return dev_err_probe(dev, ret, "Unable to request irq: %d for use\n", irq);
+		return ret;
 
 	asf_dev->adap.owner = THIS_MODULE;
 	asf_dev->adap.algo = &amd_asf_smbus_algorithm;
@@ -350,7 +354,7 @@ static int amd_asf_probe(struct platform_device *pdev)
 }
 
 static const struct acpi_device_id amd_asf_acpi_ids[] = {
-	{ "AMDI001A" },
+	{ .id = "AMDI001A" },
 	{ }
 };
 MODULE_DEVICE_TABLE(acpi, amd_asf_acpi_ids);

@@ -53,19 +53,14 @@ static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd, pgtable_t pte_
 
 static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 {
-	pgd_t *ret = (pgd_t *) __get_free_page(GFP_KERNEL);
+	pgd_t *ret = __pgd_alloc(mm, 0);
 
 	if (ret) {
 		int num, num2;
-		num = USER_PTRS_PER_PGD + USER_KERNEL_GUTTER / PGDIR_SIZE;
-		memzero(ret, num * sizeof(pgd_t));
 
+		num = USER_PTRS_PER_PGD + USER_KERNEL_GUTTER / PGDIR_SIZE;
 		num2 = VMALLOC_SIZE / PGDIR_SIZE;
 		memcpy(ret + num, swapper_pg_dir + num, num2 * sizeof(pgd_t));
-
-		memzero(ret + num + num2,
-			       (PTRS_PER_PGD - num - num2) * sizeof(pgd_t));
-
 	}
 	return ret;
 }
@@ -77,7 +72,7 @@ static inline void p4d_populate(struct mm_struct *mm, p4d_t *p4dp, pud_t *pudp)
 	set_p4d(p4dp, __p4d((unsigned long)pudp));
 }
 
-#define __pud_free_tlb(tlb, pmd, addr)  pud_free((tlb)->mm, pmd)
+#define __pud_free_tlb(tlb, pmd, addr)  tlb_remove_ptdesc((tlb), virt_to_ptdesc(pmd))
 
 #endif
 
@@ -88,10 +83,10 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pudp, pmd_t *pmdp)
 	set_pud(pudp, __pud((unsigned long)pmdp));
 }
 
-#define __pmd_free_tlb(tlb, pmd, addr)  pmd_free((tlb)->mm, pmd)
+#define __pmd_free_tlb(tlb, pmd, addr)  tlb_remove_ptdesc((tlb), virt_to_ptdesc(pmd))
 
 #endif
 
-#define __pte_free_tlb(tlb, pte, addr)  pte_free((tlb)->mm, pte)
+#define __pte_free_tlb(tlb, pte, addr)  tlb_remove_ptdesc((tlb), page_ptdesc(pte))
 
 #endif /* _ASM_ARC_PGALLOC_H */

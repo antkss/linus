@@ -25,16 +25,17 @@ enum guc_state_capture_type {
 
 #define GUC_STATE_CAPTURE_TYPE_MAX	(GUC_STATE_CAPTURE_TYPE_ENGINE_INSTANCE + 1)
 
-/* Class indecies for capture_class and capture_instance arrays */
+/* Class indices for capture_class and capture_instance arrays */
 enum guc_capture_list_class_type {
 	GUC_CAPTURE_LIST_CLASS_RENDER_COMPUTE = 0,
 	GUC_CAPTURE_LIST_CLASS_VIDEO = 1,
 	GUC_CAPTURE_LIST_CLASS_VIDEOENHANCE = 2,
 	GUC_CAPTURE_LIST_CLASS_BLITTER = 3,
 	GUC_CAPTURE_LIST_CLASS_GSC_OTHER = 4,
+	GUC_CAPTURE_LIST_CLASS_PAGING = 5,
 };
 
-#define GUC_CAPTURE_LIST_CLASS_MAX	(GUC_CAPTURE_LIST_CLASS_GSC_OTHER + 1)
+#define GUC_CAPTURE_LIST_CLASS_MAX	(GUC_CAPTURE_LIST_CLASS_PAGING + 1)
 
 /**
  * struct guc_mmio_reg - GuC MMIO reg state struct

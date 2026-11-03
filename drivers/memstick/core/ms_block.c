@@ -720,7 +720,7 @@ static int h_msb_parallel_switch(struct memstick_dev *card,
 
 static int msb_switch_to_parallel(struct msb_data *msb);
 
-/* Reset the card, to guard against hw errors beeing treated as bad blocks */
+/* Reset the card, to guard against hw errors being treated as bad blocks */
 static int msb_reset(struct msb_data *msb, bool full)
 {
 
@@ -1203,8 +1203,7 @@ static int msb_read_boot_blocks(struct msb_data *msb)
 	dbg_verbose("Start of a scan for the boot blocks");
 
 	if (!msb->boot_page) {
-		page = kmalloc_array(2, sizeof(struct ms_boot_page),
-				     GFP_KERNEL);
+		page = kmalloc_objs(struct ms_boot_page, 2);
 		if (!page)
 			return -ENOMEM;
 
@@ -1339,6 +1338,10 @@ static int msb_ftl_initialize(struct msb_data *msb)
 		return 0;
 
 	msb->zone_count = msb->block_count / MS_BLOCKS_IN_ZONE;
+	if (msb->block_count > MS_MAX_ZONES * MS_BLOCKS_IN_ZONE) {
+		pr_err("Too many blocks: %d\n", msb->block_count);
+		return -EINVAL;
+	}
 	msb->logical_block_count = msb->zone_count * 496 - 2;
 
 	msb->used_blocks_bitmap = bitmap_zalloc(msb->block_count, GFP_KERNEL);
@@ -1498,7 +1501,7 @@ static int msb_ftl_scan(struct msb_data *msb)
 
 static void msb_cache_flush_timer(struct timer_list *t)
 {
-	struct msb_data *msb = from_timer(msb, t, cache_flush_timer);
+	struct msb_data *msb = timer_container_of(msb, t, cache_flush_timer);
 
 	msb->need_flush_cache = true;
 	queue_work(msb->io_queue, &msb->io_work);
@@ -1510,7 +1513,7 @@ static void msb_cache_discard(struct msb_data *msb)
 	if (msb->cache_block_lba == MS_BLOCK_INVALID)
 		return;
 
-	del_timer_sync(&msb->cache_flush_timer);
+	timer_delete_sync(&msb->cache_flush_timer);
 
 	dbg_verbose("Discarding the write cache");
 	msb->cache_block_lba = MS_BLOCK_INVALID;
@@ -1904,7 +1907,7 @@ static void msb_io_work(struct work_struct *work)
 
 		/* process the request */
 		dbg_verbose("IO: processing new request");
-		blk_rq_map_sg(msb->queue, req, sg);
+		blk_rq_map_sg(req, sg);
 
 		lba = blk_rq_pos(req);
 
@@ -1953,10 +1956,10 @@ static void msb_data_clear(struct msb_data *msb)
 	msb->card = NULL;
 }
 
-static int msb_bd_getgeo(struct block_device *bdev,
+static int msb_bd_getgeo(struct gendisk *disk,
 				 struct hd_geometry *geo)
 {
-	struct msb_data *msb = bdev->bd_disk->private_data;
+	struct msb_data *msb = disk->private_data;
 	*geo = msb->geometry;
 	return 0;
 }
@@ -2027,7 +2030,7 @@ static void msb_stop(struct memstick_dev *card)
 	msb->io_queue_stopped = true;
 	spin_unlock_irqrestore(&msb->q_lock, flags);
 
-	del_timer_sync(&msb->cache_flush_timer);
+	timer_delete_sync(&msb->cache_flush_timer);
 	flush_workqueue(msb->io_queue);
 
 	spin_lock_irqsave(&msb->q_lock, flags);
@@ -2094,8 +2097,7 @@ static int msb_init_disk(struct memstick_dev *card)
 	if (msb->disk_id  < 0)
 		return msb->disk_id;
 
-	rc = blk_mq_alloc_sq_tag_set(&msb->tag_set, &msb_mq_ops, 2,
-				     BLK_MQ_F_SHOULD_MERGE);
+	rc = blk_mq_alloc_sq_tag_set(&msb->tag_set, &msb_mq_ops, 2, 0);
 	if (rc)
 		goto out_release_id;
 
@@ -2152,7 +2154,7 @@ static int msb_probe(struct memstick_dev *card)
 	struct msb_data *msb;
 	int rc = 0;
 
-	msb = kzalloc(sizeof(struct msb_data), GFP_KERNEL);
+	msb = kzalloc_obj(struct msb_data);
 	if (!msb)
 		return -ENOMEM;
 	memstick_set_drvdata(card, msb);
@@ -2202,6 +2204,8 @@ static void msb_remove(struct memstick_dev *card)
 	msb_data_clear(msb);
 	mutex_unlock(&msb_disk_lock);
 
+	destroy_workqueue(msb->io_queue);
+
 	put_disk(msb->disk);
 	memstick_set_drvdata(card, NULL);
 }
@@ -2226,7 +2230,7 @@ static int msb_resume(struct memstick_dev *card)
 #endif
 	mutex_lock(&card->host->lock);
 
-	new_msb = kzalloc(sizeof(struct msb_data), GFP_KERNEL);
+	new_msb = kzalloc_obj(struct msb_data);
 	if (!new_msb)
 		goto out;
 

@@ -42,7 +42,7 @@
 #define BTEMP_BATCTRL_CURR_SRC_20UA	20
 
 #define BTEMP_BATCTRL_CURR_SRC_16UA	16
-#define BTEMP_BATCTRL_CURR_SRC_18UA	18
+#define BTEMP_BATCTRL_CURR_SRC_8UA	8
 
 #define BTEMP_BATCTRL_CURR_SRC_60UA	60
 #define BTEMP_BATCTRL_CURR_SRC_120UA	120
@@ -468,39 +468,29 @@ static void ab8500_btemp_periodic(struct ab8500_btemp *di,
  */
 static int ab8500_btemp_get_temp(struct ab8500_btemp *di)
 {
-	int temp = 0;
+	int temp = di->bat_temp;
 
 	/*
 	 * The BTEMP events are not reliabe on AB8500 cut3.3
 	 * and prior versions
 	 */
-	if (is_ab8500_3p3_or_earlier(di->parent)) {
-		temp = di->bat_temp * 10;
-	} else {
+	if (!is_ab8500_3p3_or_earlier(di->parent)) {
 		if (di->events.btemp_low) {
 			if (temp > di->btemp_ranges.btemp_low_limit)
-				temp = di->btemp_ranges.btemp_low_limit * 10;
-			else
-				temp = di->bat_temp * 10;
+				temp = di->btemp_ranges.btemp_low_limit;
 		} else if (di->events.btemp_high) {
 			if (temp < di->btemp_ranges.btemp_high_limit)
-				temp = di->btemp_ranges.btemp_high_limit * 10;
-			else
-				temp = di->bat_temp * 10;
+				temp = di->btemp_ranges.btemp_high_limit;
 		} else if (di->events.btemp_lowmed) {
 			if (temp > di->btemp_ranges.btemp_med_limit)
-				temp = di->btemp_ranges.btemp_med_limit * 10;
-			else
-				temp = di->bat_temp * 10;
+				temp = di->btemp_ranges.btemp_med_limit;
 		} else if (di->events.btemp_medhigh) {
 			if (temp < di->btemp_ranges.btemp_med_limit)
-				temp = di->btemp_ranges.btemp_med_limit * 10;
-			else
-				temp = di->bat_temp * 10;
-		} else
-			temp = di->bat_temp * 10;
+				temp = di->btemp_ranges.btemp_med_limit;
+		}
 	}
-	return temp;
+
+	return temp * 10;
 }
 
 /**
@@ -540,10 +530,9 @@ static int ab8500_btemp_get_property(struct power_supply *psy,
 	return 0;
 }
 
-static int ab8500_btemp_get_ext_psy_data(struct device *dev, void *data)
+static int ab8500_btemp_get_ext_psy_data(struct power_supply *ext, void *data)
 {
 	struct power_supply *psy;
-	struct power_supply *ext = dev_get_drvdata(dev);
 	const char **supplicants = (const char **)ext->supplied_to;
 	struct ab8500_btemp *di;
 	union power_supply_propval ret;
@@ -617,7 +606,7 @@ static int ab8500_btemp_get_ext_psy_data(struct device *dev, void *data)
  */
 static void ab8500_btemp_external_power_changed(struct power_supply *psy)
 {
-	power_supply_for_each_device(psy, ab8500_btemp_get_ext_psy_data);
+	power_supply_for_each_psy(psy, ab8500_btemp_get_ext_psy_data);
 }
 
 /* ab8500 btemp driver interrupts and their respective isr */
@@ -668,7 +657,8 @@ static int ab8500_btemp_bind(struct device *dev, struct device *master,
 
 	/* Create a work queue for the btemp */
 	di->btemp_wq =
-		alloc_workqueue("ab8500_btemp_wq", WQ_MEM_RECLAIM, 0);
+		alloc_workqueue("ab8500_btemp_wq", WQ_MEM_RECLAIM | WQ_PERCPU,
+				0);
 	if (di->btemp_wq == NULL) {
 		dev_err(dev, "failed to create work queue\n");
 		return -ENOMEM;
@@ -787,11 +777,8 @@ static int ab8500_btemp_probe(struct platform_device *pdev)
 			IRQF_SHARED | IRQF_NO_SUSPEND | IRQF_ONESHOT,
 			ab8500_btemp_irq[i].name, di);
 
-		if (ret) {
-			dev_err(dev, "failed to request %s IRQ %d: %d\n"
-				, ab8500_btemp_irq[i].name, irq, ret);
+		if (ret)
 			return ret;
-		}
 		dev_dbg(dev, "Requested %s IRQ %d: %d\n",
 			ab8500_btemp_irq[i].name, irq, ret);
 	}
@@ -829,3 +816,4 @@ MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Johan Palsson, Karl Komierowski, Arun R Murthy");
 MODULE_ALIAS("platform:ab8500-btemp");
 MODULE_DESCRIPTION("AB8500 battery temperature driver");
+MODULE_IMPORT_NS("IIO_CONSUMER");

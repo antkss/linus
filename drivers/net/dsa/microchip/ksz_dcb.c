@@ -10,13 +10,22 @@
 #include "ksz_dcb.h"
 #include "ksz8.h"
 
-#define KSZ8_REG_PORT_1_CTRL_0			0x10
+/* Port X Control 0 register.
+ * The datasheet specifies: Port 1 - 0x10, Port 2 - 0x20, Port 3 - 0x30.
+ * However, the driver uses get_port_addr(), which maps Port 1 to offset 0.
+ * Therefore, we define the base offset as 0x00 here to align with that logic.
+ */
+#define KSZ8_REG_PORT_1_CTRL_0			0x00
+#define KSZ8463_REG_PORT_1_CTRL_0		0x6C
 #define KSZ8_PORT_DIFFSERV_ENABLE		BIT(6)
 #define KSZ8_PORT_802_1P_ENABLE			BIT(5)
 #define KSZ8_PORT_BASED_PRIO_M			GENMASK(4, 3)
+#define KSZ8995XA_PORT_BASED_PRIO		BIT(4)
 
+#define KSZ8463_REG_TOS_DSCP_CTRL		0x16
 #define KSZ88X3_REG_TOS_DSCP_CTRL		0x60
 #define KSZ8765_REG_TOS_DSCP_CTRL		0x90
+#define KSZ8995XA_REG_TOS_DSCP_CTRL_7		0x67
 
 #define KSZ9477_REG_SW_MAC_TOS_CTRL		0x033e
 #define KSZ9477_SW_TOS_DSCP_REMAP		BIT(0)
@@ -91,8 +100,13 @@ static void ksz_get_default_port_prio_reg(struct ksz_device *dev, int *reg,
 {
 	if (is_ksz8(dev)) {
 		*reg = KSZ8_REG_PORT_1_CTRL_0;
-		*mask = KSZ8_PORT_BASED_PRIO_M;
-		*shift = __bf_shf(KSZ8_PORT_BASED_PRIO_M);
+		if (ksz_is_ksz8995xa(dev))
+			*mask = KSZ8995XA_PORT_BASED_PRIO;
+		else
+			*mask = KSZ8_PORT_BASED_PRIO_M;
+		*shift = __bf_shf(*mask);
+		if (ksz_is_ksz8463(dev))
+			*reg = KSZ8463_REG_PORT_1_CTRL_0;
 	} else {
 		*reg = KSZ9477_REG_PORT_MRI_MAC_CTRL;
 		*mask = KSZ9477_PORT_BASED_PRIO_M;
@@ -103,29 +117,45 @@ static void ksz_get_default_port_prio_reg(struct ksz_device *dev, int *reg,
 /**
  * ksz_get_dscp_prio_reg - Retrieves the DSCP-to-priority-mapping register
  * @dev: Pointer to the KSZ switch device structure
+ * @dscp: DSCP value for which to retrieve the register
  * @reg: Pointer to the register address to be set
- * @per_reg: Pointer to the number of DSCP values per register
  * @mask: Pointer to the mask to be set
+ * @shift: Pointer to the bit shift to be set
  *
- * This function retrieves the DSCP to priority mapping register, the number of
- * DSCP values per register, and the mask to be set.
+ * This function retrieves the register, mask and shift for a DSCP to priority
+ * mapping entry.
  */
-static void ksz_get_dscp_prio_reg(struct ksz_device *dev, int *reg,
-				  int *per_reg, u8 *mask)
+static void ksz_get_dscp_prio_reg(struct ksz_device *dev, u8 dscp, int *reg,
+				  u8 *mask, int *shift)
 {
+	int per_reg;
+
+	if (ksz_is_ksz8995xa(dev)) {
+		/* KSZ8995XA stores DSCP groups in descending register order. */
+		*reg = KSZ8995XA_REG_TOS_DSCP_CTRL_7 - dscp / 8;
+		*mask = BIT(0);
+		*shift = dscp % 8;
+		return;
+	}
+
 	if (ksz_is_ksz87xx(dev) || ksz_is_8895_family(dev)) {
 		*reg = KSZ8765_REG_TOS_DSCP_CTRL;
-		*per_reg = 4;
+		per_reg = 4;
 		*mask = GENMASK(1, 0);
-	} else if (ksz_is_ksz88x3(dev)) {
+	} else if (ksz_is_ksz88x3(dev) || ksz_is_ksz8463(dev)) {
 		*reg = KSZ88X3_REG_TOS_DSCP_CTRL;
-		*per_reg = 4;
+		per_reg = 4;
 		*mask = GENMASK(1, 0);
+		if (ksz_is_ksz8463(dev))
+			*reg = KSZ8463_REG_TOS_DSCP_CTRL;
 	} else {
 		*reg = KSZ9477_REG_DIFFSERV_PRIO_MAP;
-		*per_reg = 2;
+		per_reg = 2;
 		*mask = GENMASK(2, 0);
 	}
+
+	*reg += dscp / per_reg;
+	*shift = (dscp % per_reg) * (8 / per_reg);
 }
 
 /**
@@ -146,6 +176,8 @@ static void ksz_get_apptrust_map_and_reg(struct ksz_device *dev,
 		*map = ksz8_apptrust_map_to_bit;
 		*reg = KSZ8_REG_PORT_1_CTRL_0;
 		*mask = KSZ8_PORT_DIFFSERV_ENABLE | KSZ8_PORT_802_1P_ENABLE;
+		if (ksz_is_ksz8463(dev))
+			*reg = KSZ8463_REG_PORT_1_CTRL_0;
 	} else {
 		*map = ksz9477_apptrust_map_to_bit;
 		*reg = KSZ9477_REG_PORT_MRI_PRIO_CTRL;
@@ -182,49 +214,6 @@ int ksz_port_get_default_prio(struct dsa_switch *ds, int port)
 }
 
 /**
- * ksz88x3_port_set_default_prio_quirks - Quirks for default priority
- * @dev: Pointer to the KSZ switch device structure
- * @port: Port number for which to set the default priority
- * @prio: Priority value to set
- *
- * This function implements quirks for setting the default priority on KSZ88x3
- * devices. On Port 2, no other priority providers are working
- * except of PCP. So, configuring default priority on Port 2 is not possible.
- * On Port 1, it is not possible to configure port priority if PCP
- * apptrust on Port 2 is disabled. Since we disable multiple queues on the
- * switch to disable PCP on Port 2, we need to ensure that the default priority
- * configuration on Port 1 is in agreement with the configuration on Port 2.
- *
- * Return: 0 on success, or a negative error code on failure
- */
-static int ksz88x3_port_set_default_prio_quirks(struct ksz_device *dev, int port,
-						u8 prio)
-{
-	if (!prio)
-		return 0;
-
-	if (port == KSZ_PORT_2) {
-		dev_err(dev->dev, "Port priority configuration is not working on Port 2\n");
-		return -EINVAL;
-	} else if (port == KSZ_PORT_1) {
-		u8 port2_data;
-		int ret;
-
-		ret = ksz_pread8(dev, KSZ_PORT_2, KSZ8_REG_PORT_1_CTRL_0,
-				 &port2_data);
-		if (ret)
-			return ret;
-
-		if (!(port2_data & KSZ8_PORT_802_1P_ENABLE)) {
-			dev_err(dev->dev, "Not possible to configure port priority on Port 1 if PCP apptrust on Port 2 is disabled\n");
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
-/**
  * ksz_port_set_default_prio - Sets the default priority for a port on a KSZ
  *			       switch
  * @ds: Pointer to the DSA switch structure
@@ -239,17 +228,11 @@ static int ksz88x3_port_set_default_prio_quirks(struct ksz_device *dev, int port
 int ksz_port_set_default_prio(struct dsa_switch *ds, int port, u8 prio)
 {
 	struct ksz_device *dev = ds->priv;
-	int reg, shift, ret;
+	int reg, shift;
 	u8 mask;
 
 	if (prio >= dev->info->num_ipms)
 		return -EINVAL;
-
-	if (ksz_is_ksz88x3(dev)) {
-		ret = ksz88x3_port_set_default_prio_quirks(dev, port, prio);
-		if (ret)
-			return ret;
-	}
 
 	ksz_get_default_port_prio_reg(dev, &reg, &mask, &shift);
 
@@ -272,10 +255,10 @@ int ksz_port_set_default_prio(struct dsa_switch *ds, int port, u8 prio)
 int ksz_port_get_dscp_prio(struct dsa_switch *ds, int port, u8 dscp)
 {
 	struct ksz_device *dev = ds->priv;
-	int reg, per_reg, ret, shift;
+	int reg, ret, shift;
 	u8 data, mask;
 
-	ksz_get_dscp_prio_reg(dev, &reg, &per_reg, &mask);
+	ksz_get_dscp_prio_reg(dev, dscp, &reg, &mask, &shift);
 
 	/* If DSCP remapping is disabled, DSCP bits 3-5 are used as Internal
 	 * Priority Map (IPM)
@@ -296,12 +279,9 @@ int ksz_port_get_dscp_prio(struct dsa_switch *ds, int port, u8 dscp)
 	/* In case DSCP remapping is enabled, we need to write the DSCP to
 	 * priority mapping table.
 	 */
-	reg += dscp / per_reg;
 	ret = ksz_read8(dev, reg, &data);
 	if (ret)
 		return ret;
-
-	shift = (dscp % per_reg) * (8 / per_reg);
 
 	return (data >> shift) & mask;
 }
@@ -319,15 +299,12 @@ int ksz_port_get_dscp_prio(struct dsa_switch *ds, int port, u8 dscp)
  */
 static int ksz_set_global_dscp_entry(struct ksz_device *dev, u8 dscp, u8 ipm)
 {
-	int reg, per_reg, shift;
+	int reg, shift;
 	u8 mask;
 
-	ksz_get_dscp_prio_reg(dev, &reg, &per_reg, &mask);
+	ksz_get_dscp_prio_reg(dev, dscp, &reg, &mask, &shift);
 
-	shift = (dscp % per_reg) * (8 / per_reg);
-
-	return ksz_rmw8(dev, reg + (dscp / per_reg), mask << shift,
-			ipm << shift);
+	return ksz_rmw8(dev, reg, mask << shift, ipm << shift);
 }
 
 /**
@@ -477,6 +454,9 @@ static void ksz_apptrust_error(struct ksz_device *dev)
  * 2. IEEE_8021QAZ_APP_SEL_DSCP - Differentiated Services Code Point selector
  *   (lowest priority)
  *
+ * KSZ8995XA instead ORs the classification results, so it supports only
+ * one trusted selector at a time.
+ *
  * Return: 0 on success, or a negative error code on failure
  */
 static int ksz_port_set_apptrust_validate(struct ksz_device *dev, int port,
@@ -484,6 +464,12 @@ static int ksz_port_set_apptrust_validate(struct ksz_device *dev, int port,
 {
 	int i, j, found;
 	int j_prev = 0;
+
+	if (ksz_is_ksz8995xa(dev) && nsel > 1) {
+		dev_err(dev->dev,
+			"KSZ8995XA supports only one apptrust selector at a time\n");
+		return -EOPNOTSUPP;
+	}
 
 	/* Iterate through the requested selectors */
 	for (i = 0; i < nsel; i++) {
@@ -516,155 +502,6 @@ err_sel_not_vaild:
 	ksz_apptrust_error(dev);
 
 	return -EINVAL;
-}
-
-/**
- * ksz88x3_port1_apptrust_quirk - Quirk for apptrust configuration on Port 1
- *				  of KSZ88x3 devices
- * @dev: Pointer to the KSZ switch device structure
- * @port: Port number for which to set the apptrust selectors
- * @reg: Register address for the apptrust configuration
- * @port1_data: Data to set for the apptrust configuration
- *
- * This function implements a quirk for apptrust configuration on Port 1 of
- * KSZ88x3 devices. It ensures that apptrust configuration on Port 1 is not
- * possible if PCP apptrust on Port 2 is disabled. This is because the Port 2
- * seems to be permanently hardwired to PCP classification, so we need to
- * do Port 1 configuration always in agreement with Port 2 configuration.
- *
- * Return: 0 on success, or a negative error code on failure
- */
-static int ksz88x3_port1_apptrust_quirk(struct ksz_device *dev, int port,
-					int reg, u8 port1_data)
-{
-	u8 port2_data;
-	int ret;
-
-	/* If no apptrust is requested for Port 1, no need to care about Port 2
-	 * configuration.
-	 */
-	if (!(port1_data & (KSZ8_PORT_802_1P_ENABLE | KSZ8_PORT_DIFFSERV_ENABLE)))
-		return 0;
-
-	/* We got request to enable any apptrust on Port 1. To make it possible,
-	 * we need to enable multiple queues on the switch. If we enable
-	 * multiqueue support, PCP classification on Port 2 will be
-	 * automatically activated by HW.
-	 */
-	ret = ksz_pread8(dev, KSZ_PORT_2, reg, &port2_data);
-	if (ret)
-		return ret;
-
-	/* If KSZ8_PORT_802_1P_ENABLE bit is set on Port 2, the driver showed
-	 * the interest in PCP classification on Port 2. In this case,
-	 * multiqueue support is enabled and we can enable any apptrust on
-	 * Port 1.
-	 * If KSZ8_PORT_802_1P_ENABLE bit is not set on Port 2, the PCP
-	 * classification on Port 2 is still active, but the driver disabled
-	 * multiqueue support and made frame prioritization inactive for
-	 * all ports. In this case, we can't enable any apptrust on Port 1.
-	 */
-	if (!(port2_data & KSZ8_PORT_802_1P_ENABLE)) {
-		dev_err(dev->dev, "Not possible to enable any apptrust on Port 1 if PCP apptrust on Port 2 is disabled\n");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-/**
- * ksz88x3_port2_apptrust_quirk - Quirk for apptrust configuration on Port 2
- *				  of KSZ88x3 devices
- * @dev: Pointer to the KSZ switch device structure
- * @port: Port number for which to set the apptrust selectors
- * @reg: Register address for the apptrust configuration
- * @port2_data: Data to set for the apptrust configuration
- *
- * This function implements a quirk for apptrust configuration on Port 2 of
- * KSZ88x3 devices. It ensures that DSCP apptrust is not working on Port 2 and
- * that it is not possible to disable PCP on Port 2. The only way to disable PCP
- * on Port 2 is to disable multiple queues on the switch.
- *
- * Return: 0 on success, or a negative error code on failure
- */
-static int ksz88x3_port2_apptrust_quirk(struct ksz_device *dev, int port,
-					int reg, u8 port2_data)
-{
-	struct dsa_switch *ds = dev->ds;
-	u8 port1_data;
-	int ret;
-
-	/* First validate Port 2 configuration. DiffServ/DSCP is not working
-	 * on this port.
-	 */
-	if (port2_data & KSZ8_PORT_DIFFSERV_ENABLE) {
-		dev_err(dev->dev, "DSCP apptrust is not working on Port 2\n");
-		return -EINVAL;
-	}
-
-	/* If PCP support is requested, we need to enable all queues on the
-	 * switch to make PCP priority working on Port 2.
-	 */
-	if (port2_data & KSZ8_PORT_802_1P_ENABLE)
-		return ksz8_all_queues_split(dev, dev->info->num_tx_queues);
-
-	/* We got request to disable PCP priority on Port 2.
-	 * Now, we need to compare Port 2 configuration with Port 1
-	 * configuration.
-	 */
-	ret = ksz_pread8(dev, KSZ_PORT_1, reg, &port1_data);
-	if (ret)
-		return ret;
-
-	/* If Port 1 has any apptrust enabled, we can't disable multiple queues
-	 * on the switch, so we can't disable PCP on Port 2.
-	 */
-	if (port1_data & (KSZ8_PORT_802_1P_ENABLE | KSZ8_PORT_DIFFSERV_ENABLE)) {
-		dev_err(dev->dev, "Not possible to disable PCP on Port 2 if any apptrust is enabled on Port 1\n");
-		return -EINVAL;
-	}
-
-	/* Now we need to ensure that default priority on Port 1 is set to 0
-	 * otherwise we can't disable multiqueue support on the switch.
-	 */
-	ret = ksz_port_get_default_prio(ds, KSZ_PORT_1);
-	if (ret < 0) {
-		return ret;
-	} else if (ret) {
-		dev_err(dev->dev, "Not possible to disable PCP on Port 2 if non zero default priority is set on Port 1\n");
-		return -EINVAL;
-	}
-
-	/* Port 1 has no apptrust or default priority set and we got request to
-	 * disable PCP on Port 2. We can disable multiqueue support to disable
-	 * PCP on Port 2.
-	 */
-	return ksz8_all_queues_split(dev, 1);
-}
-
-/**
- * ksz88x3_port_apptrust_quirk - Quirk for apptrust configuration on KSZ88x3
- *			       devices
- * @dev: Pointer to the KSZ switch device structure
- * @port: Port number for which to set the apptrust selectors
- * @reg: Register address for the apptrust configuration
- * @data: Data to set for the apptrust configuration
- *
- * This function implements a quirk for apptrust configuration on KSZ88x3
- * devices. It ensures that apptrust configuration on Port 1 and
- * Port 2 is done in agreement with each other.
- *
- * Return: 0 on success, or a negative error code on failure
- */
-static int ksz88x3_port_apptrust_quirk(struct ksz_device *dev, int port,
-				       int reg, u8 data)
-{
-	if (port == KSZ_PORT_1)
-		return ksz88x3_port1_apptrust_quirk(dev, port, reg, data);
-	else if (port == KSZ_PORT_2)
-		return ksz88x3_port2_apptrust_quirk(dev, port, reg, data);
-
-	return 0;
 }
 
 /**
@@ -707,12 +544,6 @@ int ksz_port_set_apptrust(struct dsa_switch *ds, int port,
 		}
 	}
 
-	if (ksz_is_ksz88x3(dev)) {
-		ret = ksz88x3_port_apptrust_quirk(dev, port, reg, data);
-		if (ret)
-			return ret;
-	}
-
 	return ksz_prmw8(dev, port, reg, mask, data);
 }
 
@@ -742,6 +573,10 @@ int ksz_port_get_apptrust(struct dsa_switch *ds, int port, u8 *sel, int *nsel)
 	ret = ksz_pread8(dev, port, reg, &data);
 	if (ret)
 		return ret;
+
+	/* XA's combined classification cannot be reported as a trust order. */
+	if (ksz_is_ksz8995xa(dev) && (data & mask) == mask)
+		return -EOPNOTSUPP;
 
 	*nsel = 0;
 	for (i = 0; i < ARRAY_SIZE(ksz_supported_apptrust); i++) {
@@ -799,21 +634,5 @@ int ksz_dcb_init_port(struct ksz_device *dev, int port)
  */
 int ksz_dcb_init(struct ksz_device *dev)
 {
-	int ret;
-
-	ret = ksz_init_global_dscp_map(dev);
-	if (ret)
-		return ret;
-
-	/* Enable 802.1p priority control on Port 2 during switch initialization.
-	 * This setup is critical for the apptrust functionality on Port 1, which
-	 * relies on the priority settings of Port 2. Note: Port 1 is naturally
-	 * configured before Port 2, necessitating this configuration order.
-	 */
-	if (ksz_is_ksz88x3(dev))
-		return ksz_prmw8(dev, KSZ_PORT_2, KSZ8_REG_PORT_1_CTRL_0,
-				 KSZ8_PORT_802_1P_ENABLE,
-				 KSZ8_PORT_802_1P_ENABLE);
-
-	return 0;
+	return ksz_init_global_dscp_map(dev);
 }

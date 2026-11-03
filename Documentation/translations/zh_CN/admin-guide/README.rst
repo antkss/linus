@@ -83,7 +83,7 @@ Linux内核6.x版本 <http://kernel.org/>
    补丁，则不应先应用6.0.1和6.0.2的补丁。类似地，如果您运行的是6.0.2内核，
    并且希望跳转到6.0.3，那么在应用6.0.3补丁之前，必须首先撤销6.0.2补丁
    （即patch -R）。更多关于这方面的内容，请阅读
-   :ref:`Documentation/process/applying-patches.rst <applying_patches>` 。
+   Documentation/translations/zh_CN/process/applying-patches.rst 。
 
    或者，脚本 patch-kernel 可以用来自动化这个过程。它能确定当前内核版本并
    应用找到的所有补丁::
@@ -146,7 +146,7 @@ Linux内核6.x版本 <http://kernel.org/>
 
      "make xconfig"     基于Qt的配置工具。
 
-     "make gconfig"     基于GTK+的配置工具。
+     "make gconfig"     基于GTK的配置工具。
 
      "make oldconfig"   基于现有的 ./.config 文件选择所有选项，并询问
                         新配置选项。
@@ -224,7 +224,7 @@ Linux内核6.x版本 <http://kernel.org/>
 编译内核
 ---------
 
- - 确保您至少有gcc 5.1可用。
+ - 确保您至少有gcc 8.1可用。
    有关更多信息，请参阅 :ref:`Documentation/process/changes.rst <changes>` 。
 
  - 执行 ``make`` 来创建压缩内核映像。如果您安装了lilo以适配内核makefile，
@@ -288,4 +288,4 @@ Documentation/translations/zh_CN/admin-guide/bug-hunting.rst 。
 
 更多用GDB调试内核的信息，请参阅：
 Documentation/translations/zh_CN/dev-tools/gdb-kernel-debugging.rst
-和 Documentation/dev-tools/kgdb.rst 。
+和 Documentation/process/debugging/kgdb.rst 。

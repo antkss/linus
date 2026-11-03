@@ -31,7 +31,7 @@ struct mlx5hws_pattern_cache_item {
 		u8 *data;
 		u16 num_of_actions;
 	} mh_data;
-	u32 refcount;
+	u32 refcount; /* protected by pattern_cache lock */
 	struct list_head ptrn_list_node;
 };
 
@@ -48,6 +48,11 @@ u32 mlx5hws_arg_data_size_to_arg_size(u16 data_size);
 int mlx5hws_pat_init_pattern_cache(struct mlx5hws_pattern_cache **cache);
 
 void mlx5hws_pat_uninit_pattern_cache(struct mlx5hws_pattern_cache *cache);
+
+bool mlx5hws_pat_compare_pattern(int cur_num_of_actions,
+				 __be64 cur_actions[],
+				 int num_of_actions,
+				 __be64 actions[]);
 
 bool mlx5hws_pat_verify_actions(struct mlx5hws_context *ctx, __be64 pattern[], size_t sz);
 
@@ -96,6 +101,7 @@ int mlx5hws_arg_write_inline_arg_data(struct mlx5hws_context *ctx,
 				      u8 *arg_data,
 				      size_t data_size);
 
-void mlx5hws_pat_calc_nope(__be64 *pattern, size_t num_actions, size_t max_actions,
-			   size_t *new_size, u32 *nope_location, __be64 *new_pat);
+int mlx5hws_pat_calc_nop(__be64 *pattern, size_t num_actions,
+			 size_t max_actions, size_t *new_size,
+			 u32 *nop_locations, __be64 *new_pat);
 #endif /* MLX5HWS_PAT_ARG_H_ */

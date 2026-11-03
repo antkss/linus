@@ -3,7 +3,6 @@
 // Copyright 2024 Advanced Micro Devices, Inc.
 
 #include "dc_spl_translate.h"
-#include "spl/dc_spl_types.h"
 #include "dcn20/dcn20_dpp.h"
 #include "dcn32/dcn32_dpp.h"
 #include "dcn401/dcn401_dpp.h"
@@ -15,6 +14,9 @@ static struct spl_callbacks dcn32_spl_callbacks = {
 	.spl_calc_lb_num_partitions = dscl32_spl_calc_lb_num_partitions,
 };
 static struct spl_callbacks dcn401_spl_callbacks = {
+	.spl_calc_lb_num_partitions = dscl401_spl_calc_lb_num_partitions,
+};
+static struct spl_callbacks dcn50_spl_callbacks = {
 	.spl_calc_lb_num_partitions = dscl401_spl_calc_lb_num_partitions,
 };
 static void populate_splrect_from_rect(struct spl_rect *spl_rect, const struct rect *rect)
@@ -64,6 +66,31 @@ static void populate_inits_from_splinits(struct scl_inits *inits,
 	inits->h_c = dc_fixpt_from_int_dy(spl_inits->h_filter_init_int_c, spl_inits->h_filter_init_frac_c >> 5, 0, 19);
 	inits->v_c = dc_fixpt_from_int_dy(spl_inits->v_filter_init_int_c, spl_inits->v_filter_init_frac_c >> 5, 0, 19);
 }
+static void populate_splformat_from_format(enum spl_pixel_format *spl_pixel_format,
+					   const enum dc_pixel_format pixel_format)
+{
+	if (pixel_format < PIXEL_FORMAT_INVALID)
+		*spl_pixel_format = (enum spl_pixel_format)pixel_format;
+	else
+		*spl_pixel_format = SPL_PIXEL_FORMAT_INVALID;
+}
+static void set_linear_light_scaling_preference(const struct dc_plane_state *plane_state, struct spl_in *spl_in)
+{
+	if (plane_state != NULL) {
+		switch (plane_state->scaling_linearity) {
+		case DC_SCALING_LINEARITY_LINEAR:
+			spl_in->lls_pref = LLS_PREF_YES;
+			break;
+		case DC_SCALING_LINEARITY_SOURCE:
+			spl_in->lls_pref = LLS_PREF_NO;
+			break;
+		default:
+			spl_in->lls_pref = LLS_PREF_DONT_CARE;
+			break;
+		}
+	} else
+		spl_in->lls_pref = LLS_PREF_DONT_CARE;
+}
 /// @brief Translate SPL input parameters from pipe context
 /// @param pipe_ctx
 /// @param spl_in
@@ -83,13 +110,18 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
 		spl_in->callbacks = dcn32_spl_callbacks;
 		break;
 	case DCN_VERSION_4_01:
+	case DCN_VERSION_4_2:
+	case DCN_VERSION_4_2B:
 		spl_in->callbacks = dcn401_spl_callbacks;
+		break;
+	case DCN_VERSION_6_0:
+		spl_in->callbacks = dcn50_spl_callbacks;
 		break;
 	default:
 		spl_in->callbacks = dcn2_spl_callbacks;
 	}
 	// Make format field from spl_in point to plane_res scl_data format
-	spl_in->basic_in.format = (enum spl_pixel_format)pipe_ctx->plane_res.scl_data.format;
+	populate_splformat_from_format(&spl_in->basic_in.format, pipe_ctx->plane_res.scl_data.format);
 	// Make view_format from basic_out point to view_format from stream
 	spl_in->basic_out.view_format = (enum spl_view_3d)stream->view_format;
 	// Populate spl input basic input clip rect from plane state clip rect
@@ -108,19 +140,21 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
 	spl_in->basic_in.horizontal_mirror = plane_state->horizontal_mirror;
 
 	// Calculate horizontal splits and split index
-	spl_in->basic_in.mpc_combine_h = resource_get_mpc_slice_count(pipe_ctx);
+	spl_in->basic_in.num_h_slices_recout_width_align.use_recout_width_aligned = false;
+	spl_in->basic_in.num_h_slices_recout_width_align.num_slices_recout_width.mpc_num_h_slices =
+		resource_get_mpc_slice_count(pipe_ctx);
 
 	if (stream->view_format == VIEW_3D_FORMAT_SIDE_BY_SIDE)
-		spl_in->basic_in.mpc_combine_v = 0;
+		spl_in->basic_in.mpc_h_slice_index = 0;
 	else
-		spl_in->basic_in.mpc_combine_v = resource_get_mpc_slice_index(pipe_ctx);
+		spl_in->basic_in.mpc_h_slice_index = resource_get_mpc_slice_index(pipe_ctx);
 
 	populate_splrect_from_rect(&spl_in->basic_out.odm_slice_rect, &odm_slice_src);
 	spl_in->basic_out.odm_combine_factor = 0;
 	spl_in->odm_slice_index = resource_get_odm_slice_index(pipe_ctx);
 	// Make spl input basic out info output_size width point to stream h active
 	spl_in->basic_out.output_size.width =
-		stream->timing.h_addressable + stream->timing.h_border_left + stream->timing.h_border_right + pipe_ctx->hblank_borrow;
+		stream->timing.h_addressable + stream->timing.h_border_left + stream->timing.h_border_right + pipe_ctx->dsc_padding_params.dsc_hactive_padding;
 	// Make spl input basic out info output_size height point to v active
 	spl_in->basic_out.output_size.height =
 		stream->timing.v_addressable + stream->timing.v_border_bottom + stream->timing.v_border_top;
@@ -139,6 +173,8 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
 		spl_in->prefer_easf = false;
 	else if (pipe_ctx->stream->ctx->dc->debug.force_easf == 2)
 		spl_in->disable_easf = true;
+	else if (pipe_ctx->stream->ctx->dc->debug.force_easf == 3)
+		spl_in->override_easf = true;
 	/* Translate adaptive sharpening preference */
 	unsigned int sharpness_setting = pipe_ctx->stream->ctx->dc->debug.force_sharpness;
 	unsigned int force_sharpness_level = pipe_ctx->stream->ctx->dc->debug.force_sharpness_level;
@@ -148,15 +184,16 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
 		spl_in->adaptive_sharpness.enable = true;
 		spl_in->adaptive_sharpness.sharpness_level = 0;
 	} else if (sharpness_setting == SHARPNESS_CUSTOM) {
-		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_min = 0;
-		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_max = 1750;
-		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_mid = 750;
-		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_min = 0;
-		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_max = 3500;
-		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_mid = 1500;
-		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_min = 0;
-		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_max = 2750;
-		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_mid = 1500;
+		/* SAT: read harpness_range from dc_plane_state */
+		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_min = plane_state->sharpness_range.sdr_rgb_min;
+		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_max = plane_state->sharpness_range.sdr_rgb_max;
+		spl_in->adaptive_sharpness.sharpness_range.sdr_rgb_mid = plane_state->sharpness_range.sdr_rgb_mid;
+		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_min = plane_state->sharpness_range.sdr_yuv_min;
+		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_max = plane_state->sharpness_range.sdr_yuv_max;
+		spl_in->adaptive_sharpness.sharpness_range.sdr_yuv_mid = plane_state->sharpness_range.sdr_yuv_mid;
+		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_min = plane_state->sharpness_range.hdr_rgb_min;
+		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_max = plane_state->sharpness_range.hdr_rgb_max;
+		spl_in->adaptive_sharpness.sharpness_range.hdr_rgb_mid = plane_state->sharpness_range.hdr_rgb_mid;
 
 		if (force_sharpness_level > 0) {
 			if (force_sharpness_level > 10)
@@ -175,7 +212,14 @@ void translate_SPL_in_params_from_pipe_ctx(struct pipe_ctx *pipe_ctx, struct spl
 	if (pipe_ctx->stream->ctx->dc->debug.force_lls > 0)
 		spl_in->lls_pref = pipe_ctx->stream->ctx->dc->debug.force_lls;
 	else
-		spl_in->lls_pref = plane_state->linear_light_scaling;
+		if ((plane_state->ctx->dce_version == DCN_VERSION_4_01) ||
+			(plane_state->ctx->dce_version == DCN_VERSION_4_2) ||
+			(plane_state->ctx->dce_version == DCN_VERSION_4_2B))
+			spl_in->lls_pref = LLS_PREF_DONT_CARE;
+		else
+			set_linear_light_scaling_preference(plane_state, spl_in);
+	/* Translate upsampling mode*/
+	spl_in->upsp_mode = pipe_ctx->plane_res.scl_data.upsp;
 	/* Translate chroma subsampling offset ( cositing ) */
 	if (pipe_ctx->stream->ctx->dc->debug.force_cositing)
 		spl_in->basic_in.cositing = pipe_ctx->stream->ctx->dc->debug.force_cositing - 1;
